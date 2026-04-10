@@ -223,16 +223,16 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
     };
 
-    // For image requests on large files: use windowed context to stay within API limits
+    // For image requests on large files: extract the relevant <section> block by keyword
     // For text-only: send the full file for maximum precision
     let contentForAI = originalContent;
     if (imageData && originalContent && originalContent.length > 30000) {
-      const window = this._findRelevantWindow(originalContent, changeRequest.prompt, pageContext);
-      if (window) {
-        contentForAI = window.content;
-        logger.info('Image request: using windowed context', { file: pageBladeFile.blade_file, lines: `${window.startLine}-${window.endLine}` });
+      const section = this._findSectionByKeyword(originalContent, changeRequest.prompt);
+      if (section) {
+        contentForAI = section.content;
+        logger.info('Image request: extracted section', { file: pageBladeFile.blade_file, lines: `${section.startLine}-${section.endLine}`, keyword: section.keyword });
       } else {
-        // No good window match — send first 30K chars
+        // No section match — send first 30K chars
         contentForAI = originalContent.substring(0, 30000) + '\n<!-- file truncated for image context -->';
         logger.info('Image request: truncated large file', { file: pageBladeFile.blade_file });
       }
@@ -478,6 +478,66 @@ class ChangeRequestController {
   // Find the ~80-line window in a file most relevant to the change.
   // Uses DOM context (visible headings/buttons/text) and prompt keywords.
   // Returns { content, startLine, endLine, score } or null (→ send full file).
+  // Find a <section> block that contains a keyword from the prompt.
+  // Returns { content, startLine, endLine, keyword } or null.
+  _findSectionByKeyword(content, prompt) {
+    if (!content) return null;
+    const lines = content.split('\n');
+
+    // Extract meaningful keywords from prompt (2+ word phrases and single words)
+    const stop = new Set(['this','that','with','from','have','make','change','update','please','should','would','could','the','and','for','add','image','section','here','now','put','show','text','color','red','blue','green','new','old']);
+    const words = prompt.toLowerCase().split(/\W+/).filter(w => w.length > 2 && !stop.has(w));
+
+    // Find all section-like blocks and score them
+    const sectionStarts = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (/<section[\s>]/i.test(lines[i]) || /class="[^"]*(?:section|area|block|banner|feature|testimonial|faq|contact|blog)[^"]*"/i.test(lines[i])) {
+        sectionStarts.push(i);
+      }
+    }
+    if (sectionStarts.length === 0) return null;
+
+    // For each section, find its end and score by keyword matches
+    let bestSection = null;
+    let bestScore = 0;
+    let bestKeyword = '';
+
+    for (let si = 0; si < sectionStarts.length; si++) {
+      const start = sectionStarts[si];
+      const end = sectionStarts[si + 1] ? sectionStarts[si + 1] : Math.min(start + 150, lines.length);
+      const block = lines.slice(start, end).join('\n').toLowerCase();
+
+      let score = 0;
+      let matchedWord = '';
+      for (const w of words) {
+        const count = (block.match(new RegExp(w, 'gi')) || []).length;
+        if (count > 0) {
+          // Weight by specificity — longer words and heading matches score higher
+          score += count * w.length;
+          if (!matchedWord || w.length > matchedWord.length) matchedWord = w;
+        }
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestSection = { startLine: start, endLine: end };
+        bestKeyword = matchedWord;
+      }
+    }
+
+    if (!bestSection || bestScore < 5) return null;
+
+    // Include 5 lines before for context
+    const start = Math.max(0, bestSection.startLine - 5);
+    const end = bestSection.endLine;
+    return {
+      content: lines.slice(start, end).join('\n'),
+      startLine: start,
+      endLine: end,
+      keyword: bestKeyword
+    };
+  }
+
   _findRelevantWindow(content, prompt, pageContext) {
     if (!content) return null;
     const lines = content.split('\n');
