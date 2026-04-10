@@ -61,9 +61,13 @@ export default function ProjectPreview() {
     reader.onload = (e) => {
       const dataUrl = e.target.result;
       const base64 = dataUrl.split(',')[1];
-      // Detect actual media type from data URL header (more reliable than file.type)
-      const detectedType = dataUrl.match(/^data:(image\/[^;]+)/)?.[1] || file.type;
-      setImage({ base64, mediaType: detectedType, preview: dataUrl });
+      // Detect actual type from base64 magic bytes (browser/clipboard can lie)
+      let mediaType = file.type;
+      if (base64.startsWith('/9j/')) mediaType = 'image/jpeg';
+      else if (base64.startsWith('iVBOR')) mediaType = 'image/png';
+      else if (base64.startsWith('R0lGO')) mediaType = 'image/gif';
+      else if (base64.startsWith('UklGR')) mediaType = 'image/webp';
+      setImage({ base64, mediaType, preview: dataUrl });
     };
     reader.readAsDataURL(file);
   }
