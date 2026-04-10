@@ -59,8 +59,11 @@ export default function ProjectPreview() {
     if (!file || !file.type.startsWith('image/')) return;
     const reader = new FileReader();
     reader.onload = (e) => {
-      const base64 = e.target.result.split(',')[1];
-      setImage({ base64, mediaType: file.type, preview: e.target.result });
+      const dataUrl = e.target.result;
+      const base64 = dataUrl.split(',')[1];
+      // Detect actual media type from data URL header (more reliable than file.type)
+      const detectedType = dataUrl.match(/^data:(image\/[^;]+)/)?.[1] || file.type;
+      setImage({ base64, mediaType: detectedType, preview: dataUrl });
     };
     reader.readAsDataURL(file);
   }
