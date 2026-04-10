@@ -116,9 +116,9 @@ class ChangeRequestController {
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
 
-      // ── Resolve current page → blade file (scoped mode) ───────────────────
+      // ── Resolve current page → blade file (always, even with images) ────────
       let pageBladeFile = null;
-      if (currentPageUrl && !imageData) {
+      if (currentPageUrl) {
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
         const resolved = await routeResolver.resolve(project.local_path, currentPageUrl);
