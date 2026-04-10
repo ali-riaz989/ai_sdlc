@@ -1,0 +1,17 @@
+[Unit]
+Description=AI SDLC Backend
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ali-riaz
+WorkingDirectory=/home/ali-riaz/Desktop/ai_sdlc/backend
+Environment=NODE_ENV=production
+ExecStart=/home/ali-riaz/.nvm/versions/node/v20.20.2/bin/node src/server.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Environment files
+.env
+.env.local
+.env.production
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build output
+frontend/.next/
+frontend/out/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Staging/Docker
+staging/
+
+# Laravel project runtime
+projects/*/storage/logs/*
+projects/*/storage/framework/cache/*
+projects/*/storage/framework/sessions/*
+projects/*/storage/framework/views/*
+projects/*/bootstrap/cache/*
+projects/*/.env
+projects/*/node_modules/
+projects/*/vendor/
+
+# Backups
+backups/
+
+# Temp files
+/tmp/
+*.tmp
+
+# Claude memory
+.claude/
