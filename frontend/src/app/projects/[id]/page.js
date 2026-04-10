@@ -230,10 +230,14 @@ export default function ProjectPreview() {
       // ── Read iframe URL at submit-time (always fresh, not stale state) ──
       const livePageUrl = (() => {
         try {
+          const href = iframeRef.current?.contentWindow?.location?.href;
+          if (href && !href.startsWith('about:')) return href.split('?')[0];
+        } catch { /* cross-origin */ }
+        try {
           const src = iframeRef.current?.src;
-          if (!src) return currentPageUrl;
-          return src.split('?')[0]; // strip cache-bust param
-        } catch { return currentPageUrl; }
+          if (src) return src.split('?')[0];
+        } catch {}
+        return currentPageUrl;
       })();
 
       // ── Extract DOM context from iframe (0ms) ──────────────────────────
@@ -375,6 +379,14 @@ export default function ProjectPreview() {
           title={project.display_name}
           sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
           onLoad={() => {
+            try {
+              // Try reading actual navigated URL (works same-origin)
+              const href = iframeRef.current?.contentWindow?.location?.href;
+              if (href && !href.startsWith('about:')) {
+                setCurrentPageUrl(href.split('?')[0]);
+                return;
+              }
+            } catch { /* cross-origin — fall through */ }
             try {
               const src = iframeRef.current?.src;
               if (src) setCurrentPageUrl(src.split('?')[0]);
