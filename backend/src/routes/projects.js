@@ -419,44 +419,43 @@ Rules:
   try {
     log(`▶ Starting setup for ${project.display_name}`, 'success');
 
-    // ── 1. Create database ────────────────────────────────────────────────
-    log('📦 Creating database on this server...', 'info');
-    if (isPostgres) {
-      // Connect as postgres superuser to create role + database
-      const adminClient = new PgClient({
-        host: 'localhost', port: 5432,
-        database: 'postgres',
-        user: process.env.POSTGRES_SUPERUSER || 'postgres',
-        password: process.env.POSTGRES_SUPERUSER_PASSWORD || ''
-      });
-      await adminClient.connect();
-      // Create project role if not exists
-      await adminClient.query(`DO $$ BEGIN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${dbUser}') THEN
-          CREATE ROLE "${dbUser}" LOGIN PASSWORD '${dbPass}';
-        END IF;
-      END $$`);
-      // Create database owned by project role
-      await adminClient.query(`CREATE DATABASE "${dbName}" OWNER "${dbUser}"`).catch(() => {});
-      await adminClient.query(`GRANT ALL PRIVILEGES ON DATABASE "${dbName}" TO "${dbUser}"`);
-      await adminClient.end();
+    // ── 1. Create database (skip for env_only) ─────────────────────────────
+    if (setup_action !== 'env_only') {
+      log('📦 Creating database on this server...', 'info');
+      if (isPostgres) {
+        const adminClient = new PgClient({
+          host: 'localhost', port: 5432,
+          database: 'postgres',
+          user: process.env.POSTGRES_SUPERUSER || 'postgres',
+          password: process.env.POSTGRES_SUPERUSER_PASSWORD || ''
+        });
+        await adminClient.connect();
+        await adminClient.query(`DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${dbUser}') THEN
+            CREATE ROLE "${dbUser}" LOGIN PASSWORD '${dbPass}';
+          END IF;
+        END $$`);
+        await adminClient.query(`CREATE DATABASE "${dbName}" OWNER "${dbUser}"`).catch(() => {});
+        await adminClient.query(`GRANT ALL PRIVILEGES ON DATABASE "${dbName}" TO "${dbUser}"`);
+        await adminClient.end();
+      } else {
+        if (!mysql_root_password) throw new Error('MYSQL_ROOT_PASSWORD not set in backend .env');
+        await mysqlExec(mysql_root_password, `CREATE DATABASE IF NOT EXISTS ${dbName}`);
+        await mysqlExec(mysql_root_password, `CREATE USER IF NOT EXISTS '${dbUser}'@'%' IDENTIFIED BY '${dbPass}'`);
+        await mysqlExec(mysql_root_password, `GRANT ALL PRIVILEGES ON ${dbName}.* TO '${dbUser}'@'%'`);
+        await mysqlExec(mysql_root_password, `FLUSH PRIVILEGES`);
+      }
+      log(`✓ Database "${dbName}" created`, 'success');
+
+      // ── 2. Save DB config ───────────────────────────────────────────────
+      await sequelize.query(
+        `UPDATE projects SET db_host = 'localhost', db_port = $1, db_name = $2,
+           db_user = $3, db_password = $4, updated_at = NOW() WHERE id = $5`,
+        { bind: [dbPort, dbName, dbUser, dbPass, project.id] }
+      );
     } else {
-      if (!mysql_root_password) throw new Error('MYSQL_ROOT_PASSWORD not set in backend .env');
-      await mysqlExec(mysql_root_password, `CREATE DATABASE IF NOT EXISTS ${dbName}`);
-      await mysqlExec(mysql_root_password, `CREATE USER IF NOT EXISTS '${dbUser}'@'%' IDENTIFIED BY '${dbPass}'`);
-      await mysqlExec(mysql_root_password, `GRANT ALL PRIVILEGES ON ${dbName}.* TO '${dbUser}'@'%'`);
-      await mysqlExec(mysql_root_password, `FLUSH PRIVILEGES`);
+      log('⏭ Skipping DB creation — using existing database from .env', 'info');
     }
-    log(`✓ Database "${dbName}" created`, 'success');
-
-    // ── 2. Save DB config ─────────────────────────────────────────────────
-    // For PostgreSQL: reuse ai_sdlc_user. For MySQL: use the created project user.
-
-    await sequelize.query(
-      `UPDATE projects SET db_host = 'localhost', db_port = $1, db_name = $2,
-         db_user = $3, db_password = $4, updated_at = NOW() WHERE id = $5`,
-      { bind: [dbPort, dbName, dbUser, dbPass, project.id] }
-    );
 
     // ── 3. Write Laravel .env ─────────────────────────────────────────────
     let laravelEnv;

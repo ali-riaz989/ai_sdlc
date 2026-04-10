@@ -32,15 +32,9 @@ Thumbs.db
 # Staging/Docker
 staging/
 
-# Laravel project runtime
-projects/*/storage/logs/*
-projects/*/storage/framework/cache/*
-projects/*/storage/framework/sessions/*
-projects/*/storage/framework/views/*
-projects/*/bootstrap/cache/*
-projects/*/.env
-projects/*/node_modules/
-projects/*/vendor/
+# Cloned projects (set up on server via GitHub)
+projects/*
+!projects/.gitkeep
 
 # Backups
 backups/
