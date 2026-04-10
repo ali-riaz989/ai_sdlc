@@ -480,41 +480,41 @@ export default function ProjectPreview() {
         )}
 
         {/* ═══ Main bar ═══ */}
-        <div className="bg-gradient-to-r from-stone-100 via-stone-50 to-stone-100 border-t border-gray-200 py-3">
+        <div className="border-t-2 border-stone-300 py-3" style={{ background: 'linear-gradient(135deg, #e8e4df 0%, #f0ece7 40%, #e8e4df 100%)' }}>
           <div className="w-[65%] mx-auto">
 
-            {/* Active prompt bubble — shows above input like Claude Code */}
+            {/* Active prompt bubble */}
             {activePrompt && (
-              <div className="mb-2 flex items-start gap-2">
-                <div className="flex-1 bg-blue-600 text-white text-sm px-4 py-2 rounded-2xl rounded-bl-sm shadow-sm">
+              <div className="mb-3 flex items-start gap-2">
+                <div className="flex-1 text-sm px-4 py-2.5 rounded-2xl rounded-bl-sm shadow-md text-white" style={{ background: 'linear-gradient(135deg, #2d6a4f, #40916c)' }}>
                   {activePrompt}
                 </div>
                 {!['review', 'failed', 'rejected', 'pending_review'].includes(result?.status) && (
-                  <div className="w-5 h-5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin flex-shrink-0 mt-1" />
+                  <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin flex-shrink-0 mt-1.5" />
                 )}
               </div>
             )}
 
             {/* Input row */}
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2.5">
 
               {/* Left: History & Upload */}
-              <div className="flex items-center gap-px bg-white rounded-xl border border-gray-200 shadow-sm flex-shrink-0 p-1">
+              <div className="flex items-center gap-px rounded-2xl border-2 border-stone-300 flex-shrink-0 p-1" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }}>
                 <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
                   title="Prompt history"
-                  className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs transition-colors ${historyOpen ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  className={`flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-xs font-medium transition-colors ${historyOpen ? 'bg-emerald-100 text-emerald-700' : 'text-stone-600 hover:bg-white/60'}`}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                   </svg>
-                  {history.length > 0 && <span className="bg-gray-200 text-gray-600 text-[10px] px-1.5 rounded-full font-medium">{history.length}</span>}
+                  {history.length > 0 && <span className="bg-stone-400 text-white text-[10px] px-1.5 rounded-full font-bold">{history.length}</span>}
                 </button>
-                <div className="w-px h-5 bg-gray-200" />
+                <div className="w-px h-5 bg-stone-300" />
                 <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
                   onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
                 <button type="button" onClick={() => fileInputRef.current?.click()}
                   title="Upload screenshot"
-                  className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs text-gray-500 hover:bg-gray-50 transition-colors">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-xs text-stone-600 hover:bg-white/60 transition-colors font-medium">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
                   </svg>
                 </button>
@@ -526,9 +526,9 @@ export default function ProjectPreview() {
                   {image && (
                     <div className="absolute -top-14 left-0">
                       <div className="relative">
-                        <img src={image.preview} alt="Screenshot" className="h-12 rounded-lg border border-gray-300 object-cover shadow-sm" />
+                        <img src={image.preview} alt="Screenshot" className="h-12 rounded-xl border-2 border-stone-300 object-cover shadow" />
                         <button type="button" onClick={() => setImage(null)}
-                          className="absolute -top-1 -right-1 w-4 h-4 bg-gray-700 text-white rounded-full text-[10px] flex items-center justify-center hover:bg-red-500">×</button>
+                          className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-stone-700 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-500 shadow">×</button>
                       </div>
                     </div>
                   )}
@@ -538,25 +538,26 @@ export default function ProjectPreview() {
                     onPaste={handlePaste}
                     placeholder="Describe your design change..."
                     disabled={submitting}
-                    className="w-full pl-4 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent disabled:opacity-50 transition-all placeholder:text-gray-400"
+                    className="w-full pl-4 pr-4 py-3 bg-white border-2 border-stone-300 rounded-2xl text-sm shadow-inner focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 disabled:opacity-50 transition-all placeholder:text-stone-400"
                   />
                 </div>
               </form>
 
               {/* Right: Preview + Send */}
-              <div className="flex items-center gap-2 flex-shrink-0">
+              <div className="flex items-center gap-2.5 flex-shrink-0">
                 {currentPageUrl && (
-                  <div className="hidden lg:flex items-center gap-1.5 bg-white border border-gray-200 rounded-xl px-2 py-1.5 shadow-sm max-w-[120px]" title={currentPageUrl}>
-                    <div className="w-7 h-5 bg-gray-100 rounded border border-gray-200 flex items-center justify-center flex-shrink-0">
-                      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400">
+                  <div className="hidden lg:flex items-center gap-2 rounded-2xl border-2 border-stone-300 px-2.5 py-2 max-w-[130px]" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }} title={currentPageUrl}>
+                    <div className="w-8 h-6 bg-white rounded-lg border border-stone-300 flex items-center justify-center flex-shrink-0">
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-stone-500">
                         <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
                       </svg>
                     </div>
-                    <span className="text-[10px] text-gray-500 truncate">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
+                    <span className="text-[10px] text-stone-600 truncate font-medium">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                   </div>
                 )}
                 <button type="button" onClick={handleSubmit} disabled={submitting || prompt.trim().length < 3}
-                  className="h-10 px-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white text-sm font-medium rounded-xl hover:from-blue-700 hover:to-blue-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm flex items-center gap-2">
+                  className="h-11 px-5 text-white text-sm font-semibold rounded-2xl disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg flex items-center gap-2"
+                  style={{ background: submitting ? '#5a8a7a' : 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
                   {submitting ? '...' : 'Send'}
                 </button>
@@ -564,19 +565,20 @@ export default function ProjectPreview() {
             </div>
 
             {/* Bottom controls */}
-            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-gray-200/60">
+            <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-stone-300/50">
               <div className="flex items-center gap-2">
                 {result?.status === 'review' && lastAppliedId && (
-                  <button onClick={handleRestore} className="text-[11px] px-2 py-1 text-orange-600 hover:bg-orange-50 rounded-lg transition-colors">Undo last</button>
+                  <button onClick={handleRestore} className="text-[11px] px-2.5 py-1 text-amber-700 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors font-medium">Undo last</button>
                 )}
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 <button type="button" onClick={handleReset} disabled={resetting}
-                  className="text-[11px] px-2.5 py-1 border border-gray-200 text-gray-500 rounded-lg hover:bg-white hover:border-red-200 hover:text-red-600 transition-colors disabled:opacity-50">
+                  className="text-[11px] px-3 py-1.5 border-2 border-stone-300 text-stone-600 rounded-xl hover:bg-white hover:border-red-300 hover:text-red-600 transition-colors disabled:opacity-50 font-medium" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }}>
                   {resetting ? 'Removing...' : 'Remove All Changes'}
                 </button>
                 <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
-                  className="text-[11px] px-2.5 py-1 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium shadow-sm">
+                  className="text-[11px] px-3 py-1.5 text-white rounded-xl transition-all font-semibold shadow-sm hover:shadow-md"
+                  style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                   Push to {project.repo_branch}
                 </button>
               </div>
