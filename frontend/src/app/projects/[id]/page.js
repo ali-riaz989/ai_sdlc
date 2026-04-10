@@ -51,6 +51,7 @@ export default function ProjectPreview() {
   const [commitMsg, setCommitMsg] = useState('');
   const [pushing, setPushing] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [activePrompt, setActivePrompt] = useState(null); // shows submitted prompt above input
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -125,6 +126,7 @@ export default function ProjectPreview() {
       setStreamingTokens('');
       setResult(prev => ({ ...prev, status: 'review', message: 'Changes accepted' }));
       setLastAppliedId(result.id);
+      setActivePrompt(null);
     } catch (err) {
       setResult(prev => ({ ...prev, status: 'failed', message: err.response?.data?.error || 'Apply failed' }));
     }
@@ -136,6 +138,7 @@ export default function ProjectPreview() {
       await apiClient.rejectChangeRequest(result.id);
       setPendingDiff(null);
       setStreamingTokens('');
+      setActivePrompt(null);
       setResult({ status: 'rejected', message: 'Reverted to original' });
       reloadIframe();
       setTimeout(() => setResult(null), 3000);
@@ -197,6 +200,7 @@ export default function ProjectPreview() {
     setFiles([]);
     const submittedPrompt = prompt;
     setPrompt('');
+    setActivePrompt(submittedPrompt);
 
     try {
       // ── Intercept undo/revert prompts — use DB restore instead of AI ────
@@ -206,6 +210,7 @@ export default function ProjectPreview() {
           await apiClient.restoreChangeRequest(lastAppliedId);
           setResult({ status: 'rejected', message: 'Reverted to original' });
           setLastAppliedId(null);
+          setActivePrompt(null);
           reloadIframe();
           setTimeout(() => setResult(null), 3000);
         } catch (err) {
@@ -475,95 +480,106 @@ export default function ProjectPreview() {
         )}
 
         {/* ═══ Main bar ═══ */}
-        <div className="bg-gradient-to-r from-stone-100 via-stone-50 to-stone-100 border-t border-gray-200">
-          <div className="flex items-center gap-2 px-3 py-2.5">
+        <div className="bg-gradient-to-r from-stone-100 via-stone-50 to-stone-100 border-t border-gray-200 py-3">
+          <div className="w-[65%] mx-auto">
 
-            {/* ── Left panel: History & Upload ── */}
-            <div className="flex items-center gap-px bg-white rounded-xl border border-gray-200 shadow-sm flex-shrink-0 p-1">
-              <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
-                title="Prompt history"
-                className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs transition-colors ${historyOpen ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-                </svg>
-                <span className="hidden sm:inline">History</span>
-                {history.length > 0 && <span className="bg-gray-200 text-gray-600 text-[10px] px-1.5 rounded-full font-medium">{history.length}</span>}
-              </button>
-              <div className="w-px h-5 bg-gray-200" />
-              <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
-                onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
-              <button type="button" onClick={() => fileInputRef.current?.click()}
-                title="Upload screenshot"
-                className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs text-gray-500 hover:bg-gray-50 transition-colors">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-                </svg>
-                <span className="hidden sm:inline">Upload</span>
-              </button>
-            </div>
+            {/* Active prompt bubble — shows above input like Claude Code */}
+            {activePrompt && (
+              <div className="mb-2 flex items-start gap-2">
+                <div className="flex-1 bg-blue-600 text-white text-sm px-4 py-2 rounded-2xl rounded-bl-sm shadow-sm">
+                  {activePrompt}
+                </div>
+                {!['review', 'failed', 'rejected', 'pending_review'].includes(result?.status) && (
+                  <div className="w-5 h-5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin flex-shrink-0 mt-1" />
+                )}
+              </div>
+            )}
 
-            {/* ── Center: Prompt input ── */}
-            <form onSubmit={handleSubmit} className="flex-1 flex items-center gap-2">
-              <div className="flex-1 relative">
-                {image && (
-                  <div className="absolute -top-14 left-0">
-                    <div className="relative">
-                      <img src={image.preview} alt="Screenshot" className="h-12 rounded-lg border border-gray-300 object-cover shadow-sm" />
-                      <button type="button" onClick={() => setImage(null)}
-                        className="absolute -top-1 -right-1 w-4 h-4 bg-gray-700 text-white rounded-full text-[10px] flex items-center justify-center hover:bg-red-500">×</button>
+            {/* Input row */}
+            <div className="flex items-center gap-2">
+
+              {/* Left: History & Upload */}
+              <div className="flex items-center gap-px bg-white rounded-xl border border-gray-200 shadow-sm flex-shrink-0 p-1">
+                <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
+                  title="Prompt history"
+                  className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs transition-colors ${historyOpen ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                  </svg>
+                  {history.length > 0 && <span className="bg-gray-200 text-gray-600 text-[10px] px-1.5 rounded-full font-medium">{history.length}</span>}
+                </button>
+                <div className="w-px h-5 bg-gray-200" />
+                <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
+                  onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
+                <button type="button" onClick={() => fileInputRef.current?.click()}
+                  title="Upload screenshot"
+                  className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs text-gray-500 hover:bg-gray-50 transition-colors">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                  </svg>
+                </button>
+              </div>
+
+              {/* Center: Input */}
+              <form onSubmit={handleSubmit} className="flex-1 flex items-center gap-2">
+                <div className="flex-1 relative">
+                  {image && (
+                    <div className="absolute -top-14 left-0">
+                      <div className="relative">
+                        <img src={image.preview} alt="Screenshot" className="h-12 rounded-lg border border-gray-300 object-cover shadow-sm" />
+                        <button type="button" onClick={() => setImage(null)}
+                          className="absolute -top-1 -right-1 w-4 h-4 bg-gray-700 text-white rounded-full text-[10px] flex items-center justify-center hover:bg-red-500">×</button>
+                      </div>
                     </div>
+                  )}
+                  <input type="text" value={prompt}
+                    onChange={e => setPrompt(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
+                    onPaste={handlePaste}
+                    placeholder="Describe your design change..."
+                    disabled={submitting}
+                    className="w-full pl-4 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent disabled:opacity-50 transition-all placeholder:text-gray-400"
+                  />
+                </div>
+              </form>
+
+              {/* Right: Preview + Send */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {currentPageUrl && (
+                  <div className="hidden lg:flex items-center gap-1.5 bg-white border border-gray-200 rounded-xl px-2 py-1.5 shadow-sm max-w-[120px]" title={currentPageUrl}>
+                    <div className="w-7 h-5 bg-gray-100 rounded border border-gray-200 flex items-center justify-center flex-shrink-0">
+                      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400">
+                        <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+                      </svg>
+                    </div>
+                    <span className="text-[10px] text-gray-500 truncate">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                   </div>
                 )}
-                <input type="text" value={prompt}
-                  onChange={e => setPrompt(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
-                  onPaste={handlePaste}
-                  placeholder="Describe your design change..."
-                  disabled={submitting}
-                  className="w-full pl-4 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent disabled:opacity-50 transition-all placeholder:text-gray-400"
-                />
+                <button type="button" onClick={handleSubmit} disabled={submitting || prompt.trim().length < 3}
+                  className="h-10 px-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white text-sm font-medium rounded-xl hover:from-blue-700 hover:to-blue-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm flex items-center gap-2">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                  {submitting ? '...' : 'Send'}
+                </button>
               </div>
-            </form>
-
-            {/* ── Right panel: Preview + Actions ── */}
-            <div className="flex items-center gap-2 flex-shrink-0">
-              {/* Page preview thumbnail */}
-              {currentPageUrl && (
-                <div className="hidden md:flex items-center gap-2 bg-white border border-gray-200 rounded-xl px-2.5 py-1.5 shadow-sm max-w-[140px]" title={currentPageUrl}>
-                  <div className="w-8 h-6 bg-gray-100 rounded border border-gray-200 flex items-center justify-center flex-shrink-0">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400">
-                      <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-                    </svg>
-                  </div>
-                  <span className="text-[10px] text-gray-500 truncate leading-tight">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
-                </div>
-              )}
-
-              {/* Send */}
-              <button type="button" onClick={handleSubmit} disabled={submitting || prompt.trim().length < 3}
-                className="h-10 px-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white text-sm font-medium rounded-xl hover:from-blue-700 hover:to-blue-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm flex items-center gap-2">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-                {submitting ? '...' : 'Send'}
-              </button>
             </div>
-          </div>
 
-          {/* ── Bottom controls ── */}
-          <div className="flex items-center justify-between px-3 pb-2">
-            <div className="flex items-center gap-2">
-              {result?.status === 'review' && lastAppliedId && (
-                <button onClick={handleRestore} className="text-[11px] px-2 py-1 text-orange-600 hover:bg-orange-50 rounded-lg transition-colors">Undo last</button>
-              )}
-            </div>
-            <div className="flex items-center gap-1.5">
-              <button type="button" onClick={handleReset} disabled={resetting}
-                className="text-[11px] px-2.5 py-1 border border-gray-200 text-gray-500 rounded-lg hover:bg-white hover:border-red-200 hover:text-red-600 transition-colors disabled:opacity-50">
-                {resetting ? 'Removing...' : 'Remove All Changes'}
-              </button>
-              <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
-                className="text-[11px] px-2.5 py-1 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium shadow-sm">
-                Push to {project.repo_branch}
-              </button>
+            {/* Bottom controls */}
+            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-gray-200/60">
+              <div className="flex items-center gap-2">
+                {result?.status === 'review' && lastAppliedId && (
+                  <button onClick={handleRestore} className="text-[11px] px-2 py-1 text-orange-600 hover:bg-orange-50 rounded-lg transition-colors">Undo last</button>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button type="button" onClick={handleReset} disabled={resetting}
+                  className="text-[11px] px-2.5 py-1 border border-gray-200 text-gray-500 rounded-lg hover:bg-white hover:border-red-200 hover:text-red-600 transition-colors disabled:opacity-50">
+                  {resetting ? 'Removing...' : 'Remove All Changes'}
+                </button>
+                <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
+                  className="text-[11px] px-2.5 py-1 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium shadow-sm">
+                  Push to {project.repo_branch}
+                </button>
+              </div>
             </div>
           </div>
         </div>
