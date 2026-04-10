@@ -235,11 +235,8 @@ async function _setupProjectInBackground({ project, setup_action, mysql_root_pas
   const dbPort     = isPostgres ? 5432 : 3306;
   const room       = `project-setup-${project.id}`;
 
-  // Extend PATH with common nvm/node locations so npm/composer/php are found
-  const NVM_BIN = process.env.NVM_BIN ||
-    require('fs').readdirSync('/home/ali-riaz/.nvm/versions/node').map(v =>
-      `/home/ali-riaz/.nvm/versions/node/${v}/bin`
-    ).pop() || '';
+  // Extend PATH with nvm/node location — auto-detect from current process
+  const NVM_BIN = process.env.NVM_BIN || require('path').dirname(process.execPath);
   const childEnv = {
     ...process.env,
     PATH: `${NVM_BIN}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ''}`
@@ -549,7 +546,7 @@ MAIL_MAILER=log
     const pm2Name = `project-${project.name}`;
     log(`🚀 Starting server on port ${port} via pm2...`, 'info');
 
-    const PM2 = '/home/ali-riaz/.nvm/versions/node/v20.20.2/bin/npx';
+    const PM2 = require('path').join(require('path').dirname(process.execPath), 'npx');
     // Stop old instance if exists
     await new Promise(resolve => {
       const stop = spawn(PM2, ['pm2', 'delete', pm2Name], { stdio: 'ignore' });
