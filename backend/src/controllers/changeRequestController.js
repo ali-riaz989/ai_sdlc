@@ -223,9 +223,23 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
     };
 
-    // Always send the FULL file — no windowing. The AI needs full context to make precise edits.
+    // For image requests on large files: use windowed context to stay within API limits
+    // For text-only: send the full file for maximum precision
+    let contentForAI = originalContent;
+    if (imageData && originalContent && originalContent.length > 30000) {
+      const window = this._findRelevantWindow(originalContent, changeRequest.prompt, pageContext);
+      if (window) {
+        contentForAI = window.content;
+        logger.info('Image request: using windowed context', { file: pageBladeFile.blade_file, lines: `${window.startLine}-${window.endLine}` });
+      } else {
+        // No good window match — send first 30K chars
+        contentForAI = originalContent.substring(0, 30000) + '\n<!-- file truncated for image context -->';
+        logger.info('Image request: truncated large file', { file: pageBladeFile.blade_file });
+      }
+    }
+
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: changeRequest.prompt, details: changeRequest.prompt };
-    const generated = await aiService.generateCode(step, originalContent, [], onToken, pageContext, imageData);
+    const generated = await aiService.generateCode(step, contentForAI, [], onToken, pageContext, imageData);
 
     let finalContent;
     if (generated.mode === 'replace') {
