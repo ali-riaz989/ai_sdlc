@@ -168,7 +168,7 @@ class AIService {
   // priorMessages: conversation thread from the preceding analyze call.
   // When provided, the AI already knows the plan — we only send the full file
   // in the new user turn, saving tokens on re-explaining the change.
-  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null) {
+  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null, imageData = null) {
     logger.info('Generating code', { file: fileInfo.file_path, threaded: priorMessages.length > 0 });
 
     const systemPrompt = `You are an AI code editor (like Cursor or Claude Code) that makes precise, surgical edits to Laravel Blade files.
@@ -205,7 +205,7 @@ CRITICAL RULES:
     }
 
     if (originalContent) {
-      const generateUserPrompt = `The user is looking at this page and asks: "${fileInfo.description}"${domNote}
+      const textPrompt = `The user is looking at this page and asks: "${fileInfo.description}"${domNote}
 
 File: ${fileInfo.file_path}
 
@@ -215,6 +215,14 @@ ${originalContent}
 
 Find the exact section the user is referring to and return the surgical edit as JSON:
 {"old_block":"verbatim text from the file above","new_block":"modified replacement"}`;
+
+      // Build user content — include image if provided
+      const generateUserPrompt = imageData
+        ? [
+            { type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } },
+            { type: 'text', text: textPrompt }
+          ]
+        : textPrompt;
 
       const messages = [
         ...priorMessages,

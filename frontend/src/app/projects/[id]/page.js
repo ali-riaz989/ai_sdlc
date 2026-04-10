@@ -81,6 +81,17 @@ export default function ProjectPreview() {
     if (!loading && !user) router.replace('/login');
   }, [user, loading, router]);
 
+  // Listen for postMessage from iframe (cross-origin URL tracking)
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type === 'iframe-navigation' && e.data?.url) {
+        setCurrentPageUrl(e.data.url.split('?')[0]);
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
   useEffect(() => {
     if (!id || !user) return;
     apiClient.getProject(id).then(res => setProject(res.data)).catch(() => router.replace('/'));
@@ -378,18 +389,18 @@ export default function ProjectPreview() {
           title={project.display_name}
           sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
           onLoad={() => {
-            try {
-              // Try reading actual navigated URL (works same-origin)
-              const href = iframeRef.current?.contentWindow?.location?.href;
-              if (href && !href.startsWith('about:')) {
-                setCurrentPageUrl(href.split('?')[0]);
-                return;
-              }
-            } catch { /* cross-origin — fall through */ }
-            try {
-              const src = iframeRef.current?.src;
-              if (src) setCurrentPageUrl(src.split('?')[0]);
-            } catch {}
+            // Read the actual URL from the iframe on every navigation
+            const readUrl = () => {
+              try {
+                const href = iframeRef.current?.contentWindow?.location?.href;
+                if (href && !href.startsWith('about:')) { setCurrentPageUrl(href.split('?')[0]); return; }
+              } catch {}
+              try {
+                const src = iframeRef.current?.src;
+                if (src) setCurrentPageUrl(src.split('?')[0]);
+              } catch {}
+            };
+            readUrl();
           }}
         />
         {/* Current page indicator */}

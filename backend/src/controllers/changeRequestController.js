@@ -133,18 +133,18 @@ class ChangeRequestController {
         }
       }
 
-      // When the blade file is already resolved and no image → skip classify + analyze.
-      // Go straight to generateCode (1 API call instead of 3).
-      if (pageBladeFile && !imageData) {
-        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext);
+      // When the blade file is resolved → always use directGenerate (1 API call).
+      // This ensures the AI edits the CORRECT file (the one the user is looking at).
+      if (pageBladeFile) {
+        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData);
       } else {
-        // Fallback: full classify → analyze → generate pipeline (for images or unknown pages)
+        // No page resolved (no URL sent) — fall back to full pipeline
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Classifying change…');
         const classification = await aiService.classifyChange(changeRequest.prompt);
         logger.info('Classified', { type: classification.type, requestId });
 
-        if (classification.type === 'text_swap') {
+        if (classification.type === 'text_swap' && !imageData) {
           await this._fastTextSwapPath(requestId, project, changeRequest, classification, pageBladeFile, emit, emitFile);
         } else {
           await this._fullAIPipeline(requestId, project, changeRequest, imageData, pageBladeFile, emit, emitFile, io, pageContext);
@@ -209,7 +209,7 @@ class ChangeRequestController {
 
   // ── Direct generate: 1 API call, no classify/analyze overhead ──────────────
   // Used when blade file is already resolved from the URL — the common case.
-  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null) {
+  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
     await this._updateStatus(requestId, 'generating_code');
     emit('generating_code', 'Generating change…');
 
@@ -225,7 +225,7 @@ class ChangeRequestController {
 
     // Always send the FULL file — no windowing. The AI needs full context to make precise edits.
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: changeRequest.prompt, details: changeRequest.prompt };
-    const generated = await aiService.generateCode(step, originalContent, [], onToken, pageContext);
+    const generated = await aiService.generateCode(step, originalContent, [], onToken, pageContext, imageData);
 
     let finalContent;
     if (generated.mode === 'replace') {
