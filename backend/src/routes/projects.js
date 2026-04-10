@@ -488,7 +488,9 @@ MAIL_MAILER=log
     log('✓ Laravel .env written', 'success');
 
     // ── 4. Composer install ───────────────────────────────────────────────
-    if (await confirm('Install PHP dependencies via Composer?', 'composer install')) {
+    const autoRun = setup_action === 'env_only'; // skip confirms for env_only
+    if (autoRun || await confirm('Install PHP dependencies via Composer?', 'composer install')) {
+      log('📦 Running composer install...', 'info');
       await runComposer();
       log('✓ Composer install complete', 'success');
     }
@@ -496,7 +498,8 @@ MAIL_MAILER=log
     // ── 4b. npm install (if package.json exists) ──────────────────────────
     try {
       await fs.access(path.join(project.local_path, 'package.json'));
-      if (await confirm('package.json found — install JS dependencies?', 'npm install --legacy-peer-deps')) {
+      if (autoRun || await confirm('package.json found — install JS dependencies?', 'npm install --legacy-peer-deps')) {
+        log('📦 Running npm install...', 'info');
         await runWithAI('script', ['-q', '-e', '-c', 'npm install --legacy-peer-deps', '/dev/null']);
         log('✓ npm install complete', 'success');
       }
@@ -510,6 +513,8 @@ MAIL_MAILER=log
         await runWithAI('php', ['artisan', 'migrate', '--force']);
         log('✓ Migrations complete', 'success');
       }
+    } else if (setup_action === 'env_only') {
+      log('⏭ Skipping migration — using existing database', 'info');
     } else if (setup_action === 'import' && db_file_path) {
       if (await confirm('Import SQL dump into database?', `mysql ... < ${path.basename(db_file_path)}`)) {
         if (isPostgres) {
