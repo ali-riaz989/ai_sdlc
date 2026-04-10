@@ -397,32 +397,30 @@ export default function ProjectPreview() {
         </div>
       )}
 
-      {/* Bottom toolbar */}
-      <div className="bg-white border-t border-gray-200 flex-shrink-0 relative">
+      {/* ═══ Bottom Workspace Bar ═══ */}
+      <div className="flex-shrink-0 relative" style={{ zIndex: 20 }}>
 
         {/* History overlay */}
         {historyOpen && (
-          <div className="absolute bottom-full left-0 right-0 bg-white border border-gray-200 rounded-t-xl shadow-2xl animate-slideUp"
-            style={{ maxHeight: '50vh', zIndex: 30 }}>
-            <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 sticky top-0 bg-white rounded-t-xl">
-              <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Prompt History</span>
+          <div className="absolute bottom-full left-0 bg-white border border-gray-200 rounded-t-xl shadow-2xl animate-slideUp w-72"
+            style={{ zIndex: 30 }}>
+            <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100 bg-gray-50 rounded-t-xl">
+              <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Prompt History</span>
               <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(false); }}
-                className="w-6 h-6 flex items-center justify-center rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-800 text-sm">×</button>
+                className="w-5 h-5 flex items-center justify-center rounded-full text-gray-400 hover:bg-gray-200 hover:text-gray-700 text-xs">×</button>
             </div>
-            <div className="overflow-y-auto" style={{ maxHeight: 'calc(50vh - 44px)' }}>
+            <div className="overflow-y-auto" style={{ maxHeight: '280px' }}>
               {history.length === 0 ? (
-                <p className="text-center text-gray-400 text-sm py-8">No changes yet</p>
+                <p className="text-center text-gray-400 text-xs py-6">No changes yet</p>
               ) : (
                 <ul className="divide-y divide-gray-50">
                   {history.map(cr => (
-                    <li key={cr.id} className="px-4 py-3 hover:bg-blue-50 cursor-pointer transition-colors"
+                    <li key={cr.id} className="px-3 py-2.5 hover:bg-blue-50 cursor-pointer transition-colors"
                       onClick={() => { setPrompt(cr.prompt); setHistoryOpen(false); }}>
-                      <div className="flex items-start justify-between gap-3">
-                        <p className="text-sm text-gray-800 leading-snug flex-1 line-clamp-2">{cr.prompt}</p>
-                        <span className="text-xs text-gray-400 flex-shrink-0 whitespace-nowrap">
-                          {formatDistanceToNow(new Date(cr.created_at), { addSuffix: true })}
-                        </span>
-                      </div>
+                      <p className="text-xs text-gray-700 leading-snug line-clamp-2">{cr.prompt}</p>
+                      <span className="text-[10px] text-gray-400 mt-0.5 block">
+                        {formatDistanceToNow(new Date(cr.created_at), { addSuffix: true })}
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -436,154 +434,134 @@ export default function ProjectPreview() {
         {pushModalOpen && (
           <>
             <div className="fixed inset-0 bg-black/40" style={{ zIndex: 50 }} onClick={() => setPushModalOpen(false)} />
-            <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-md" style={{ zIndex: 51 }}>
-              <h3 className="text-sm font-semibold text-gray-900 mb-3">Push Changes to {project.repo_branch}</h3>
-              <input
-                value={commitMsg}
-                onChange={e => setCommitMsg(e.target.value)}
-                placeholder="Commit message..."
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 mb-3"
-                autoFocus
+            <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm" style={{ zIndex: 51 }}>
+              <h3 className="text-sm font-semibold text-gray-900 mb-3">Push to <span className="font-mono text-blue-600">{project.repo_branch}</span></h3>
+              <input value={commitMsg} onChange={e => setCommitMsg(e.target.value)}
+                placeholder="Commit message..." autoFocus
                 onKeyDown={e => { if (e.key === 'Enter') handlePush(); }}
-              />
+                className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-green-500 focus:border-transparent mb-3" />
               <div className="flex gap-2">
                 <button onClick={() => setPushModalOpen(false)}
-                  className="flex-1 py-2 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
+                  className="flex-1 py-2 border border-gray-200 rounded-xl text-sm text-gray-500 hover:bg-gray-50">Cancel</button>
                 <button onClick={handlePush} disabled={pushing || !commitMsg.trim()}
-                  className="flex-1 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50">
-                  {pushing ? 'Pushing...' : 'Push'}
-                </button>
+                  className="flex-1 py-2 bg-green-600 text-white rounded-xl text-sm font-medium hover:bg-green-700 disabled:opacity-50">
+                  {pushing ? 'Pushing...' : 'Push'}</button>
               </div>
             </div>
           </>
         )}
 
-        {/* Status bar */}
+        {/* Status / streaming / accept-reject bar */}
         {result && (
-          <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between gap-4 text-sm">
-            <div className="flex items-center gap-2">
-              {!['review', 'failed', 'rejected', 'pending_review'].includes(result.status) && (
-                <div className="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              )}
-              <span className={STATUS_COLORS[result.status] || 'text-gray-600'}>
-                {STATUS_LABELS[result.status] || result.status}
-              </span>
-              {result.message && !['review'].includes(result.status) && (
-                <span className="text-gray-400 text-xs">{result.message}</span>
-              )}
-            </div>
+          <div className="bg-white px-4 py-1.5 border-t border-gray-100 flex items-center gap-2 text-xs">
+            {!['review', 'failed', 'rejected', 'pending_review'].includes(result.status) && (
+              <div className="w-2.5 h-2.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+            )}
+            <span className={STATUS_COLORS[result.status] || 'text-gray-500'}>{STATUS_LABELS[result.status] || result.status}</span>
+            {result.message && result.status !== 'review' && <span className="text-gray-400">{result.message}</span>}
           </div>
         )}
-
-        {/* Streaming tokens */}
         {result?.status === 'generating_code' && streamingTokens && (
-          <div className="px-4 py-2 bg-gray-50 border-b border-gray-100">
-            <pre className="text-xs text-gray-500 font-mono whitespace-pre-wrap max-h-16 overflow-hidden">{streamingTokens.slice(-200)}</pre>
+          <div className="bg-gray-50 px-4 py-1 border-t border-gray-100">
+            <pre className="text-[10px] text-gray-400 font-mono whitespace-pre-wrap max-h-10 overflow-hidden">{streamingTokens.slice(-150)}</pre>
           </div>
         )}
-
-        {/* Accept / Reject bar */}
         {pendingDiff && (
-          <div className="border-b border-blue-200 bg-blue-50 px-4 py-3">
-            <p className="text-xs text-blue-600 mb-3">Preview applied — check the page above, then accept or reject.</p>
-            <div className="flex gap-3">
-              <button onClick={rejectChange} className="flex-1 py-2.5 text-sm font-medium bg-white border-2 border-red-300 text-red-700 rounded-lg hover:bg-red-50 transition-colors">
-                Reject &amp; Revert
-              </button>
-              <button onClick={applyChange} className="flex-1 py-2.5 text-sm font-medium bg-green-600 border-2 border-green-600 text-white rounded-lg hover:bg-green-700 transition-colors">
-                Accept Changes
-              </button>
-            </div>
+          <div className="bg-blue-50 px-4 py-2 border-t border-blue-100 flex items-center gap-3">
+            <span className="text-xs text-blue-600 flex-1">Preview applied — accept or reject</span>
+            <button onClick={rejectChange} className="px-3 py-1.5 text-xs font-medium bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50">Reject</button>
+            <button onClick={applyChange} className="px-3 py-1.5 text-xs font-medium bg-green-600 text-white rounded-lg hover:bg-green-700">Accept</button>
           </div>
         )}
 
-        {/* Main prompt area */}
-        <div className="px-4 py-3">
-          {/* Image preview */}
-          {image && (
-            <div className="relative inline-block mb-2">
-              <img src={image.preview} alt="Screenshot" className="h-16 rounded-lg border border-gray-200 object-cover" />
-              <button type="button" onClick={() => setImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-gray-800 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-600">×</button>
-            </div>
-          )}
+        {/* ═══ Main bar ═══ */}
+        <div className="bg-gradient-to-r from-stone-100 via-stone-50 to-stone-100 border-t border-gray-200">
+          <div className="flex items-center gap-2 px-3 py-2.5">
 
-          <form onSubmit={handleSubmit} className="flex items-center gap-3">
-            {/* Left tools */}
-            <div className="flex items-center gap-1 flex-shrink-0">
+            {/* ── Left panel: History & Upload ── */}
+            <div className="flex items-center gap-px bg-white rounded-xl border border-gray-200 shadow-sm flex-shrink-0 p-1">
               <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
                 title="Prompt history"
-                className={`w-9 h-9 flex items-center justify-center rounded-full transition-colors ${historyOpen ? 'bg-blue-100 text-blue-600' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs transition-colors ${historyOpen ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                 </svg>
+                <span className="hidden sm:inline">History</span>
+                {history.length > 0 && <span className="bg-gray-200 text-gray-600 text-[10px] px-1.5 rounded-full font-medium">{history.length}</span>}
               </button>
+              <div className="w-px h-5 bg-gray-200" />
               <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
                 onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
               <button type="button" onClick={() => fileInputRef.current?.click()}
                 title="Upload screenshot"
-                className="w-9 h-9 flex items-center justify-center rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs text-gray-500 hover:bg-gray-50 transition-colors">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
                 </svg>
+                <span className="hidden sm:inline">Upload</span>
               </button>
             </div>
 
-            {/* Input */}
-            <div className="flex-1 relative">
-              <input
-                type="text"
-                value={prompt}
-                onChange={e => setPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
-                onPaste={handlePaste}
-                placeholder="Describe your design change..."
-                disabled={submitting}
-                className="w-full pl-4 pr-4 py-2.5 bg-gray-50 border border-gray-200 rounded-full text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent focus:bg-white disabled:opacity-50 transition-colors"
-              />
-            </div>
+            {/* ── Center: Prompt input ── */}
+            <form onSubmit={handleSubmit} className="flex-1 flex items-center gap-2">
+              <div className="flex-1 relative">
+                {image && (
+                  <div className="absolute -top-14 left-0">
+                    <div className="relative">
+                      <img src={image.preview} alt="Screenshot" className="h-12 rounded-lg border border-gray-300 object-cover shadow-sm" />
+                      <button type="button" onClick={() => setImage(null)}
+                        className="absolute -top-1 -right-1 w-4 h-4 bg-gray-700 text-white rounded-full text-[10px] flex items-center justify-center hover:bg-red-500">×</button>
+                    </div>
+                  </div>
+                )}
+                <input type="text" value={prompt}
+                  onChange={e => setPrompt(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
+                  onPaste={handlePaste}
+                  placeholder="Describe your design change..."
+                  disabled={submitting}
+                  className="w-full pl-4 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent disabled:opacity-50 transition-all placeholder:text-gray-400"
+                />
+              </div>
+            </form>
 
-            {/* Right: webpage preview thumb + send */}
+            {/* ── Right panel: Preview + Actions ── */}
             <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Page preview thumbnail */}
               {currentPageUrl && (
-                <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 bg-gray-50 border border-gray-200 rounded-lg max-w-[120px]" title={currentPageUrl}>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400 flex-shrink-0">
-                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-                  </svg>
-                  <span className="text-xs text-gray-500 truncate">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
+                <div className="hidden md:flex items-center gap-2 bg-white border border-gray-200 rounded-xl px-2.5 py-1.5 shadow-sm max-w-[140px]" title={currentPageUrl}>
+                  <div className="w-8 h-6 bg-gray-100 rounded border border-gray-200 flex items-center justify-center flex-shrink-0">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400">
+                      <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+                    </svg>
+                  </div>
+                  <span className="text-[10px] text-gray-500 truncate leading-tight">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                 </div>
               )}
-              <button type="submit" disabled={submitting || prompt.trim().length < 3}
-                className="h-10 px-5 bg-blue-600 text-white text-sm font-medium rounded-full hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                </svg>
+
+              {/* Send */}
+              <button type="button" onClick={handleSubmit} disabled={submitting || prompt.trim().length < 3}
+                className="h-10 px-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white text-sm font-medium rounded-xl hover:from-blue-700 hover:to-blue-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm flex items-center gap-2">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
                 {submitting ? '...' : 'Send'}
               </button>
             </div>
-          </form>
+          </div>
 
-          {/* Bottom action buttons */}
-          <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-100">
+          {/* ── Bottom controls ── */}
+          <div className="flex items-center justify-between px-3 pb-2">
             <div className="flex items-center gap-2">
-              {history.length > 0 && (
-                <span className="text-xs text-gray-400">{history.length} change{history.length !== 1 ? 's' : ''}</span>
-              )}
               {result?.status === 'review' && lastAppliedId && (
-                <button onClick={handleRestore} className="text-xs px-2.5 py-1 text-orange-600 hover:bg-orange-50 rounded transition-colors">
-                  Undo last
-                </button>
+                <button onClick={handleRestore} className="text-[11px] px-2 py-1 text-orange-600 hover:bg-orange-50 rounded-lg transition-colors">Undo last</button>
               )}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <button type="button" onClick={handleReset} disabled={resetting}
-                title="Remove all uncommitted changes"
-                className="text-xs px-3 py-1.5 border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition-colors disabled:opacity-50">
+                className="text-[11px] px-2.5 py-1 border border-gray-200 text-gray-500 rounded-lg hover:bg-white hover:border-red-200 hover:text-red-600 transition-colors disabled:opacity-50">
                 {resetting ? 'Removing...' : 'Remove All Changes'}
               </button>
               <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
-                title={`Push to ${project.repo_branch}`}
-                className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium">
+                className="text-[11px] px-2.5 py-1 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium shadow-sm">
                 Push to {project.repo_branch}
               </button>
             </div>
