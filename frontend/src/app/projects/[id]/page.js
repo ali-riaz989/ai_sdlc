@@ -227,17 +227,16 @@ export default function ProjectPreview() {
         return;
       }
 
-      // ── Read iframe URL at submit-time (always fresh, not stale state) ──
+      // ── Read iframe URL at submit-time ──
       const livePageUrl = (() => {
         try {
           const href = iframeRef.current?.contentWindow?.location?.href;
           if (href && !href.startsWith('about:')) return href.split('?')[0];
         } catch { /* cross-origin */ }
-        try {
-          const src = iframeRef.current?.src;
-          if (src) return src.split('?')[0];
-        } catch {}
-        return currentPageUrl;
+        // Fallback: use the src attribute or tracked URL
+        // Convert preview domain URL to project_url for route resolution
+        const fallback = currentPageUrl || iframeRef.current?.src?.split('?')[0] || project.project_url;
+        return fallback;
       })();
 
       // ── Extract DOM context from iframe (0ms) ──────────────────────────

@@ -223,13 +223,9 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
     };
 
-    // Use windowed context if we have a strong DOM match
-    const window = originalContent ? this._findRelevantWindow(originalContent, changeRequest.prompt, pageContext) : null;
-    const contentForAI = window ? window.content : originalContent;
-    if (window) logger.info('Using windowed context', { file: pageBladeFile.blade_file, lines: `${window.startLine}-${window.endLine}`, score: window.score });
-
+    // Always send the FULL file — no windowing. The AI needs full context to make precise edits.
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: changeRequest.prompt, details: changeRequest.prompt };
-    const generated = await aiService.generateCode(step, contentForAI, [], onToken);
+    const generated = await aiService.generateCode(step, originalContent, [], onToken, pageContext);
 
     let finalContent;
     if (generated.mode === 'replace') {

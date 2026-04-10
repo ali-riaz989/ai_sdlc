@@ -53,6 +53,18 @@ export function extractPageContext(iframe) {
       .map(el => el.innerText?.trim().substring(0, 300))
       .filter(Boolean);
 
+    // ── Images with alt text ─────────────────────────────────────────────
+    const images = [...doc.querySelectorAll('img[alt]')]
+      .slice(0, 8)
+      .map(el => ({ alt: el.alt?.trim().substring(0, 100), src: el.src?.substring(0, 200) }))
+      .filter(i => i.alt);
+
+    // ── Nav links ────────────────────────────────────────────────────────
+    const navLinks = [...doc.querySelectorAll('nav a, .nav a, .navbar a')]
+      .slice(0, 15)
+      .map(el => el.innerText?.trim().substring(0, 60))
+      .filter(Boolean);
+
     return {
       url: pathname,
       origin,
@@ -61,7 +73,9 @@ export function extractPageContext(iframe) {
       sections: dataSections,
       headings,
       buttons,
-      paragraphs
+      paragraphs,
+      images,
+      navLinks
     };
   } catch {
     return null;

@@ -168,44 +168,53 @@ class AIService {
   // priorMessages: conversation thread from the preceding analyze call.
   // When provided, the AI already knows the plan — we only send the full file
   // in the new user turn, saving tokens on re-explaining the change.
-  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null) {
+  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null) {
     logger.info('Generating code', { file: fileInfo.file_path, threaded: priorMessages.length > 0 });
 
-    const systemPrompt = `You are an expert Laravel developer making precise, surgical edits.
-Return ONLY valid JSON — no markdown, no explanation.`;
+    const systemPrompt = `You are an AI code editor (like Cursor or Claude Code) that makes precise, surgical edits to Laravel Blade files.
+
+You MUST return ONLY valid JSON — no markdown, no explanation, no commentary.
+The JSON format is: {"old_block":"exact verbatim text from the file","new_block":"replacement text"}
+
+CRITICAL RULES:
+- old_block must be EXACTLY character-for-character identical to a section in the file — copy it precisely
+- Include 3-5 surrounding lines in old_block so it matches uniquely in the file
+- new_block contains the modified version — change ONLY what the user asked for
+- Preserve all indentation, whitespace, HTML structure, Blade directives exactly
+- Do NOT rewrite sections the user didn't mention
+- If the user mentions a heading, button, text, or section — find that EXACT element in the file and change only that`;
+
+    // Build DOM context string so the AI knows what the user sees on screen
+    let domNote = '';
+    if (pageContext) {
+      const parts = [];
+      if (pageContext.url) parts.push(`Current page URL: ${pageContext.url}`);
+      if (pageContext.title) parts.push(`Page title: "${pageContext.title}"`);
+      if (pageContext.headings?.length) parts.push('Visible headings:\n' + pageContext.headings.map(h => `  - [${h.tag}] "${h.text}"`).join('\n'));
+      if (pageContext.navLinks?.length) parts.push('Navigation links: ' + pageContext.navLinks.join(', '));
+      if (pageContext.buttons?.length) parts.push('Buttons/CTAs:\n' + pageContext.buttons.map(b => `  - "${b.text}"${b.href ? ' → ' + b.href : ''}`).join('\n'));
+      if (pageContext.images?.length) parts.push('Images:\n' + pageContext.images.map(i => `  - alt="${i.alt}"`).join('\n'));
+      if (pageContext.paragraphs?.length) parts.push('Text content:\n' + pageContext.paragraphs.slice(0, 5).map(p => `  - "${p.substring(0, 120)}"`).join('\n'));
+      if (pageContext.sections?.length) {
+        pageContext.sections.forEach(s => {
+          const fields = (s.fields || []).map(f => `${f.field}="${f.text}"`).join(', ');
+          parts.push(`Data section [${s.section_slug || s.section_id}]: ${fields || s.current_text?.substring(0, 150)}`);
+        });
+      }
+      if (parts.length) domNote = `\n\nThis is what the user currently sees on the page (use this to locate the right element in the code):\n${parts.join('\n')}`;
+    }
 
     if (originalContent) {
-      // ── Existing file: surgical block replace ────────────────────────────
-      // When threaded: the prior messages already described the change.
-      // We only need to supply the full file and ask for the block.
-      // When standalone: include the change description in the user message.
-      const generateUserPrompt = priorMessages.length > 0
-        ? `Now implement the change you analyzed above. Here is the complete file:
+      const generateUserPrompt = `The user is looking at this page and asks: "${fileInfo.description}"${domNote}
 
 File: ${fileInfo.file_path}
+
+\`\`\`blade
 ${originalContent}
+\`\`\`
 
-Return ONLY valid JSON with the exact block to replace:
-{"old_block":"verbatim text from the file (include 2-3 surrounding lines for uniqueness)","new_block":"replacement text"}
-
-Rules:
-- old_block must be character-for-character identical to text in the file above
-- new_block makes ONLY the requested change — preserve all surrounding structure`
-        : `File: ${fileInfo.file_path}
-Change requested: ${fileInfo.description}
-Details: ${fileInfo.details}
-
-Current file content:
-${originalContent}
-
-Return the EXACT block that must change as JSON:
-{"old_block":"verbatim text from the file to replace (include 2-3 surrounding lines for uniqueness)","new_block":"replacement text"}
-
-Rules:
-- old_block must be character-for-character identical to text in the file above
-- Include enough surrounding context lines in old_block so it is unique in the file
-- new_block makes ONLY the requested change — preserve all surrounding structure
-- Never rewrite more of the file than necessary`;
+Find the exact section the user is referring to and return the surgical edit as JSON:
+{"old_block":"verbatim text from the file above","new_block":"modified replacement"}`;
 
       const messages = [
         ...priorMessages,
