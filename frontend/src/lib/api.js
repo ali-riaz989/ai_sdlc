@@ -50,6 +50,10 @@ export const apiClient = {
   applyChangeRequest: (id) => api.post(`/api/change-requests/${id}/apply`),
   rejectChangeRequest: (id) => api.post(`/api/change-requests/${id}/reject`),
   restoreChangeRequest: (id) => api.post(`/api/change-requests/${id}/restore`),
+
+  // Git operations
+  pushProject: (id, commitMessage, gitToken) => api.post(`/api/projects/${id}/push`, { commit_message: commitMessage, git_token: gitToken }),
+  resetProject: (id) => api.post(`/api/projects/${id}/reset`),
 };
 
 export default api;

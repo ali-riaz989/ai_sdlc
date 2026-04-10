@@ -47,6 +47,10 @@ export default function ProjectPreview() {
   const [pendingDiff, setPendingDiff] = useState(null);
   const [lastAppliedId, setLastAppliedId] = useState(null); // change request id of last applied change
   const [streamingTokens, setStreamingTokens] = useState('');
+  const [pushModalOpen, setPushModalOpen] = useState(false);
+  const [commitMsg, setCommitMsg] = useState('');
+  const [pushing, setPushing] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -149,6 +153,39 @@ export default function ProjectPreview() {
       setResult(null);
     } catch (err) {
       alert(err.response?.data?.error || 'Restore failed');
+    }
+  }
+
+  async function handlePush() {
+    if (!commitMsg.trim()) return;
+    setPushing(true);
+    try {
+      await apiClient.pushProject(id, commitMsg);
+      setPushModalOpen(false);
+      setCommitMsg('');
+      setResult({ status: 'review', message: `Pushed to ${project.repo_branch}` });
+      setTimeout(() => setResult(null), 4000);
+    } catch (err) {
+      alert(err.response?.data?.error || 'Push failed');
+    } finally {
+      setPushing(false);
+    }
+  }
+
+  async function handleReset() {
+    if (!confirm('Remove ALL uncommitted changes? This cannot be undone.')) return;
+    setResetting(true);
+    try {
+      await apiClient.resetProject(id);
+      reloadIframe();
+      setResult({ status: 'rejected', message: 'All changes removed' });
+      setLastAppliedId(null);
+      setPendingDiff(null);
+      setTimeout(() => setResult(null), 3000);
+    } catch (err) {
+      alert(err.response?.data?.error || 'Reset failed');
+    } finally {
+      setResetting(false);
     }
   }
 
@@ -360,21 +397,17 @@ export default function ProjectPreview() {
         </div>
       )}
 
-      {/* Prompt bar */}
+      {/* Bottom toolbar */}
       <div className="bg-white border-t border-gray-200 flex-shrink-0 relative">
 
-        {/* History overlay — slides up from prompt bar, hidden by default */}
+        {/* History overlay */}
         {historyOpen && (
           <div className="absolute bottom-full left-0 right-0 bg-white border border-gray-200 rounded-t-xl shadow-2xl animate-slideUp"
             style={{ maxHeight: '50vh', zIndex: 30 }}>
             <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 sticky top-0 bg-white rounded-t-xl">
               <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Prompt History</span>
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); setHistoryOpen(false); }}
-                className="w-6 h-6 flex items-center justify-center rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-800 text-sm">
-                ×
-              </button>
+              <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(false); }}
+                className="w-6 h-6 flex items-center justify-center rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-800 text-sm">×</button>
             </div>
             <div className="overflow-y-auto" style={{ maxHeight: 'calc(50vh - 44px)' }}>
               {history.length === 0 ? (
@@ -382,8 +415,7 @@ export default function ProjectPreview() {
               ) : (
                 <ul className="divide-y divide-gray-50">
                   {history.map(cr => (
-                    <li key={cr.id}
-                      className="px-4 py-3 hover:bg-blue-50 cursor-pointer transition-colors"
+                    <li key={cr.id} className="px-4 py-3 hover:bg-blue-50 cursor-pointer transition-colors"
                       onClick={() => { setPrompt(cr.prompt); setHistoryOpen(false); }}>
                       <div className="flex items-start justify-between gap-3">
                         <p className="text-sm text-gray-800 leading-snug flex-1 line-clamp-2">{cr.prompt}</p>
@@ -398,13 +430,37 @@ export default function ProjectPreview() {
             </div>
           </div>
         )}
-        {/* Click-outside backdrop to close history */}
-        {historyOpen && (
-          <div className="fixed inset-0" style={{ zIndex: 25 }} onClick={() => setHistoryOpen(false)} />
+        {historyOpen && <div className="fixed inset-0" style={{ zIndex: 25 }} onClick={() => setHistoryOpen(false)} />}
+
+        {/* Push commit modal */}
+        {pushModalOpen && (
+          <>
+            <div className="fixed inset-0 bg-black/40" style={{ zIndex: 50 }} onClick={() => setPushModalOpen(false)} />
+            <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-md" style={{ zIndex: 51 }}>
+              <h3 className="text-sm font-semibold text-gray-900 mb-3">Push Changes to {project.repo_branch}</h3>
+              <input
+                value={commitMsg}
+                onChange={e => setCommitMsg(e.target.value)}
+                placeholder="Commit message..."
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 mb-3"
+                autoFocus
+                onKeyDown={e => { if (e.key === 'Enter') handlePush(); }}
+              />
+              <div className="flex gap-2">
+                <button onClick={() => setPushModalOpen(false)}
+                  className="flex-1 py-2 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
+                <button onClick={handlePush} disabled={pushing || !commitMsg.trim()}
+                  className="flex-1 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50">
+                  {pushing ? 'Pushing...' : 'Push'}
+                </button>
+              </div>
+            </div>
+          </>
         )}
-        {/* Result status */}
+
+        {/* Status bar */}
         {result && (
-          <div className={`px-4 py-2 border-b border-gray-100 flex items-center justify-between gap-4 text-sm`}>
+          <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between gap-4 text-sm">
             <div className="flex items-center gap-2">
               {!['review', 'failed', 'rejected', 'pending_review'].includes(result.status) && (
                 <div className="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
@@ -412,25 +468,21 @@ export default function ProjectPreview() {
               <span className={STATUS_COLORS[result.status] || 'text-gray-600'}>
                 {STATUS_LABELS[result.status] || result.status}
               </span>
-              {result.message && result.status !== 'review' && (
+              {result.message && !['review'].includes(result.status) && (
                 <span className="text-gray-400 text-xs">{result.message}</span>
               )}
             </div>
-            {result.stagingUrl && (
-              <a href={result.stagingUrl} target="_blank" rel="noopener noreferrer"
-                className="text-xs text-blue-600 hover:underline">View staging →</a>
-            )}
           </div>
         )}
 
-        {/* Streaming token display — visible while generating */}
+        {/* Streaming tokens */}
         {result?.status === 'generating_code' && streamingTokens && (
           <div className="px-4 py-2 bg-gray-50 border-b border-gray-100">
             <pre className="text-xs text-gray-500 font-mono whitespace-pre-wrap max-h-16 overflow-hidden">{streamingTokens.slice(-200)}</pre>
           </div>
         )}
 
-        {/* Diff preview panel — visible when pending_review */}
+        {/* Accept / Reject bar */}
         {pendingDiff && (
           <div className="border-b border-blue-200 bg-blue-50 px-4 py-3">
             <p className="text-xs text-blue-600 mb-3">Preview applied — check the page above, then accept or reject.</p>
@@ -445,56 +497,98 @@ export default function ProjectPreview() {
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="px-4 py-3 flex flex-col gap-2">
+        {/* Main prompt area */}
+        <div className="px-4 py-3">
           {/* Image preview */}
           {image && (
-            <div className="relative inline-block self-start">
-              <img src={image.preview} alt="Attached screenshot" className="h-20 rounded border border-gray-300 object-cover" />
+            <div className="relative inline-block mb-2">
+              <img src={image.preview} alt="Screenshot" className="h-16 rounded-lg border border-gray-200 object-cover" />
               <button type="button" onClick={() => setImage(null)}
-                className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-gray-800 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-600">
-                ×
-              </button>
+                className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-gray-800 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-600">×</button>
             </div>
           )}
-          <div className="flex items-end gap-2">
-            {/* History + image buttons on the left */}
-            <div className="flex flex-col gap-1.5 flex-shrink-0">
-              <button type="button"
-                onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
+
+          <form onSubmit={handleSubmit} className="flex items-center gap-3">
+            {/* Left tools */}
+            <div className="flex items-center gap-1 flex-shrink-0">
+              <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
                 title="Prompt history"
-                className={`px-2.5 py-2 text-sm rounded-lg transition-colors ${historyOpen ? 'bg-blue-100 text-blue-600' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
-                ↑
-                {history.length > 0 && (
-                  <span className="ml-0.5 text-xs">{history.length}</span>
-                )}
+                className={`w-9 h-9 flex items-center justify-center rounded-full transition-colors ${historyOpen ? 'bg-blue-100 text-blue-600' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                </svg>
               </button>
               <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
                 onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
               <button type="button" onClick={() => fileInputRef.current?.click()}
                 title="Upload screenshot"
-                className="px-2.5 py-2 bg-gray-100 text-gray-500 text-sm rounded-lg hover:bg-gray-200 transition-colors">
-                +
+                className="w-9 h-9 flex items-center justify-center rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                </svg>
               </button>
             </div>
-            {/* Textarea */}
-            <textarea
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
-              onPaste={handlePaste}
-              placeholder="Describe a change..."
-              rows={2}
-              disabled={submitting}
-              className="flex-1 resize-none px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
-              style={{ maxHeight: '120px', overflowY: 'auto' }}
-            />
-            {/* Send button */}
-            <button type="submit" disabled={submitting || prompt.trim().length < 5}
-              className="flex-shrink-0 px-4 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors self-end">
-              {submitting ? '...' : 'Send'}
-            </button>
+
+            {/* Input */}
+            <div className="flex-1 relative">
+              <input
+                type="text"
+                value={prompt}
+                onChange={e => setPrompt(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
+                onPaste={handlePaste}
+                placeholder="Describe your design change..."
+                disabled={submitting}
+                className="w-full pl-4 pr-4 py-2.5 bg-gray-50 border border-gray-200 rounded-full text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent focus:bg-white disabled:opacity-50 transition-colors"
+              />
+            </div>
+
+            {/* Right: webpage preview thumb + send */}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {currentPageUrl && (
+                <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 bg-gray-50 border border-gray-200 rounded-lg max-w-[120px]" title={currentPageUrl}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-400 flex-shrink-0">
+                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+                  </svg>
+                  <span className="text-xs text-gray-500 truncate">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
+                </div>
+              )}
+              <button type="submit" disabled={submitting || prompt.trim().length < 3}
+                className="h-10 px-5 bg-blue-600 text-white text-sm font-medium rounded-full hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                </svg>
+                {submitting ? '...' : 'Send'}
+              </button>
+            </div>
+          </form>
+
+          {/* Bottom action buttons */}
+          <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-100">
+            <div className="flex items-center gap-2">
+              {history.length > 0 && (
+                <span className="text-xs text-gray-400">{history.length} change{history.length !== 1 ? 's' : ''}</span>
+              )}
+              {result?.status === 'review' && lastAppliedId && (
+                <button onClick={handleRestore} className="text-xs px-2.5 py-1 text-orange-600 hover:bg-orange-50 rounded transition-colors">
+                  Undo last
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={handleReset} disabled={resetting}
+                title="Remove all uncommitted changes"
+                className="text-xs px-3 py-1.5 border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition-colors disabled:opacity-50">
+                {resetting ? 'Removing...' : 'Remove All Changes'}
+              </button>
+              <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
+                title={`Push to ${project.repo_branch}`}
+                className="text-xs px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium">
+                Push to {project.repo_branch}
+              </button>
+            </div>
           </div>
-        </form>
+        </div>
       </div>
     </div>
   );

@@ -660,4 +660,55 @@ router.delete('/:id', authenticateToken, requireRole('admin'), async (req, res, 
   }
 });
 
+// POST /api/projects/:id/push - Git add, commit, pull, push
+router.post('/:id/push', authenticateToken, requireRole('admin'), async (req, res, next) => {
+  try {
+    const [projects] = await sequelize.query('SELECT * FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+    const project = projects[0];
+    const { commit_message, git_token } = req.body;
+
+    const git = simpleGit(project.local_path);
+
+    if (git_token) {
+      const remoteUrl = project.repo_url.replace('https://', `https://oauth2:${git_token}@`);
+      await git.remote(['set-url', 'origin', remoteUrl]);
+    }
+
+    await git.add('.');
+    await git.commit(commit_message || 'AI SDLC: push changes');
+    await git.pull('origin', project.repo_branch, { '--rebase': 'true' });
+    await git.push('origin', project.repo_branch);
+
+    logger.info('Project pushed', { projectId: project.id, branch: project.repo_branch });
+    res.json({ message: `Pushed to ${project.repo_branch}` });
+  } catch (error) {
+    logger.error('Push failed', { error: error.message });
+    next(error);
+  }
+});
+
+// POST /api/projects/:id/reset - Remove all uncommitted changes (git checkout .)
+router.post('/:id/reset', authenticateToken, requireRole('admin'), async (req, res, next) => {
+  try {
+    const [projects] = await sequelize.query('SELECT * FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+    const project = projects[0];
+
+    const git = simpleGit(project.local_path);
+    await git.checkout(['.']);
+    await git.clean('f', ['-d']);
+
+    // Clear view cache
+    const { exec: execChild } = require('child_process');
+    await new Promise(resolve => execChild('php artisan view:clear', { cwd: project.local_path }, () => resolve()));
+
+    logger.info('Project reset', { projectId: project.id });
+    res.json({ message: 'All changes removed' });
+  } catch (error) {
+    logger.error('Reset failed', { error: error.message });
+    next(error);
+  }
+});
+
 module.exports = router;
