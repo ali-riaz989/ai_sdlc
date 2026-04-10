@@ -3,8 +3,19 @@
 # Usage: bash restart.sh
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-NODE="/home/ali-riaz/.nvm/versions/node/v20.20.2/bin/node"
 LOGS_DIR="$BASE_DIR/logs"
+
+# Load nvm if available
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+
+# Find node binary
+NODE=$(which node 2>/dev/null)
+if [ -z "$NODE" ]; then
+  echo "ERROR: node not found. Install Node.js 20+ via nvm first."
+  exit 1
+fi
+echo "Using node: $NODE ($(node -v))"
 
 mkdir -p "$LOGS_DIR"
 
