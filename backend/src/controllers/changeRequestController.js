@@ -273,35 +273,30 @@ class ChangeRequestController {
         if (score > bestScore) { bestScore = score; bestSection = s; }
       }
 
+      // Also check section content/paragraphs for matches, not just headings
+      if (bestScore < 6) {
+        for (const s of contentSections) {
+          let score = 0;
+          const allText = ((s.heading || '') + ' ' + (s.content || []).join(' ')).toLowerCase();
+          const promptWords = prompt.split(/\W+/).filter(w => w.length > 3);
+          const stopWords = new Set(['this','that','with','from','have','make','change','update','image','section','background','replace','here','text','color','button','heading','page','font','size','style','add']);
+          for (const w of promptWords) {
+            if (!stopWords.has(w) && allText.includes(w)) score += 8;
+          }
+          if (score > bestScore) { bestScore = score; bestSection = s; }
+        }
+      }
+
       if (bestSection && bestScore >= 6) {
         const startIdx = bestSection.startLine - 1;
         const nextSection = contentSections.find(s => s.startLine > bestSection.startLine);
         const endIdx = nextSection ? nextSection.startLine - 1 : Math.min(startIdx + 120, lines.length);
         contentForAI = lines.slice(Math.max(0, startIdx - 5), endIdx).join('\n');
-        logger.info('Matched section by heading', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
+        logger.info('Matched section', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
       } else {
-        // No heading match — search for keywords directly in the file content
-        const keywords = prompt.split(/\W+/).filter(w => w.length > 3);
-        let matchLine = -1;
-        for (let i = 0; i < lines.length; i++) {
-          const lineLower = lines[i].toLowerCase();
-          for (const kw of keywords) {
-            if (lineLower.includes(kw)) { matchLine = i; break; }
-          }
-          if (matchLine >= 0) break;
-        }
-
-        if (matchLine >= 0) {
-          // Found keyword in file — extract ±60 lines around it
-          const start = Math.max(0, matchLine - 60);
-          const end = Math.min(lines.length, matchLine + 60);
-          contentForAI = lines.slice(start, end).join('\n');
-          logger.info('Matched by keyword search', { line: matchLine, keyword: keywords.find(kw => lines[matchLine].toLowerCase().includes(kw)) });
-        } else {
-          // Truly no match — send first 10K
-          contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated -->';
-          logger.info('No match found, sending first 10K', { file: pageBladeFile.blade_file });
-        }
+        // No section match — send first 10K
+        contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated -->';
+        logger.info('No section match, sending first 10K', { file: pageBladeFile.blade_file });
       }
     }
 
