@@ -105,7 +105,6 @@ class ChangeRequestController {
 
   // ── Main processor ─────────────────────────────────────────────────────────
   async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null) {
-    console.log('>>> ENTERED _processChangeRequest', requestId, currentPageUrl);
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -114,38 +113,29 @@ class ChangeRequestController {
     };
 
     try {
-      console.log('>>> INSIDE TRY BLOCK');
-      console.log('>>> About to query change request from DB');
       logger.info('Processing change request', { requestId, currentPageUrl });
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
-      console.log('>>> Got change request from DB:', changeRequest?.id);
 
       // ── Resolve current page → blade file (always, even with images) ────────
       let pageBladeFile = null;
       if (currentPageUrl) {
-        console.log('>>> Resolving route for:', currentPageUrl);
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
         const resolved = await routeResolver.resolve(project.local_path, currentPageUrl);
-        console.log('>>> Route resolved:', resolved?.blade_file || 'NULL');
         if (resolved) {
           try {
             await fs.access(resolved.abs_path);
             pageBladeFile = resolved;
-            console.log('>>> File exists on disk:', resolved.abs_path);
             logger.info('Page resolved', { blade: resolved.blade_file });
           } catch {
-            console.log('>>> File NOT found on disk:', resolved.abs_path);
             logger.warn('Resolved blade file not found on disk', { abs: resolved.abs_path });
           }
         }
       }
 
-      console.log('>>> pageBladeFile:', pageBladeFile?.blade_file || 'NULL', '| hasImage:', !!imageData);
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
-        console.log('>>> Entering directGenerate');
         await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData);
       } else {
         // No page resolved (no URL sent) — fall back to full pipeline
@@ -220,10 +210,8 @@ class ChangeRequestController {
   // ── Direct generate: 1 API call, no classify/analyze overhead ──────────────
   // Used when blade file is already resolved from the URL — the common case.
   async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
-    console.log('>>> directGenerate START');
     await this._updateStatus(requestId, 'generating_code');
     emit('generating_code', 'Generating change…');
-    console.log('>>> directGenerate: status updated, reading file...');
 
     const absPath = path.join(project.local_path, pageBladeFile.blade_file);
     let originalContent = null;
@@ -298,9 +286,7 @@ class ChangeRequestController {
     }
 
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: promptWithImage, details: promptWithImage };
-    console.log('>>> directGenerate: calling AI, file size:', contentForAI?.length, 'bytes, hasImage:', !!imageData);
     const generated = await aiService.generateCode(step, contentForAI, [], onToken, pageContext, imageData);
-    console.log('>>> directGenerate: AI returned mode:', generated?.mode);
 
     let finalContent;
     if (generated.mode === 'replace') {
