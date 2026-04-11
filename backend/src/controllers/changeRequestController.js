@@ -349,11 +349,21 @@ class ChangeRequestController {
           if (trimLines(normContent).includes(trimLines(normOld))) {
             finalContent = trimLines(normContent).split(trimLines(normOld)).join(trimLines(norm(newBlock)));
           } else {
-            logger.warn('old_block not found — skipping', { file: step.file_path, old_block_preview: oldBlock.substring(0, 200) });
-            emitFile(step.file_path, 'modify', 'failed');
-            await this._updateStatus(requestId, 'failed');
-            emit('failed', 'AI generated a change that could not be located in the file');
-            return;
+            // Normalize smart quotes/apostrophes and try again
+            const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, '-').replace(/\u2026/g, '...');
+            const qContent = normQ(normContent);
+            const qOld = normQ(normOld);
+            const qNew = normQ(norm(newBlock));
+            if (qContent.includes(qOld)) {
+              finalContent = qContent.split(qOld).join(qNew);
+              logger.info('Matched after smart quote normalization');
+            } else {
+              logger.warn('old_block not found — skipping', { file: step.file_path, old_block_preview: oldBlock.substring(0, 200) });
+              emitFile(step.file_path, 'modify', 'failed');
+              await this._updateStatus(requestId, 'failed');
+              emit('failed', 'AI generated a change that could not be located in the file');
+              return;
+            }
           }
         }
       }
