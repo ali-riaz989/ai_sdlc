@@ -282,6 +282,7 @@ export default function ProjectPreview() {
     setResult(null);
     setFiles([]);
     const submittedPrompt = prompt;
+    const submittedImage = image; // capture image before state changes
     setPrompt('');
     setActivePrompt(submittedPrompt);
 
@@ -319,7 +320,7 @@ export default function ProjectPreview() {
       const pageContext = iframeRef.current ? extractPageContext(iframeRef.current) : null;
 
       // ── Try quick path first (Tier 1 or Tier 2) — no image ────────────
-      if (!image) {
+      if (!submittedImage) {
         setResult({ status: 'analyzing', message: 'Applying change…' });
         try {
           const qRes = await apiClient.quickChangeRequest({
@@ -360,9 +361,9 @@ export default function ProjectPreview() {
         category: 'content',
         current_page_url: livePageUrl,
         page_context: pageContext,
-        ...(image && {
-          image_base64: image.base64,
-          image_media_type: image.mediaType
+        ...(submittedImage && {
+          image_base64: submittedImage.base64,
+          image_media_type: submittedImage.mediaType
         })
       });
       const cr = res.data;
