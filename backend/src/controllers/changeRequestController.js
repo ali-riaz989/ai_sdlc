@@ -105,6 +105,7 @@ class ChangeRequestController {
 
   // ── Main processor ─────────────────────────────────────────────────────────
   async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null) {
+    console.log('>>> ENTERED _processChangeRequest', requestId, currentPageUrl);
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -113,6 +114,7 @@ class ChangeRequestController {
     };
 
     try {
+      console.log('>>> INSIDE TRY BLOCK');
       logger.info('Processing change request', { requestId, currentPageUrl });
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
