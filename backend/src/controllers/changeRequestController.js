@@ -58,9 +58,18 @@ class ChangeRequestController {
           }
         : null;
 
-      this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context).catch(error => {
-        console.error('PROCESS ERROR FULL STACK:', error);
-        logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
+      console.log('>>> ABOUT TO CALL _processChangeRequest, requestId:', requestId);
+      const _this = this;
+      (async function() {
+        try {
+          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context);
+          console.log('>>> _processChangeRequest COMPLETED for', requestId);
+        } catch (error) {
+          console.error('>>> PROCESS ERROR:', error.message, error.stack);
+          logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
+        }
+      })().catch(error => {
+        console.error('>>> OUTER CATCH:', error);
       });
 
       res.json(newRequest[0]);
