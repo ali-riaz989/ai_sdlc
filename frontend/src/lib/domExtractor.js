@@ -1,6 +1,7 @@
 /**
- * Extracts page context from the iframe DOM.
- * Works with or without data-section-id attributes.
+ * Extracts a structured DOM map from the iframe.
+ * Builds a section-level view so the AI can navigate like a browser,
+ * distinguishing nav items from content sections.
  */
 
 export function extractPageContext(iframe) {
@@ -12,70 +13,71 @@ export function extractPageContext(iframe) {
     let pathname = '/';
     try { pathname = new URL(iframe.src.split('?')[0]).pathname; } catch {}
 
-    // ── Sections with data attributes (rich mode) ─────────────────────────
-    const dataSections = [...doc.querySelectorAll('[data-section-id],[data-section-slug]')]
-      .map(el => ({
-        section_id: el.getAttribute('data-section-id'),
-        section_slug: el.getAttribute('data-section-slug'),
-        tag: el.tagName,
-        current_text: el.innerText?.trim().substring(0, 500),
-        fields: [...el.querySelectorAll('[data-field]')].map(f => ({
-          field: f.getAttribute('data-field'),
-          tag: f.tagName,
-          text: f.innerText?.trim().substring(0, 300)
-        }))
-      }));
+    // ── Build structured section map ──────────────────────────────────────
+    // Each entry has: role, tag, id, classes, heading, content summary, images
+    const sectionMap = [];
 
-    // ── Headings (always available) ────────────────────────────────────────
-    const headings = [...doc.querySelectorAll('h1,h2,h3,h4')]
-      .slice(0, 15)
-      .map(el => ({
+    // 1. Navigation elements (explicitly tagged as nav — AI should avoid editing these unless asked)
+    [...doc.querySelectorAll('nav, .nav, .navbar, [class*="menu"], header')].forEach((el, i) => {
+      const links = [...el.querySelectorAll('a')].slice(0, 20).map(a => a.innerText?.trim()).filter(Boolean);
+      if (links.length === 0) return;
+      sectionMap.push({
+        role: 'navigation',
         tag: el.tagName,
-        text: el.innerText?.trim().substring(0, 200),
         id: el.id || null,
-        classes: el.className?.substring(0, 100)
-      }))
-      .filter(h => h.text);
+        classes: el.className?.substring(0, 120) || null,
+        links,
+        _score: -10 // AI should NOT target nav unless explicitly asked
+      });
+    });
 
-    // ── Buttons & links with visible text ─────────────────────────────────
-    const buttons = [...doc.querySelectorAll('button,a.btn,a[class*="btn"],[class*="button"]')]
-      .slice(0, 10)
-      .map(el => ({
+    // 2. Content sections (section, article, main, div with section-like classes)
+    const sectionEls = doc.querySelectorAll('section, article, main, [class*="section"], [class*="area"], [class*="block"]:not(nav):not(header):not(footer)');
+    [...sectionEls].forEach((el, i) => {
+      // Skip if inside nav/header/footer
+      if (el.closest('nav') || el.closest('header') || el.closest('footer')) return;
+      // Skip very small elements
+      if (el.innerText?.trim().length < 20) return;
+
+      const heading = el.querySelector('h1,h2,h3,h4');
+      const images = [...el.querySelectorAll('img')].slice(0, 4).map(img => ({
+        alt: img.alt?.trim().substring(0, 80) || '',
+        src: img.src?.substring(0, 150) || ''
+      }));
+      const buttons = [...el.querySelectorAll('a.btn,a[class*="btn"],button,[class*="button"]')].slice(0, 4).map(b => b.innerText?.trim().substring(0, 60)).filter(Boolean);
+      const paragraphs = [...el.querySelectorAll('p')].slice(0, 3).map(p => p.innerText?.trim().substring(0, 150)).filter(Boolean);
+
+      sectionMap.push({
+        role: 'content-section',
         tag: el.tagName,
-        text: el.innerText?.trim().substring(0, 100),
-        href: el.href || null
-      }))
-      .filter(b => b.text);
+        id: el.id || null,
+        classes: el.className?.substring(0, 150) || null,
+        heading: heading?.innerText?.trim().substring(0, 120) || null,
+        headingTag: heading?.tagName || null,
+        content: paragraphs,
+        buttons,
+        images,
+        _score: 10 // AI should prefer content sections
+      });
+    });
 
-    // ── Paragraphs (first few per visible area) ────────────────────────────
-    const paragraphs = [...doc.querySelectorAll('p')]
-      .slice(0, 10)
-      .map(el => el.innerText?.trim().substring(0, 300))
-      .filter(Boolean);
-
-    // ── Images with alt text ─────────────────────────────────────────────
-    const images = [...doc.querySelectorAll('img[alt]')]
-      .slice(0, 8)
-      .map(el => ({ alt: el.alt?.trim().substring(0, 100), src: el.src?.substring(0, 200) }))
-      .filter(i => i.alt);
-
-    // ── Nav links ────────────────────────────────────────────────────────
-    const navLinks = [...doc.querySelectorAll('nav a, .nav a, .navbar a')]
-      .slice(0, 15)
-      .map(el => el.innerText?.trim().substring(0, 60))
-      .filter(Boolean);
+    // 3. Footer
+    [...doc.querySelectorAll('footer, .footer, [class*="footer"]')].forEach(el => {
+      sectionMap.push({
+        role: 'footer',
+        tag: el.tagName,
+        id: el.id || null,
+        classes: el.className?.substring(0, 100) || null,
+        text: el.innerText?.trim().substring(0, 200),
+        _score: -5
+      });
+    });
 
     return {
       url: pathname,
       origin,
       title: doc.title,
-      has_data_attributes: dataSections.length > 0,
-      sections: dataSections,
-      headings,
-      buttons,
-      paragraphs,
-      images,
-      navLinks
+      sectionMap
     };
   } catch {
     return null;
@@ -84,14 +86,12 @@ export function extractPageContext(iframe) {
 
 /**
  * After a quick change succeeds, update the DOM directly without a full reload.
- * Only works when the element can be identified.
  */
 export function applyDomUpdate(iframe, update) {
   try {
     const doc = iframe.contentDocument;
     if (!doc) return false;
 
-    // Approach 1: data-section-id + data-field
     if (update.section_id && update.field) {
       const section = doc.querySelector(`[data-section-id="${update.section_id}"]`);
       if (section) {
@@ -100,7 +100,6 @@ export function applyDomUpdate(iframe, update) {
       }
     }
 
-    // Approach 2: find element by its current text value
     if (update.old_text) {
       const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
       let node;

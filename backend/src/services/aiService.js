@@ -171,41 +171,47 @@ class AIService {
   async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null, imageData = null) {
     logger.info('Generating code', { file: fileInfo.file_path, threaded: priorMessages.length > 0 });
 
-    const systemPrompt = `You are an AI code editor (like Cursor or Claude Code) making precise surgical edits to Laravel Blade files.
+    const systemPrompt = `You are an AI code editor making precise surgical edits to a Laravel Blade file.
 
-RESPONSE FORMAT: Return ONLY valid JSON, nothing else.
-{"old_block":"exact verbatim text from the file to replace","new_block":"replacement text"}
+RESPONSE: Return ONLY valid JSON — no markdown, no explanation.
+{"old_block":"exact verbatim text from the file","new_block":"replacement text"}
 
-RULES:
-1. The file content is shown WITH LINE NUMBERS (e.g. "42| <h1>Hello</h1>"). Use line numbers to locate the right section.
-2. old_block must NOT include line numbers — only the raw file content, character-for-character identical.
-3. Include 2-4 surrounding lines in old_block for unique matching.
-4. new_block changes ONLY what the user asked — preserve everything else exactly.
-5. Never touch sections the user didn't mention.
-6. Match the user's request to the correct HTML element by reading the actual content, class names, headings, and structure.`;
+HOW TO FIND THE RIGHT ELEMENT:
+1. You will receive a PAGE STRUCTURE MAP showing every section on the page with its role (navigation, content-section, footer).
+2. You will receive the FILE with line numbers.
+3. FIRST identify which section (by role + heading) the user is referring to.
+4. THEN find that section's code in the file by matching the heading text and class names.
+5. Edit ONLY within that section.
 
-    // Build DOM context string so the AI knows what the user sees on screen
+DISAMBIGUATION — if the same text appears in multiple places:
+- PREFER content sections (section, article, main) over navigation (nav, header, menu)
+- PREFER elements with headings (h1-h4) over link lists
+- PREFER larger containers over inline elements
+- NEVER edit navigation menus unless the user explicitly says "nav", "menu", or "navigation"
+
+old_block RULES:
+- Must be character-for-character identical to text in the file (NO line numbers)
+- Include 2-4 surrounding lines for uniqueness
+- new_block changes ONLY what was asked — preserve everything else`;
+
+    // Build structured DOM context
     let domNote = '';
-    if (pageContext) {
-      const parts = [];
-      if (pageContext.url) parts.push(`Current page URL: ${pageContext.url}`);
-      if (pageContext.title) parts.push(`Page title: "${pageContext.title}"`);
-      if (pageContext.headings?.length) parts.push('Visible headings:\n' + pageContext.headings.map(h => `  - [${h.tag}] "${h.text}"`).join('\n'));
-      if (pageContext.navLinks?.length) parts.push('Navigation links: ' + pageContext.navLinks.join(', '));
-      if (pageContext.buttons?.length) parts.push('Buttons/CTAs:\n' + pageContext.buttons.map(b => `  - "${b.text}"${b.href ? ' → ' + b.href : ''}`).join('\n'));
-      if (pageContext.images?.length) parts.push('Images:\n' + pageContext.images.map(i => `  - alt="${i.alt}"`).join('\n'));
-      if (pageContext.paragraphs?.length) parts.push('Text content:\n' + pageContext.paragraphs.slice(0, 5).map(p => `  - "${p.substring(0, 120)}"`).join('\n'));
-      if (pageContext.sections?.length) {
-        pageContext.sections.forEach(s => {
-          const fields = (s.fields || []).map(f => `${f.field}="${f.text}"`).join(', ');
-          parts.push(`Data section [${s.section_slug || s.section_id}]: ${fields || s.current_text?.substring(0, 150)}`);
-        });
-      }
-      if (parts.length) domNote = `\n\nThis is what the user currently sees on the page (use this to locate the right element in the code):\n${parts.join('\n')}`;
+    if (pageContext?.sectionMap?.length) {
+      const sections = pageContext.sectionMap.map((s, i) => {
+        let desc = `[${i + 1}] role=${s.role}`;
+        if (s.id) desc += ` id="${s.id}"`;
+        if (s.classes) desc += ` class="${s.classes.substring(0, 80)}"`;
+        if (s.heading) desc += `\n    heading: "${s.heading}"`;
+        if (s.content?.length) desc += `\n    text: ${s.content.map(p => `"${p.substring(0, 80)}"`).join(', ')}`;
+        if (s.buttons?.length) desc += `\n    buttons: ${s.buttons.join(', ')}`;
+        if (s.images?.length) desc += `\n    images: ${s.images.map(img => img.alt || 'no-alt').join(', ')}`;
+        if (s.links?.length) desc += `\n    links: ${s.links.slice(0, 10).join(', ')}`;
+        return desc;
+      }).join('\n');
+      domNote = `\n\nPAGE STRUCTURE MAP (use this to identify the correct section):\n${sections}`;
     }
 
     if (originalContent) {
-      // Add line numbers like Claude Code does — helps AI locate exact sections
       const numberedContent = originalContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
 
       const textPrompt = `User request: "${fileInfo.description}"${domNote}
@@ -213,8 +219,10 @@ RULES:
 File: ${fileInfo.file_path}
 ${numberedContent}
 
-Return JSON to edit the correct section. old_block must be the RAW text (no line numbers):
-{"old_block":"verbatim raw text from file","new_block":"replacement"}`;
+STEP 1: Which section from the PAGE STRUCTURE MAP matches the user's request?
+STEP 2: Find that section's code in the file by line number.
+STEP 3: Return the surgical edit JSON (old_block WITHOUT line numbers):
+{"old_block":"verbatim raw text","new_block":"replacement"}`;
 
       // Build user content — include image if provided
       const generateUserPrompt = imageData
