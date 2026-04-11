@@ -171,18 +171,18 @@ class AIService {
   async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null, imageData = null) {
     logger.info('Generating code', { file: fileInfo.file_path, threaded: priorMessages.length > 0 });
 
-    const systemPrompt = `You are an AI code editor (like Cursor or Claude Code) that makes precise, surgical edits to Laravel Blade files.
+    const systemPrompt = `You are an AI code editor (like Cursor or Claude Code) making precise surgical edits to Laravel Blade files.
 
-You MUST return ONLY valid JSON — no markdown, no explanation, no commentary.
-The JSON format is: {"old_block":"exact verbatim text from the file","new_block":"replacement text"}
+RESPONSE FORMAT: Return ONLY valid JSON, nothing else.
+{"old_block":"exact verbatim text from the file to replace","new_block":"replacement text"}
 
-CRITICAL RULES:
-- old_block must be EXACTLY character-for-character identical to a section in the file — copy it precisely
-- Include 3-5 surrounding lines in old_block so it matches uniquely in the file
-- new_block contains the modified version — change ONLY what the user asked for
-- Preserve all indentation, whitespace, HTML structure, Blade directives exactly
-- Do NOT rewrite sections the user didn't mention
-- If the user mentions a heading, button, text, or section — find that EXACT element in the file and change only that`;
+RULES:
+1. The file content is shown WITH LINE NUMBERS (e.g. "42| <h1>Hello</h1>"). Use line numbers to locate the right section.
+2. old_block must NOT include line numbers — only the raw file content, character-for-character identical.
+3. Include 2-4 surrounding lines in old_block for unique matching.
+4. new_block changes ONLY what the user asked — preserve everything else exactly.
+5. Never touch sections the user didn't mention.
+6. Match the user's request to the correct HTML element by reading the actual content, class names, headings, and structure.`;
 
     // Build DOM context string so the AI knows what the user sees on screen
     let domNote = '';
@@ -205,16 +205,16 @@ CRITICAL RULES:
     }
 
     if (originalContent) {
-      const textPrompt = `The user is looking at this page and asks: "${fileInfo.description}"${domNote}
+      // Add line numbers like Claude Code does — helps AI locate exact sections
+      const numberedContent = originalContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
+
+      const textPrompt = `User request: "${fileInfo.description}"${domNote}
 
 File: ${fileInfo.file_path}
+${numberedContent}
 
-\`\`\`blade
-${originalContent}
-\`\`\`
-
-Find the exact section the user is referring to and return the surgical edit as JSON:
-{"old_block":"verbatim text from the file above","new_block":"modified replacement"}`;
+Return JSON to edit the correct section. old_block must be the RAW text (no line numbers):
+{"old_block":"verbatim raw text from file","new_block":"replacement"}`;
 
       // Build user content — include image if provided
       const generateUserPrompt = imageData
