@@ -239,6 +239,7 @@ class ChangeRequestController {
 
     // If user uploaded an image, save it to project's public/images/ and get the asset URL
     let savedImageUrl = null;
+    console.log('>>> imageData:', imageData ? `base64=${imageData.base64?.length} origBase64=${imageData.origBase64?.length} type=${imageData.mediaType}` : 'NULL');
     if (imageData) {
       try {
         const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[imageData.origMediaType || imageData.mediaType] || '.jpg';
