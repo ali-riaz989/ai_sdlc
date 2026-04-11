@@ -58,6 +58,7 @@ class ChangeRequestController {
           }
         : null;
 
+      console.log('>>> imageData in create:', imageData ? `base64=${imageData.base64?.length} orig=${imageData.origBase64?.length}` : 'NULL');
       console.log('>>> ABOUT TO CALL _processChangeRequest, requestId:', requestId);
       const _this = this;
       (async function() {
