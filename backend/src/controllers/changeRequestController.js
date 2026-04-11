@@ -54,7 +54,8 @@ class ChangeRequestController {
         : null;
 
       this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context).catch(error => {
-        logger.error('Processing failed', { error: error.message, requestId });
+        console.error('PROCESS ERROR FULL STACK:', error);
+        logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
       });
 
       res.json(newRequest[0]);
