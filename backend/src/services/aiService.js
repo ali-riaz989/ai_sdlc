@@ -236,6 +236,26 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
       ];
 
       try {
+        // For image requests: use non-streaming create() — stream() can hang with images
+        if (imageData) {
+          logger.info('Using non-streaming API for image request');
+          const response = await this.client.messages.create({
+            model: this.model,
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages
+          });
+          let result;
+          try { result = this._extractJSON(response.content[0].text); } catch {
+            logger.warn('AI response not valid JSON (image)', { response: response.content[0].text.substring(0, 300) });
+            return { mode: 'skip' };
+          }
+          if (result?.old_block !== undefined && result?.new_block !== undefined) {
+            return { mode: 'replace', old_block: result.old_block, new_block: result.new_block };
+          }
+          return { mode: 'skip' };
+        }
+
         if (onToken) {
           let accumulated = '';
           const stream = this.client.messages.stream({
