@@ -55,21 +55,72 @@ export default function ProjectPreview() {
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  const [imageLoading, setImageLoading] = useState(false);
+
   function loadImageFile(file) {
     if (!file || !file.type.startsWith('image/')) return;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const dataUrl = e.target.result;
+    setImageLoading(true);
+
+    // Resize large images (max 1200px wide, JPEG quality 0.8) to keep requests fast
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const MAX_WIDTH = 1200;
+      const MAX_HEIGHT = 1200;
+      let { width, height } = img;
+
+      if (width > MAX_WIDTH || height > MAX_HEIGHT) {
+        const ratio = Math.min(MAX_WIDTH / width, MAX_HEIGHT / height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
       const base64 = dataUrl.split(',')[1];
-      // Detect actual type from base64 magic bytes (browser/clipboard can lie)
-      let mediaType = file.type;
-      if (base64.startsWith('/9j/')) mediaType = 'image/jpeg';
-      else if (base64.startsWith('iVBOR')) mediaType = 'image/png';
-      else if (base64.startsWith('R0lGO')) mediaType = 'image/gif';
-      else if (base64.startsWith('UklGR')) mediaType = 'image/webp';
-      setImage({ base64, mediaType, preview: dataUrl });
+
+      // Also read the original full-res for saving to disk
+      const origReader = new FileReader();
+      origReader.onload = (oe) => {
+        const origDataUrl = oe.target.result;
+        const origBase64 = origDataUrl.split(',')[1];
+        let origType = file.type;
+        if (origBase64.startsWith('/9j/')) origType = 'image/jpeg';
+        else if (origBase64.startsWith('iVBOR')) origType = 'image/png';
+
+        setImage({
+          base64,             // compressed — sent to AI for understanding
+          mediaType: 'image/jpeg',
+          preview: dataUrl,
+          origBase64,         // full-res — saved to disk
+          origMediaType: origType
+        });
+        setImageLoading(false);
+      };
+      origReader.readAsDataURL(file);
     };
-    reader.readAsDataURL(file);
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setImageLoading(false);
+      // Fallback: read as-is without resize
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const dataUrl = e.target.result;
+        const base64 = dataUrl.split(',')[1];
+        let mediaType = file.type;
+        if (base64.startsWith('/9j/')) mediaType = 'image/jpeg';
+        else if (base64.startsWith('iVBOR')) mediaType = 'image/png';
+        setImage({ base64, mediaType, preview: dataUrl });
+      };
+      reader.readAsDataURL(file);
+    };
+    img.src = objectUrl;
   }
 
   function handlePaste(e) {
@@ -309,7 +360,12 @@ export default function ProjectPreview() {
         category: 'content',
         current_page_url: livePageUrl,
         page_context: pageContext,
-        ...(image && { image_base64: image.base64, image_media_type: image.mediaType })
+        ...(image && {
+          image_base64: image.base64,
+          image_media_type: image.mediaType,
+          orig_image_base64: image.origBase64 || image.base64,
+          orig_image_media_type: image.origMediaType || image.mediaType
+        })
       });
       const cr = res.data;
       setImage(null);
@@ -566,7 +622,12 @@ export default function ProjectPreview() {
               {/* Center: Input */}
               <form onSubmit={handleSubmit} className="flex-1 flex items-center gap-2">
                 <div className="flex-1 relative">
-                  {image && (
+                  {imageLoading && (
+                    <div className="absolute -top-14 left-0 h-12 w-16 rounded-xl border-2 border-stone-300 bg-stone-100 flex items-center justify-center shadow">
+                      <div className="w-4 h-4 border-2 border-stone-400 border-t-transparent rounded-full animate-spin" />
+                    </div>
+                  )}
+                  {image && !imageLoading && (
                     <div className="absolute -top-14 left-0">
                       <div className="relative">
                         <img src={image.preview} alt="Screenshot" className="h-12 rounded-xl border-2 border-stone-300 object-cover shadow" />
@@ -598,7 +659,7 @@ export default function ProjectPreview() {
                     <span className="text-[10px] text-stone-600 truncate font-medium">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                   </div>
                 )}
-                <button type="button" onClick={handleSubmit} disabled={submitting || prompt.trim().length < 3}
+                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
                   className="h-11 px-5 text-white text-sm font-semibold rounded-2xl disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg flex items-center gap-2"
                   style={{ background: submitting ? '#5a8a7a' : 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
