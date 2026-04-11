@@ -308,7 +308,8 @@ class ChangeRequestController {
     // If image was saved, append the real URL to the prompt so the AI uses it
     let promptWithImage = changeRequest.prompt;
     if (savedImageUrl) {
-      promptWithImage += `\n\nThe uploaded image has been saved to: ${savedImageUrl}\nUse this exact path in the code: {{ asset('${savedImageUrl.substring(1)}') }}`;
+      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+      promptWithImage += `\n\nIMPORTANT: The user uploaded an image. It is saved at: ${savedImageUrl}\nYou MUST set the img src to exactly: ${assetPath}\nDo NOT copy any Cloudinary or external URL from the file. The new src MUST be: ${assetPath}`;
     }
 
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: promptWithImage, details: promptWithImage };
