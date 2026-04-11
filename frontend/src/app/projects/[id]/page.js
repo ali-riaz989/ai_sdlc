@@ -410,6 +410,35 @@ export default function ProjectPreview() {
       socketClient.onToken(cr.id, (tokenData) => {
         setStreamingTokens(prev => prev + (tokenData.token || ''));
       });
+
+      // Poll as fallback in case Socket.io doesn't deliver updates
+      const pollInterval = setInterval(async () => {
+        try {
+          const pollRes = await apiClient.getChangeRequest(cr.id);
+          const s = pollRes.data?.status;
+          if (s && s !== 'pending' && s !== 'analyzing' && s !== 'generating_code' && s !== 'staging') {
+            clearInterval(pollInterval);
+            setResult(prev => ({ ...prev, id: cr.id, status: s, message: s === 'failed' ? 'Change failed' : s === 'pending_review' ? 'Preview ready' : 'Done' }));
+            if (s === 'pending_review') {
+              setPendingDiff({ diff: [] });
+              reloadIframe();
+              setStreamingTokens('');
+            } else if (s === 'review') {
+              reloadIframe();
+              setPendingDiff(null);
+              setStreamingTokens('');
+              setLastAppliedId(cr.id);
+            } else if (s === 'failed') {
+              setPendingDiff(null);
+              setStreamingTokens('');
+              setActivePrompt(null);
+            }
+          }
+        } catch {}
+      }, 3000);
+      // Stop polling after 2 minutes
+      setTimeout(() => clearInterval(pollInterval), 120000);
+
     } catch (err) {
       setResult({ status: 'failed', message: err.response?.data?.error || 'Failed to submit' });
     } finally {
