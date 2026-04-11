@@ -224,16 +224,16 @@ class ChangeRequestController {
       logger.info('Built section map from code', { sections: pageContext.sectionMap.length });
     }
 
-    // If user uploaded an image, save it to project's public/images/ai-uploads/ and get the asset URL
+    // If user uploaded an image, save it to project's public/images/ and get the asset URL
     let savedImageUrl = null;
     if (imageData) {
       try {
         const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[imageData.mediaType] || '.jpg';
         const filename = `ai-${Date.now()}${ext}`;
-        const uploadDir = path.join(project.local_path, 'public', 'images', 'ai-uploads');
+        const uploadDir = path.join(project.local_path, 'public', 'images');
         await fs.mkdir(uploadDir, { recursive: true });
         await fs.writeFile(path.join(uploadDir, filename), Buffer.from(imageData.base64, 'base64'));
-        savedImageUrl = `/images/ai-uploads/${filename}`;
+        savedImageUrl = `/images/${filename}`;
         logger.info('Saved uploaded image', { path: savedImageUrl });
       } catch (imgErr) {
         logger.warn('Failed to save uploaded image', { error: imgErr.message });
