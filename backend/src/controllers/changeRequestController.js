@@ -230,18 +230,37 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
     };
 
-    // For image requests on large files: extract the relevant <section> block by keyword
-    // For text-only: send the full file for maximum precision
+    // For image requests on large files: use the section map to extract the right block
     let contentForAI = originalContent;
-    if (imageData && originalContent && originalContent.length > 30000) {
-      const section = this._findSectionByKeyword(originalContent, changeRequest.prompt);
-      if (section) {
-        contentForAI = section.content;
-        logger.info('Image request: extracted section', { file: pageBladeFile.blade_file, lines: `${section.startLine}-${section.endLine}`, keyword: section.keyword });
+    if (imageData && originalContent && originalContent.length > 30000 && pageContext?.sectionMap?.length) {
+      const lines = originalContent.split('\n');
+      const prompt = changeRequest.prompt.toLowerCase();
+
+      // Find the content section whose heading best matches the prompt
+      const contentSections = pageContext.sectionMap.filter(s => s.role === 'content-section' && s.startLine);
+      let bestSection = null;
+      let bestScore = 0;
+
+      for (const s of contentSections) {
+        let score = 0;
+        const heading = (s.heading || '').toLowerCase();
+        const classes = (s.classes || '').toLowerCase();
+        // Check if any word from heading appears in prompt
+        heading.split(/\s+/).forEach(w => { if (w.length > 2 && prompt.includes(w)) score += 10; });
+        classes.split(/[\s-]+/).forEach(w => { if (w.length > 2 && prompt.includes(w)) score += 3; });
+        if (score > bestScore) { bestScore = score; bestSection = s; }
+      }
+
+      if (bestSection && bestScore >= 10) {
+        // Extract from this section's start line to the next section (or +100 lines)
+        const startIdx = bestSection.startLine - 1;
+        const nextSection = contentSections.find(s => s.startLine > bestSection.startLine);
+        const endIdx = nextSection ? nextSection.startLine - 1 : Math.min(startIdx + 100, lines.length);
+        contentForAI = lines.slice(Math.max(0, startIdx - 3), endIdx).join('\n');
+        logger.info('Image request: matched section by heading', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
       } else {
-        // No section match — send first 30K chars
-        contentForAI = originalContent.substring(0, 30000) + '\n<!-- file truncated for image context -->';
-        logger.info('Image request: truncated large file', { file: pageBladeFile.blade_file });
+        contentForAI = originalContent.substring(0, 30000) + '\n<!-- file truncated -->';
+        logger.info('Image request: no heading match, truncated', { file: pageBladeFile.blade_file });
       }
     }
 
