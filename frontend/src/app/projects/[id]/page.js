@@ -669,7 +669,7 @@ export default function ProjectPreview() {
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
                     onPaste={handlePaste}
                     placeholder="Describe your design change..."
-                    disabled={submitting}
+                    disabled={submitting || !!pendingDiff}
                     className="w-full pl-4 pr-4 py-3 bg-white border-2 border-stone-300 rounded-2xl text-sm shadow-inner focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 disabled:opacity-50 transition-all placeholder:text-stone-400"
                   />
                 </div>
@@ -687,7 +687,7 @@ export default function ProjectPreview() {
                     <span className="text-[10px] text-stone-600 truncate font-medium">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                   </div>
                 )}
-                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
+                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || !!pendingDiff || prompt.trim().length < 3}
                   className="h-11 px-5 text-white text-sm font-semibold rounded-2xl disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg flex items-center gap-2"
                   style={{ background: submitting ? '#5a8a7a' : 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
