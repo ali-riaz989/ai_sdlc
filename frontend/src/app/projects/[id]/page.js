@@ -92,6 +92,20 @@ export default function ProjectPreview() {
     return () => window.removeEventListener('message', handler);
   }, []);
 
+  // Poll iframe URL — catches navigation on same-origin, onLoad handles cross-origin
+  useEffect(() => {
+    const interval = setInterval(() => {
+      try {
+        const href = iframeRef.current?.contentWindow?.location?.href;
+        if (href && !href.startsWith('about:')) {
+          const clean = href.split('?')[0];
+          setCurrentPageUrl(prev => prev !== clean ? clean : prev);
+        }
+      } catch {} // cross-origin — ignore
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   useEffect(() => {
     if (!id || !user) return;
     apiClient.getProject(id).then(res => setProject(res.data)).catch(() => router.replace('/'));
