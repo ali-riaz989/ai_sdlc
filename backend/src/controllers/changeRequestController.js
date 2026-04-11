@@ -224,6 +224,22 @@ class ChangeRequestController {
       logger.info('Built section map from code', { sections: pageContext.sectionMap.length });
     }
 
+    // If user uploaded an image, save it to project's public/images/ai-uploads/ and get the asset URL
+    let savedImageUrl = null;
+    if (imageData) {
+      try {
+        const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[imageData.mediaType] || '.jpg';
+        const filename = `ai-${Date.now()}${ext}`;
+        const uploadDir = path.join(project.local_path, 'public', 'images', 'ai-uploads');
+        await fs.mkdir(uploadDir, { recursive: true });
+        await fs.writeFile(path.join(uploadDir, filename), Buffer.from(imageData.base64, 'base64'));
+        savedImageUrl = `/images/ai-uploads/${filename}`;
+        logger.info('Saved uploaded image', { path: savedImageUrl });
+      } catch (imgErr) {
+        logger.warn('Failed to save uploaded image', { error: imgErr.message });
+      }
+    }
+
     emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
     const onToken = (chunk) => {
@@ -264,7 +280,13 @@ class ChangeRequestController {
       }
     }
 
-    const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: changeRequest.prompt, details: changeRequest.prompt };
+    // If image was saved, append the real URL to the prompt so the AI uses it
+    let promptWithImage = changeRequest.prompt;
+    if (savedImageUrl) {
+      promptWithImage += `\n\nThe uploaded image has been saved to: ${savedImageUrl}\nUse this exact path in the code: {{ asset('${savedImageUrl.substring(1)}') }}`;
+    }
+
+    const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: promptWithImage, details: promptWithImage };
     const generated = await aiService.generateCode(step, contentForAI, [], onToken, pageContext, imageData);
 
     let finalContent;
