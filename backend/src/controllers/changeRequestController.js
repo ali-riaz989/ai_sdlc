@@ -220,9 +220,10 @@ class ChangeRequestController {
   // ── Direct generate: 1 API call, no classify/analyze overhead ──────────────
   // Used when blade file is already resolved from the URL — the common case.
   async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
+    console.log('>>> directGenerate START');
     await this._updateStatus(requestId, 'generating_code');
     emit('generating_code', 'Generating change…');
-    logger.info('directGenerate', { file: pageBladeFile.blade_file, hasPageContext: !!pageContext, hasSectionMap: !!pageContext?.sectionMap?.length, hasImage: !!imageData });
+    console.log('>>> directGenerate: status updated, reading file...');
 
     const absPath = path.join(project.local_path, pageBladeFile.blade_file);
     let originalContent = null;
@@ -297,7 +298,9 @@ class ChangeRequestController {
     }
 
     const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: promptWithImage, details: promptWithImage };
+    console.log('>>> directGenerate: calling AI, file size:', contentForAI?.length, 'bytes, hasImage:', !!imageData);
     const generated = await aiService.generateCode(step, contentForAI, [], onToken, pageContext, imageData);
+    console.log('>>> directGenerate: AI returned mode:', generated?.mode);
 
     let finalContent;
     if (generated.mode === 'replace') {
