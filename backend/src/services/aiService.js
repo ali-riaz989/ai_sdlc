@@ -219,10 +219,8 @@ old_block RULES:
 File: ${fileInfo.file_path}
 ${numberedContent}
 
-STEP 1: Which section from the PAGE STRUCTURE MAP matches the user's request?
-STEP 2: Find that section's code in the file by line number.
-STEP 3: Return the surgical edit JSON (old_block WITHOUT line numbers):
-{"old_block":"verbatim raw text","new_block":"replacement"}`;
+Return ONLY the JSON edit. old_block must NOT include line numbers:
+{"old_block":"verbatim raw text from file","new_block":"replacement"}`;
 
       // Build user content — include image if provided
       const generateUserPrompt = imageData

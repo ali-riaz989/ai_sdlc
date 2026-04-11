@@ -212,10 +212,17 @@ class ChangeRequestController {
   async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
     await this._updateStatus(requestId, 'generating_code');
     emit('generating_code', 'Generating change…');
+    logger.info('directGenerate', { file: pageBladeFile.blade_file, hasPageContext: !!pageContext, hasSectionMap: !!pageContext?.sectionMap?.length, hasImage: !!imageData });
 
     const absPath = path.join(project.local_path, pageBladeFile.blade_file);
     let originalContent = null;
     try { originalContent = await fs.readFile(absPath, 'utf-8'); } catch {}
+
+    // If no DOM context from frontend (cross-origin iframe), build section map from the blade file
+    if ((!pageContext || !pageContext.sectionMap?.length) && originalContent) {
+      pageContext = this._buildSectionMapFromCode(originalContent);
+      logger.info('Built section map from code', { sections: pageContext.sectionMap.length });
+    }
 
     emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
@@ -494,6 +501,66 @@ class ChangeRequestController {
   // Find the ~80-line window in a file most relevant to the change.
   // Uses DOM context (visible headings/buttons/text) and prompt keywords.
   // Returns { content, startLine, endLine, score } or null (→ send full file).
+  // Build a section map from blade file source code (fallback when DOM context unavailable)
+  _buildSectionMapFromCode(content) {
+    const lines = content.split('\n');
+    const sectionMap = [];
+
+    // Find nav blocks
+    const navStart = lines.findIndex(l => /<nav[\s>]/i.test(l) || /class="[^"]*nav/i.test(l));
+    if (navStart >= 0) {
+      const navLinks = [];
+      for (let i = navStart; i < Math.min(navStart + 100, lines.length); i++) {
+        const m = lines[i].match(/<a[^>]*>([^<]+)<\/a>/);
+        if (m) navLinks.push(m[1].trim());
+        if (/<\/nav>/i.test(lines[i])) break;
+      }
+      sectionMap.push({ role: 'navigation', links: navLinks.slice(0, 15), _score: -10 });
+    }
+
+    // Find content sections
+    for (let i = 0; i < lines.length; i++) {
+      const sectionMatch = lines[i].match(/<section[\s>][^>]*(?:class="([^"]*)")?/i);
+      if (!sectionMatch) continue;
+
+      const classes = sectionMatch[1] || '';
+      const startLine = i + 1;
+
+      // Find heading, images, text within next 80 lines
+      let heading = null, headingTag = null;
+      const images = [], paragraphs = [], buttons = [];
+      const endLine = Math.min(i + 80, lines.length);
+
+      for (let j = i + 1; j < endLine; j++) {
+        if (/<\/section>/i.test(lines[j])) break;
+        if (!heading) {
+          const hm = lines[j].match(/<(h[1-4])[^>]*>([^<]*(?:<[^/][^>]*>[^<]*)*)<\/\1>/i);
+          if (hm) { headingTag = hm[1].toUpperCase(); heading = hm[2].replace(/<[^>]*>/g, '').trim(); }
+        }
+        const imgm = lines[j].match(/alt="([^"]*)"/);
+        if (imgm && images.length < 3) images.push({ alt: imgm[1] });
+        const pm = lines[j].match(/<p[^>]*>([^<]{10,})/);
+        if (pm && paragraphs.length < 2) paragraphs.push(pm[1].trim().substring(0, 100));
+        const bm = lines[j].match(/<(?:a|button)[^>]*class="[^"]*btn[^"]*"[^>]*>([^<]+)/i);
+        if (bm && buttons.length < 3) buttons.push(bm[1].trim());
+      }
+
+      sectionMap.push({
+        role: 'content-section',
+        classes: classes.substring(0, 120),
+        heading,
+        headingTag,
+        startLine,
+        content: paragraphs,
+        buttons,
+        images,
+        _score: 10
+      });
+    }
+
+    return { sectionMap };
+  }
+
   // Find a <section> block that contains a keyword from the prompt.
   // Returns { content, startLine, endLine, keyword } or null.
   _findSectionByKeyword(content, prompt) {
