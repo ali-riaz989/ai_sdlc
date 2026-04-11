@@ -15,7 +15,7 @@ const fs = require('fs').promises;
 class ChangeRequestController {
   async create(req, res, next) {
     try {
-      const { project_id, title, prompt, category, image_base64, image_media_type, orig_image_base64, orig_image_media_type, current_page_url, page_context } = req.body;
+      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context } = req.body;
       const userId = req.user.id;
 
       const [projects] = await sequelize.query(
@@ -50,21 +50,13 @@ class ChangeRequestController {
       );
 
       const imageData = (image_base64 && image_media_type)
-        ? {
-            base64: image_base64,           // compressed — sent to AI
-            mediaType: image_media_type,
-            origBase64: orig_image_base64 || image_base64,    // full-res — saved to disk
-            origMediaType: orig_image_media_type || image_media_type
-          }
+        ? { base64: image_base64, mediaType: image_media_type }
         : null;
 
-      console.log('>>> imageData in create:', imageData ? `base64=${imageData.base64?.length} orig=${imageData.origBase64?.length}` : 'NULL');
-      console.log('>>> ABOUT TO CALL _processChangeRequest, requestId:', requestId);
       const _this = this;
       (async function() {
         try {
           await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context);
-          console.log('>>> _processChangeRequest COMPLETED for', requestId);
         } catch (error) {
           console.error('>>> PROCESS ERROR:', error.message, error.stack);
           logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
@@ -240,15 +232,13 @@ class ChangeRequestController {
 
     // If user uploaded an image, save it to project's public/images/ and get the asset URL
     let savedImageUrl = null;
-    console.log('>>> imageData:', imageData ? `base64=${imageData.base64?.length} origBase64=${imageData.origBase64?.length} type=${imageData.mediaType}` : 'NULL');
     if (imageData) {
       try {
-        const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[imageData.origMediaType || imageData.mediaType] || '.jpg';
+        const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[imageData.mediaType] || '.jpg';
         const filename = `ai-${Date.now()}${ext}`;
         const uploadDir = path.join(project.local_path, 'public', 'images');
         await fs.mkdir(uploadDir, { recursive: true });
-        // Save the original full-res image to disk, not the compressed AI version
-        await fs.writeFile(path.join(uploadDir, filename), Buffer.from(imageData.origBase64 || imageData.base64, 'base64'));
+        await fs.writeFile(path.join(uploadDir, filename), Buffer.from(imageData.base64, 'base64'));
         savedImageUrl = `/images/${filename}`;
         logger.info('Saved uploaded image', { path: savedImageUrl });
       } catch (imgErr) {

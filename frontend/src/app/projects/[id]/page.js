@@ -362,9 +362,7 @@ export default function ProjectPreview() {
         page_context: pageContext,
         ...(image && {
           image_base64: image.base64,
-          image_media_type: image.mediaType,
-          orig_image_base64: image.origBase64 || image.base64,
-          orig_image_media_type: image.origMediaType || image.mediaType
+          image_media_type: image.mediaType
         })
       });
       const cr = res.data;
