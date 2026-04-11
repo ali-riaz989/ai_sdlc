@@ -251,9 +251,9 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
     };
 
-    // For image requests on large files: use the section map to extract the right block
+    // For large files: extract the relevant section to keep API calls fast
     let contentForAI = originalContent;
-    if (imageData && originalContent && originalContent.length > 30000 && pageContext?.sectionMap?.length) {
+    if (originalContent && originalContent.length > 15000 && pageContext?.sectionMap?.length) {
       const lines = originalContent.split('\n');
       const prompt = changeRequest.prompt.toLowerCase();
 
@@ -272,16 +272,16 @@ class ChangeRequestController {
         if (score > bestScore) { bestScore = score; bestSection = s; }
       }
 
-      if (bestSection && bestScore >= 10) {
-        // Extract from this section's start line to the next section (or +100 lines)
+      if (bestSection && bestScore >= 6) {
         const startIdx = bestSection.startLine - 1;
         const nextSection = contentSections.find(s => s.startLine > bestSection.startLine);
-        const endIdx = nextSection ? nextSection.startLine - 1 : Math.min(startIdx + 100, lines.length);
-        contentForAI = lines.slice(Math.max(0, startIdx - 3), endIdx).join('\n');
-        logger.info('Image request: matched section by heading', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
+        const endIdx = nextSection ? nextSection.startLine - 1 : Math.min(startIdx + 120, lines.length);
+        contentForAI = lines.slice(Math.max(0, startIdx - 5), endIdx).join('\n');
+        logger.info('Matched section by heading', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
       } else {
-        contentForAI = originalContent.substring(0, 30000) + '\n<!-- file truncated -->';
-        logger.info('Image request: no heading match, truncated', { file: pageBladeFile.blade_file });
+        // No heading match — send first 10K chars (fast enough for API)
+        contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated - specify which section to edit -->';
+        logger.info('No heading match, sending first 10K', { file: pageBladeFile.blade_file });
       }
     }
 
