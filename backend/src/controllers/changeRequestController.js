@@ -598,16 +598,19 @@ class ChangeRequestController {
       const classes = sectionMatch[1] || '';
       const startLine = i + 1;
 
-      // Find heading, images, text within next 80 lines
-      let heading = null, headingTag = null;
+      // Find ALL headings, images, text within next 150 lines
+      const headings = [];
+      let headingTag = null;
       const images = [], paragraphs = [], buttons = [];
-      const endLine = Math.min(i + 80, lines.length);
+      const endLine = Math.min(i + 150, lines.length);
 
       for (let j = i + 1; j < endLine; j++) {
         if (/<\/section>/i.test(lines[j])) break;
-        if (!heading) {
-          const hm = lines[j].match(/<(h[1-4])[^>]*>([^<]*(?:<[^/][^>]*>[^<]*)*)<\/\1>/i);
-          if (hm) { headingTag = hm[1].toUpperCase(); heading = hm[2].replace(/<[^>]*>/g, '').trim(); }
+        const hm = lines[j].match(/<(h[1-6])[^>]*>([^<]*(?:<[^/][^>]*>[^<]*)*)<\/\1>/i);
+        if (hm) {
+          const hText = hm[2].replace(/<[^>]*>/g, '').trim();
+          if (hText) headings.push(hText);
+          if (!headingTag) headingTag = hm[1].toUpperCase();
         }
         const imgm = lines[j].match(/alt="([^"]*)"/);
         if (imgm && images.length < 3) images.push({ alt: imgm[1] });
@@ -617,10 +620,11 @@ class ChangeRequestController {
         if (bm && buttons.length < 3) buttons.push(bm[1].trim());
       }
 
+      const heading = headings.join(' | ');
       sectionMap.push({
         role: 'content-section',
         classes: classes.substring(0, 120),
-        heading,
+        heading: heading || null,
         headingTag,
         startLine,
         content: paragraphs,
