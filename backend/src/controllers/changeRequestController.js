@@ -115,30 +115,37 @@ class ChangeRequestController {
 
     try {
       console.log('>>> INSIDE TRY BLOCK');
+      console.log('>>> About to query change request from DB');
       logger.info('Processing change request', { requestId, currentPageUrl });
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
+      console.log('>>> Got change request from DB:', changeRequest?.id);
 
       // ── Resolve current page → blade file (always, even with images) ────────
       let pageBladeFile = null;
       if (currentPageUrl) {
+        console.log('>>> Resolving route for:', currentPageUrl);
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
         const resolved = await routeResolver.resolve(project.local_path, currentPageUrl);
+        console.log('>>> Route resolved:', resolved?.blade_file || 'NULL');
         if (resolved) {
           try {
             await fs.access(resolved.abs_path);
             pageBladeFile = resolved;
+            console.log('>>> File exists on disk:', resolved.abs_path);
             logger.info('Page resolved', { blade: resolved.blade_file });
           } catch {
+            console.log('>>> File NOT found on disk:', resolved.abs_path);
             logger.warn('Resolved blade file not found on disk', { abs: resolved.abs_path });
           }
         }
       }
 
+      console.log('>>> pageBladeFile:', pageBladeFile?.blade_file || 'NULL', '| hasImage:', !!imageData);
       // When the blade file is resolved → always use directGenerate (1 API call).
-      // This ensures the AI edits the CORRECT file (the one the user is looking at).
       if (pageBladeFile) {
+        console.log('>>> Entering directGenerate');
         await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData);
       } else {
         // No page resolved (no URL sent) — fall back to full pipeline
