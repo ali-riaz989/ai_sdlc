@@ -288,9 +288,28 @@ class ChangeRequestController {
         contentForAI = lines.slice(Math.max(0, startIdx - 5), endIdx).join('\n');
         logger.info('Matched section by heading', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
       } else {
-        // No heading match — send first 10K chars (fast enough for API)
-        contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated - specify which section to edit -->';
-        logger.info('No heading match, sending first 10K', { file: pageBladeFile.blade_file });
+        // No heading match — search for keywords directly in the file content
+        const keywords = prompt.split(/\W+/).filter(w => w.length > 3);
+        let matchLine = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const lineLower = lines[i].toLowerCase();
+          for (const kw of keywords) {
+            if (lineLower.includes(kw)) { matchLine = i; break; }
+          }
+          if (matchLine >= 0) break;
+        }
+
+        if (matchLine >= 0) {
+          // Found keyword in file — extract ±60 lines around it
+          const start = Math.max(0, matchLine - 60);
+          const end = Math.min(lines.length, matchLine + 60);
+          contentForAI = lines.slice(start, end).join('\n');
+          logger.info('Matched by keyword search', { line: matchLine, keyword: keywords.find(kw => lines[matchLine].toLowerCase().includes(kw)) });
+        } else {
+          // Truly no match — send first 10K
+          contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated -->';
+          logger.info('No match found, sending first 10K', { file: pageBladeFile.blade_file });
+        }
       }
     }
 
