@@ -243,21 +243,37 @@ class ChangeRequestController {
 
     let finalContent;
     if (generated.mode === 'replace') {
-      const found = originalContent && originalContent.includes(generated.old_block);
+      // Strip line numbers if the AI accidentally included them (e.g. "42| <h1>")
+      let oldBlock = generated.old_block;
+      let newBlock = generated.new_block;
+      if (/^\d+\|\s/.test(oldBlock)) {
+        oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+        newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+        logger.info('Stripped line numbers from AI response');
+      }
+
+      const found = originalContent && originalContent.includes(oldBlock);
       if (found) {
-        finalContent = originalContent.split(generated.old_block).join(generated.new_block);
+        finalContent = originalContent.split(oldBlock).join(newBlock);
       } else if (originalContent) {
+        // Try normalizing line endings
         const norm = s => s.replace(/\r\n/g, '\n');
         const normContent = norm(originalContent);
-        const normOld = norm(generated.old_block);
+        const normOld = norm(oldBlock);
         if (normContent.includes(normOld)) {
-          finalContent = normContent.split(normOld).join(norm(generated.new_block));
+          finalContent = normContent.split(normOld).join(norm(newBlock));
         } else {
-          logger.warn('old_block not found — skipping', { file: step.file_path });
-          emitFile(step.file_path, 'modify', 'failed');
-          await this._updateStatus(requestId, 'failed');
-          emit('failed', 'AI generated a change that could not be located in the file');
-          return;
+          // Try trimming trailing whitespace per line
+          const trimLines = s => s.split('\n').map(l => l.trimEnd()).join('\n');
+          if (trimLines(normContent).includes(trimLines(normOld))) {
+            finalContent = trimLines(normContent).split(trimLines(normOld)).join(trimLines(norm(newBlock)));
+          } else {
+            logger.warn('old_block not found — skipping', { file: step.file_path, old_block_preview: oldBlock.substring(0, 200) });
+            emitFile(step.file_path, 'modify', 'failed');
+            await this._updateStatus(requestId, 'failed');
+            emit('failed', 'AI generated a change that could not be located in the file');
+            return;
+          }
         }
       }
     } else if (generated.mode === 'create') {
