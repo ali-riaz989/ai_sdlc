@@ -214,23 +214,21 @@ class ChangeRequestController {
     logger.info('Fast text swap complete', { requestId, files: changedFiles.length });
   }
 
-  // ── Direct generate: 1 API call, no classify/analyze overhead ──────────────
-  // Used when blade file is already resolved from the URL — the common case.
+  // ── 2-step flow: AI identifies section → confirms → edits ──────────────────
   async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
-    await this._updateStatus(requestId, 'generating_code');
-    emit('generating_code', 'Generating change…');
+    await this._updateStatus(requestId, 'analyzing');
+    emit('analyzing', 'Finding the right section…');
 
     const absPath = path.join(project.local_path, pageBladeFile.blade_file);
     let originalContent = null;
     try { originalContent = await fs.readFile(absPath, 'utf-8'); } catch {}
-
-    // If no DOM context from frontend (cross-origin iframe), build section map from the blade file
-    if ((!pageContext || !pageContext.sectionMap?.length) && originalContent) {
-      pageContext = this._buildSectionMapFromCode(originalContent);
-      logger.info('Built section map from code', { sections: pageContext.sectionMap.length });
+    if (!originalContent) {
+      await this._updateStatus(requestId, 'failed');
+      emit('failed', 'Could not read file');
+      return;
     }
 
-    // If user uploaded an image, save it to project's public/images/ and get the asset URL
+    // Save uploaded image to disk first
     let savedImageUrl = null;
     if (imageData) {
       try {
@@ -246,69 +244,43 @@ class ChangeRequestController {
       }
     }
 
+    // ── Step 1: Ask Claude to identify which section the user means ──────
+    // Send the full file (with line numbers) so Claude can find the right section
+    // For large files, truncate to first 15K lines to stay within limits
+    const contentForIdentify = originalContent.length > 50000
+      ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
+      : originalContent;
+
+    const section = await aiService.identifySection(
+      changeRequest.prompt, contentForIdentify, pageBladeFile.blade_file,
+      imageData
+    );
+
+    if (!section || !section.line_start) {
+      logger.warn('Could not identify section', { requestId });
+      await this._updateStatus(requestId, 'failed');
+      emit('failed', 'Could not identify which section to edit');
+      return;
+    }
+
+    logger.info('Section identified', { heading: section.section_heading, lines: `${section.line_start}-${section.line_end}`, confidence: section.confidence });
+
+    // ── Extract the section content from the file ────────────────────────
+    const lines = originalContent.split('\n');
+    const startIdx = Math.max(0, section.line_start - 5);
+    const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 5);
+    const sectionContent = lines.slice(startIdx, endIdx).join('\n');
+
+    // ── Emit section confirmation to frontend ────────────────────────────
+    // The frontend shows "Editing section: X" and the user sees the preview
+    emit('generating_code', `Editing: ${section.section_heading || 'section at line ' + section.line_start}`);
     emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
-    const onToken = (chunk) => {
-      if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
-    };
-
-    // For large files: extract the relevant section to keep API calls fast
-    let contentForAI = originalContent;
-    if (originalContent && originalContent.length > 15000 && pageContext?.sectionMap?.length) {
-      const lines = originalContent.split('\n');
-      const prompt = changeRequest.prompt.toLowerCase();
-
-      // Find the content section whose heading best matches the prompt
-      const contentSections = pageContext.sectionMap.filter(s => s.role === 'content-section' && s.startLine);
-      let bestSection = null;
-      let bestScore = 0;
-
-      for (const s of contentSections) {
-        let score = 0;
-        const heading = (s.heading || '').toLowerCase();
-        const classes = (s.classes || '').toLowerCase();
-        // Check if any word from heading appears in prompt
-        heading.split(/\s+/).forEach(w => { if (w.length > 2 && prompt.includes(w)) score += 10; });
-        classes.split(/[\s-]+/).forEach(w => { if (w.length > 2 && prompt.includes(w)) score += 3; });
-        if (score > bestScore) { bestScore = score; bestSection = s; }
-      }
-
-      // Also check section content/paragraphs for matches, not just headings
-      if (bestScore < 6) {
-        for (const s of contentSections) {
-          let score = 0;
-          const allText = ((s.heading || '') + ' ' + (s.content || []).join(' ')).toLowerCase();
-          const promptWords = prompt.split(/\W+/).filter(w => w.length > 3);
-          const stopWords = new Set(['this','that','with','from','have','make','change','update','image','section','background','replace','here','text','color','button','heading','page','font','size','style','add']);
-          for (const w of promptWords) {
-            if (!stopWords.has(w) && allText.includes(w)) score += 8;
-          }
-          if (score > bestScore) { bestScore = score; bestSection = s; }
-        }
-      }
-
-      if (bestSection && bestScore >= 6) {
-        const startIdx = bestSection.startLine - 1;
-        const nextSection = contentSections.find(s => s.startLine > bestSection.startLine);
-        const endIdx = nextSection ? nextSection.startLine - 1 : Math.min(startIdx + 120, lines.length);
-        contentForAI = lines.slice(Math.max(0, startIdx - 5), endIdx).join('\n');
-        logger.info('Matched section', { heading: bestSection.heading, lines: `${startIdx}-${endIdx}`, score: bestScore });
-      } else {
-        // No section match — send first 10K
-        contentForAI = originalContent.substring(0, 10000) + '\n<!-- file truncated -->';
-        logger.info('No section match, sending first 10K', { file: pageBladeFile.blade_file });
-      }
-    }
-
-    // If image was saved, append the real URL to the prompt so the AI uses it
-    let promptWithImage = changeRequest.prompt;
-    if (savedImageUrl) {
-      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-      promptWithImage += `\n\nIMPORTANT: The user uploaded an image. It is saved at: ${savedImageUrl}\nYou MUST set the img src to exactly: ${assetPath}\nDo NOT copy any Cloudinary or external URL from the file. The new src MUST be: ${assetPath}`;
-    }
-
-    const step = { file_path: pageBladeFile.blade_file, change_type: 'modify', description: promptWithImage, details: promptWithImage };
-    const generated = await aiService.generateCode(step, contentForAI, [], onToken, pageContext, imageData);
+    // ── Step 2: Generate the edit for this specific section ──────────────
+    const generated = await aiService.generateSectionEdit(
+      changeRequest.prompt, sectionContent, pageBladeFile.blade_file,
+      imageData, savedImageUrl
+    );
 
     let finalContent;
     if (generated.mode === 'replace') {

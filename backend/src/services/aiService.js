@@ -58,6 +58,100 @@ class AIService {
     }
   }
 
+  // ─── Identify which section the user wants to edit ─────────────────────────
+  // Returns { section_heading, line_start, line_end, preview, confidence }
+  async identifySection(prompt, fileContent, filePath, imageData = null) {
+    logger.info('Identifying section', { prompt: prompt.substring(0, 80) });
+
+    const numberedContent = fileContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
+
+    const textBlock = {
+      type: 'text',
+      text: `The user wants to make this change: "${prompt}"
+
+File: ${filePath}
+${numberedContent}
+
+Which section of this file is the user referring to? Return ONLY valid JSON:
+{
+  "section_heading": "the heading or name of the section",
+  "line_start": 100,
+  "line_end": 150,
+  "preview": "first 2-3 lines of the section content (raw, no line numbers)",
+  "confidence": "high" or "medium" or "low",
+  "explanation": "brief explanation of why this section matches"
+}`
+    };
+
+    const userContent = imageData
+      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
+      : [textBlock];
+
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 500,
+        system: 'You identify which section of an HTML/Blade file a user is referring to. Return ONLY valid JSON.',
+        messages: [{ role: 'user', content: userContent }]
+      });
+      return this._extractJSON(response.content[0].text);
+    } catch (error) {
+      logger.error('Section identification failed', { error: error.message });
+      return null;
+    }
+  }
+
+  // ─── Generate edit for a confirmed section ─────────────────────────────────
+  // Takes the identified section lines and makes the edit
+  async generateSectionEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
+    logger.info('Generating section edit', { file: filePath });
+
+    let fullPrompt = prompt;
+    if (savedImageUrl) {
+      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+      fullPrompt += `\n\nIMPORTANT: The user uploaded an image saved at: ${savedImageUrl}\nYou MUST set the img src to exactly: ${assetPath}\nDo NOT use any Cloudinary or external URL.`;
+    }
+
+    const textBlock = {
+      type: 'text',
+      text: `User request: "${fullPrompt}"
+
+Here is the section to edit:
+\`\`\`blade
+${sectionContent}
+\`\`\`
+
+Return ONLY valid JSON with the exact block to replace:
+{"old_block":"verbatim text from the section above","new_block":"replacement text"}
+
+Rules:
+- old_block must be character-for-character identical to text in the section
+- Include 2-3 surrounding lines for uniqueness
+- new_block changes ONLY what the user asked`
+    };
+
+    const userContent = imageData
+      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
+      : [textBlock];
+
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 4096,
+        system: 'You are an AI code editor. Make precise surgical edits. Return ONLY valid JSON: {"old_block":"...","new_block":"..."}',
+        messages: [{ role: 'user', content: userContent }]
+      });
+      const result = this._extractJSON(response.content[0].text);
+      if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        return { mode: 'replace', old_block: result.old_block, new_block: result.new_block };
+      }
+      return { mode: 'skip' };
+    } catch (error) {
+      logger.error('Section edit failed', { error: error.message });
+      throw error;
+    }
+  }
+
   // ─── Step 2b: Scoped page analysis — only one blade file sent ─────────────
   // Returns { result, messages } — messages threads into the generate step.
   async analyzePageChange(prompt, bladeFilePath, bladeContent, imageData = null, changeHistory = '', relatedFiles = []) {
