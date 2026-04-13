@@ -287,6 +287,14 @@ export default function ProjectPreview() {
     setActivePrompt(submittedPrompt);
 
     try {
+      // ── Auto-reject any pending review before submitting new prompt ────
+      if (result?.id && result?.status === 'pending_review') {
+        try {
+          await apiClient.rejectChangeRequest(result.id);
+          setPendingDiff(null);
+        } catch {}
+      }
+
       // ── Intercept undo/revert prompts — use DB restore instead of AI ────
       const revertPattern = /^(undo|revert|rollback|restore|go back|cancel)\b/i;
       if (revertPattern.test(submittedPrompt.trim()) && lastAppliedId) {
@@ -410,32 +418,33 @@ export default function ProjectPreview() {
         setStreamingTokens(prev => prev + (tokenData.token || ''));
       });
 
-      // Poll as fallback in case Socket.io doesn't deliver updates
+      // Poll for status updates (Socket.io may not work through Nginx)
       const pollInterval = setInterval(async () => {
         try {
           const pollRes = await apiClient.getChangeRequest(cr.id);
           const s = pollRes.data?.status;
-          if (s && s !== 'pending' && s !== 'analyzing' && s !== 'generating_code' && s !== 'staging') {
-            clearInterval(pollInterval);
-            setResult(prev => ({ ...prev, id: cr.id, status: s, message: s === 'failed' ? 'Change failed' : s === 'pending_review' ? 'Preview ready' : 'Done' }));
-            if (s === 'pending_review') {
-              setPendingDiff({ diff: [] });
-              reloadIframe();
-              setStreamingTokens('');
-            } else if (s === 'review') {
-              reloadIframe();
-              setPendingDiff(null);
-              setStreamingTokens('');
-              setLastAppliedId(cr.id);
-            } else if (s === 'failed') {
-              setPendingDiff(null);
-              setStreamingTokens('');
-              setActivePrompt(null);
-            }
+          if (!s || ['pending', 'analyzing', 'generating_code', 'staging'].includes(s)) return;
+          clearInterval(pollInterval);
+          if (s === 'pending_review') {
+            setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Preview ready' }));
+            setPendingDiff({ diff: [] });
+            reloadIframe();
+            setStreamingTokens('');
+          } else if (s === 'review') {
+            setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Done' }));
+            reloadIframe();
+            setPendingDiff(null);
+            setStreamingTokens('');
+            setLastAppliedId(cr.id);
+          } else if (s === 'failed') {
+            setResult(prev => ({ ...prev, id: cr.id, status: 'failed', message: 'Change failed' }));
+            setPendingDiff(null);
+            setStreamingTokens('');
+            setActivePrompt(null);
+            setTimeout(() => setResult(null), 5000);
           }
         } catch {}
-      }, 3000);
-      // Stop polling after 2 minutes
+      }, 2000);
       setTimeout(() => clearInterval(pollInterval), 120000);
 
     } catch (err) {
@@ -669,7 +678,7 @@ export default function ProjectPreview() {
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
                     onPaste={handlePaste}
                     placeholder="Describe your design change..."
-                    disabled={submitting || !!pendingDiff}
+                    disabled={submitting}
                     className="w-full pl-4 pr-4 py-3 bg-white border-2 border-stone-300 rounded-2xl text-sm shadow-inner focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 disabled:opacity-50 transition-all placeholder:text-stone-400"
                   />
                 </div>
@@ -687,7 +696,7 @@ export default function ProjectPreview() {
                     <span className="text-[10px] text-stone-600 truncate font-medium">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
                   </div>
                 )}
-                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || !!pendingDiff || prompt.trim().length < 3}
+                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
                   className="h-11 px-5 text-white text-sm font-semibold rounded-2xl disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg flex items-center gap-2"
                   style={{ background: submitting ? '#5a8a7a' : 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
