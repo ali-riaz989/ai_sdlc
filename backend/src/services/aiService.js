@@ -58,28 +58,36 @@ class AIService {
     }
   }
 
-  // ─── Identify which section the user wants to edit ─────────────────────────
-  // Returns { section_heading, line_start, line_end, preview, confidence }
-  async identifySection(prompt, fileContent, filePath, imageData = null) {
-    logger.info('Identifying section', { prompt: prompt.substring(0, 80) });
+  // ─── PHASE 1: Identify target section using structured DOM + file ────────
+  // AI thinks through: understand → locate → validate
+  // Returns { target_section, line_start, line_end, reasoning, confidence }
+  async identifySection(prompt, structuredSections, fileContent, filePath, imageData = null) {
+    logger.info('Phase 1: Identifying section', { prompt: prompt.substring(0, 80) });
 
     const numberedContent = fileContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
 
     const textBlock = {
       type: 'text',
-      text: `The user wants to make this change: "${prompt}"
+      text: `USER REQUEST: "${prompt}"
 
-File: ${filePath}
+PAGE STRUCTURE (each section with its role and content):
+${JSON.stringify(structuredSections, null, 2)}
+
+FILE (with line numbers):
 ${numberedContent}
 
-Which section of this file is the user referring to? Return ONLY valid JSON:
+Follow this thinking process:
+UNDERSTAND: What does the user want to change?
+LOCATE: Which section from the PAGE STRUCTURE matches? Use context and meaning, not just keywords.
+VALIDATE: Is this the ONLY correct match? If multiple sections match, pick the content section (not navigation).
+
+Return ONLY valid JSON:
 {
-  "section_heading": "the heading or name of the section",
+  "target_section": "heading or description of the matched section",
   "line_start": 100,
   "line_end": 150,
-  "preview": "first 2-3 lines of the section content (raw, no line numbers)",
-  "confidence": "high" or "medium" or "low",
-  "explanation": "brief explanation of why this section matches"
+  "reasoning": "why this section matches the user's request",
+  "confidence": "high|medium|low"
 }`
     };
 
@@ -91,7 +99,14 @@ Which section of this file is the user referring to? Return ONLY valid JSON:
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 500,
-        system: 'You identify which section of an HTML/Blade file a user is referring to. Return ONLY valid JSON.',
+        system: `You are an intelligent section identifier. Your job is to find which section of a webpage the user wants to edit.
+
+RULES:
+- Prefer CONTENT sections over navigation/header/footer
+- Use meaning and context, not just keyword matching
+- "Leeds golf" could mean a heading that says "Leeds Golf Centre" — fuzzy match is OK
+- If the user mentions text that's slightly different from the file, still match the closest section
+- Return the line range that covers the FULL section (from <section> to </section>)`,
         messages: [{ role: 'user', content: userContent }]
       });
       return this._extractJSON(response.content[0].text);
@@ -101,33 +116,36 @@ Which section of this file is the user referring to? Return ONLY valid JSON:
     }
   }
 
-  // ─── Generate edit for a confirmed section ─────────────────────────────────
-  // Takes the identified section lines and makes the edit
-  async generateSectionEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
-    logger.info('Generating section edit', { file: filePath });
+  // ─── PHASE 2: Execute edit within the identified section ───────────────
+  // AI receives ONLY the target section code and makes the precise edit
+  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
+    logger.info('Phase 2: Executing edit', { file: filePath });
 
-    let fullPrompt = prompt;
+    let editInstruction = prompt;
     if (savedImageUrl) {
       const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-      fullPrompt += `\n\nIMPORTANT: The user uploaded an image saved at: ${savedImageUrl}\nYou MUST set the img src to exactly: ${assetPath}\nDo NOT use any Cloudinary or external URL.`;
+      editInstruction += `\n\nThe user uploaded an image. It is saved at: ${savedImageUrl}\nYou MUST use this exact src: ${assetPath}\nDo NOT use any Cloudinary URL or external URL from the file.`;
     }
 
     const textBlock = {
       type: 'text',
-      text: `User request: "${fullPrompt}"
+      text: `USER REQUEST: "${editInstruction}"
 
-Here is the section to edit:
+SECTION TO EDIT (this is the ONLY section you may modify):
 \`\`\`blade
 ${sectionContent}
 \`\`\`
 
-Return ONLY valid JSON with the exact block to replace:
-{"old_block":"verbatim text from the section above","new_block":"replacement text"}
+PLAN: Describe what exactly will change, then execute.
 
-Rules:
-- old_block must be character-for-character identical to text in the section
-- Include 2-3 surrounding lines for uniqueness
-- new_block changes ONLY what the user asked`
+Return ONLY valid JSON:
+{"old_block":"exact verbatim text from the section above to replace","new_block":"the replacement text"}
+
+RULES:
+- old_block MUST be character-for-character identical to text in the section above
+- Include 2-3 surrounding lines in old_block for uniqueness
+- new_block changes ONLY what the user asked — preserve everything else
+- Do NOT modify any code outside old_block`
     };
 
     const userContent = imageData
@@ -138,16 +156,22 @@ Rules:
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 4096,
-        system: 'You are an AI code editor. Make precise surgical edits. Return ONLY valid JSON: {"old_block":"...","new_block":"..."}',
+        system: `You are a precise code editor. You receive a single section of a Blade file and make exactly one surgical edit.
+
+VERIFY before responding:
+- Is old_block copied exactly from the section? (character-for-character)
+- Does new_block change ONLY what was requested?
+- Are no unrelated parts modified?`,
         messages: [{ role: 'user', content: userContent }]
       });
       const result = this._extractJSON(response.content[0].text);
       if (result?.old_block !== undefined && result?.new_block !== undefined) {
         return { mode: 'replace', old_block: result.old_block, new_block: result.new_block };
       }
+      logger.warn('AI returned unexpected shape', { keys: Object.keys(result || {}) });
       return { mode: 'skip' };
     } catch (error) {
-      logger.error('Section edit failed', { error: error.message });
+      logger.error('Edit execution failed', { error: error.message });
       throw error;
     }
   }

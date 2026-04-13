@@ -244,16 +244,33 @@ class ChangeRequestController {
       }
     }
 
-    // ── Step 1: Ask Claude to identify which section the user means ──────
-    // Send the full file (with line numbers) so Claude can find the right section
-    // For large files, truncate to first 15K lines to stay within limits
+    // ── Build structured sections from DOM context or code ─────────────
+    let structuredSections = pageContext?.sections || [];
+    if (!structuredSections.length) {
+      const codeCtx = this._buildSectionMapFromCode(originalContent);
+      structuredSections = codeCtx.sectionMap.map((s, i) => ({
+        id: `sec_${i + 1}`,
+        role: s.role,
+        tag: 'section',
+        classes: s.classes || '',
+        headings: s.heading ? s.heading.split(' | ').map(h => ({ tag: s.headingTag || 'h2', text: h })) : [],
+        text: (s.content || []).join(' ').substring(0, 200),
+        children_summary: [],
+        images: s.images || [],
+        buttons: s.buttons || [],
+        links: s.links || []
+      }));
+      logger.info('Built structured sections from code', { count: structuredSections.length });
+    }
+
+    // ── PHASE 1: AI identifies which section the user means ──────────────
     const contentForIdentify = originalContent.length > 50000
       ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
       : originalContent;
 
     const section = await aiService.identifySection(
-      changeRequest.prompt, contentForIdentify, pageBladeFile.blade_file,
-      imageData
+      changeRequest.prompt, structuredSections, contentForIdentify,
+      pageBladeFile.blade_file, imageData
     );
 
     if (!section || !section.line_start) {
@@ -263,21 +280,26 @@ class ChangeRequestController {
       return;
     }
 
-    logger.info('Section identified', { heading: section.section_heading, lines: `${section.line_start}-${section.line_end}`, confidence: section.confidence });
+    logger.info('Section identified', {
+      target: section.target_section,
+      lines: `${section.line_start}-${section.line_end}`,
+      confidence: section.confidence,
+      reasoning: section.reasoning
+    });
 
     // ── Extract the section content from the file ────────────────────────
     const lines = originalContent.split('\n');
-    const startIdx = Math.max(0, section.line_start - 5);
-    const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 5);
+    const startIdx = Math.max(0, section.line_start - 3);
+    const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 3);
     const sectionContent = lines.slice(startIdx, endIdx).join('\n');
 
-    // ── Emit section confirmation to frontend ────────────────────────────
-    // The frontend shows "Editing section: X" and the user sees the preview
-    emit('generating_code', `Editing: ${section.section_heading || 'section at line ' + section.line_start}`);
+    // ── Emit to frontend: "Editing: {section name}" ─────────────────────
+    await this._updateStatus(requestId, 'generating_code');
+    emit('generating_code', `Editing: ${section.target_section || 'section'} (${section.confidence} confidence)`);
     emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
-    // ── Step 2: Generate the edit for this specific section ──────────────
-    const generated = await aiService.generateSectionEdit(
+    // ── PHASE 2: AI executes the edit within the identified section ──────
+    const generated = await aiService.executeEdit(
       changeRequest.prompt, sectionContent, pageBladeFile.blade_file,
       imageData, savedImageUrl
     );
