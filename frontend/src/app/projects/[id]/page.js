@@ -327,41 +327,8 @@ export default function ProjectPreview() {
       // ── Extract DOM context from iframe (0ms) ──────────────────────────
       const pageContext = iframeRef.current ? extractPageContext(iframeRef.current) : null;
 
-      // ── Try quick path first (Tier 1 or Tier 2) — no image ────────────
-      if (!submittedImage) {
-        setResult({ status: 'analyzing', message: 'Applying change…' });
-        try {
-          const qRes = await apiClient.quickChangeRequest({
-            project: { local_path: project.local_path, project_url: project.project_url },
-            prompt: submittedPrompt,
-            current_page_url: livePageUrl,
-            page_context: pageContext
-          });
-          const q = qRes.data;
-
-          if (!q.fallback) {
-            // Tier 1 or 2 succeeded
-            const tierLabel = q.tier === 1 ? 'Instant' : 'Fast';
-            setResult({ status: 'review', message: `${tierLabel} change applied` });
-            setFiles([{ file: q.file, change_type: 'modify', status: 'done' }]);
-
-            // Try DOM update first (no reload), fall back to iframe reload
-            const domApplied = q.dom_update && iframeRef.current
-              ? applyDomUpdate(iframeRef.current, q.dom_update)
-              : false;
-            if (!domApplied) reloadIframe();
-            setImage(null);
-            setSubmitting(false);
-            return;
-          }
-          // q.fallback === true → fall through to full pipeline
-          setResult({ status: 'analyzing', message: 'Running full analysis…' });
-        } catch {
-          // quick endpoint failed → fall through
-        }
-      }
-
-      // ── Full pipeline (Tier 3) ─────────────────────────────────────────
+      // ── All prompts go through the 2-step AI flow (identify → edit) ────
+      setResult({ status: 'analyzing', message: 'Analyzing change…' });
       const res = await apiClient.createChangeRequest({
         project_id: id,
         title: submittedPrompt.substring(0, 100),
