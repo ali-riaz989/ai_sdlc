@@ -84,8 +84,13 @@ class ChangeRequestController {
         'SELECT * FROM staging_environments WHERE change_request_id = $1 LIMIT 1',
         { bind: [id] }
       );
+      const [generatedCode] = await sequelize.query(
+        'SELECT id, file_path, change_type, diff FROM generated_code WHERE change_request_id = $1',
+        { bind: [id] }
+      );
       const result = requests[0];
       result.staging = stagingEnvs[0] || null;
+      result.generated_code = generatedCode || [];
       res.json(result);
     } catch (error) {
       next(error);
@@ -287,114 +292,35 @@ class ChangeRequestController {
       reasoning: section.reasoning
     });
 
-    // ── Extract the section content from the file ────────────────────────
+    // ── Extract section preview for confirmation ──────────────────────────
     const lines = originalContent.split('\n');
     const startIdx = Math.max(0, section.line_start - 3);
     const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 3);
-    const sectionContent = lines.slice(startIdx, endIdx).join('\n');
+    const sectionPreview = lines.slice(section.line_start - 1, Math.min(section.line_start + 4, lines.length)).join('\n');
 
-    // ── Emit to frontend: "Editing: {section name}" ─────────────────────
-    await this._updateStatus(requestId, 'generating_code');
-    emit('generating_code', `Editing: ${section.target_section || 'section'} (${section.confidence} confidence)`);
-    emitFile(pageBladeFile.blade_file, 'modify', 'generating');
-
-    // ── PHASE 2: AI executes the edit within the identified section ──────
-    const generated = await aiService.executeEdit(
-      changeRequest.prompt, sectionContent, pageBladeFile.blade_file,
-      imageData, savedImageUrl
-    );
-
-    let finalContent;
-    if (generated.mode === 'replace') {
-      // Strip line numbers if the AI accidentally included them (e.g. "42| <h1>")
-      let oldBlock = generated.old_block;
-      let newBlock = generated.new_block;
-      if (/^\d+\|\s/.test(oldBlock)) {
-        oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-        newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-        logger.info('Stripped line numbers from AI response');
-      }
-
-      const found = originalContent && originalContent.includes(oldBlock);
-      if (found) {
-        finalContent = originalContent.split(oldBlock).join(newBlock);
-      } else if (originalContent) {
-        // Try normalizing line endings
-        const norm = s => s.replace(/\r\n/g, '\n');
-        const normContent = norm(originalContent);
-        const normOld = norm(oldBlock);
-        if (normContent.includes(normOld)) {
-          finalContent = normContent.split(normOld).join(norm(newBlock));
-        } else {
-          // Try trimming trailing whitespace per line
-          const trimLines = s => s.split('\n').map(l => l.trimEnd()).join('\n');
-          if (trimLines(normContent).includes(trimLines(normOld))) {
-            finalContent = trimLines(normContent).split(trimLines(normOld)).join(trimLines(norm(newBlock)));
-          } else {
-            // Normalize smart quotes/apostrophes and try again
-            const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, '-').replace(/\u2026/g, '...');
-            const qContent = normQ(normContent);
-            const qOld = normQ(normOld);
-            const qNew = normQ(norm(newBlock));
-            if (qContent.includes(qOld)) {
-              finalContent = qContent.split(qOld).join(qNew);
-              logger.info('Matched after smart quote normalization');
-            } else {
-              logger.warn('old_block not found — skipping', { file: step.file_path, old_block_preview: oldBlock.substring(0, 200) });
-              emitFile(step.file_path, 'modify', 'failed');
-              await this._updateStatus(requestId, 'failed');
-              emit('failed', 'AI generated a change that could not be located in the file');
-              return;
-            }
-          }
-        }
-      }
-    } else if (generated.mode === 'create') {
-      finalContent = generated.content;
-    } else {
-      logger.warn('AI returned skip', { file: step.file_path });
-      emitFile(step.file_path, 'modify', 'failed');
-      await this._updateStatus(requestId, 'failed');
-      emit('failed', 'AI could not determine the change');
-      return;
-    }
-
-    // PHP syntax check
-    if (step.file_path.endsWith('.php')) {
-      const { validatePhpSyntax } = require('../services/phpValidator');
-      const check = await validatePhpSyntax(finalContent);
-      if (!check.valid) {
-        logger.warn('PHP syntax error', { file: step.file_path, output: check.output });
-        emitFile(step.file_path, 'modify', 'failed');
-        await this._updateStatus(requestId, 'failed');
-        emit('failed', 'Generated code has syntax errors');
-        return;
-      }
-    }
-
-    // Store in DB
-    const gcId = uuidv4();
+    // ── Store section info + original content in DB for Phase 2 ─────────
     await sequelize.query(
       `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
-       VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
-      { bind: [gcId, requestId, step.file_path, originalContent, finalContent, JSON.stringify({ old_block: generated.old_block || '', new_block: generated.new_block || '' })] }
+       VALUES ($1, $2, $3, $4, '', 'modify', $5)`,
+      { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent,
+        JSON.stringify({
+          line_start: startIdx, line_end: endIdx, saved_image_url: savedImageUrl,
+          target_section: section.target_section, reasoning: section.reasoning,
+          confidence: section.confidence, preview: sectionPreview
+        })
+      ]}
     );
 
-    emitFile(step.file_path, 'modify', 'done');
-
-    // Write to disk for live preview
-    await fs.mkdir(path.dirname(absPath), { recursive: true });
-    await fs.writeFile(absPath, finalContent, 'utf-8');
-    logger.info('Applied file for preview', { file: step.file_path });
-
-    await projectCache.invalidate(project.id);
-    await this._clearViewCache(project.local_path);
-
-    // Enter pending_review — user sees live preview and clicks Accept/Reject
-    await this._updateStatus(requestId, 'pending_review');
-    const diffPayload = [{ file_path: step.file_path, change_type: 'modify', old_block: generated.old_block || '', new_block: generated.new_block || '' }];
-    emit('pending_review', JSON.stringify({ message: 'Preview ready — accept or reject', diff: diffPayload }));
-    logger.info('Direct generate complete', { requestId });
+    // ── STOP — ask user to confirm before editing ────────────────────────
+    await this._updateStatus(requestId, 'confirm_section');
+    emit('confirm_section', JSON.stringify({
+      target_section: section.target_section,
+      reasoning: section.reasoning,
+      confidence: section.confidence,
+      preview: sectionPreview,
+      file: pageBladeFile.blade_file
+    }));
+    logger.info('Waiting for user confirmation', { requestId, section: section.target_section });
   }
 
   // ── Full pipeline: analyze → generate (scoped to current page file) ────────

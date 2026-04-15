@@ -109,43 +109,81 @@ RULES:
 - Return the line range that covers the FULL section (from <section> to </section>)`,
         messages: [{ role: 'user', content: userContent }]
       });
-      return this._extractJSON(response.content[0].text);
+      try {
+        return this._extractJSON(response.content[0].text);
+      } catch (jsonErr) {
+        logger.warn('AI returned invalid JSON in identifySection', { response: response.content[0].text.substring(0, 500) });
+        return null;
+      }
     } catch (error) {
       logger.error('Section identification failed', { error: error.message });
       return null;
     }
   }
 
-  // ─── PHASE 2: Execute edit within the identified section ───────────────
-  // AI receives ONLY the target section code and makes the precise edit
+  // ─── PHASE 2: Execute edit — returns CSS selector + action ──────────────
   async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
     logger.info('Phase 2: Executing edit', { file: filePath });
 
     let editInstruction = prompt;
     if (savedImageUrl) {
       const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-      editInstruction += `\n\nThe user uploaded an image. It is saved at: ${savedImageUrl}\nYou MUST use this exact src: ${assetPath}\nDo NOT use any Cloudinary URL or external URL from the file.`;
+      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
     }
+
+    const systemPrompt = `You are an advanced web editing AI working inside a live webpage editor.
+
+You do NOT have direct access to the full DOM.
+You must rely only on the provided section HTML and user intent.
+
+Your goal is to generate a PRECISE and SAFE edit instruction.
+
+THINKING PROCESS (MANDATORY — follow these steps internally before answering):
+
+1. UNDERSTAND — What exactly does the user want to change?
+2. LOCATE — Identify ALL possible matching elements from the provided HTML. Use context like tag type, class names, content, and structure — NOT keyword alone.
+3. DISAMBIGUATE — If multiple matches exist, prefer elements in main content. Avoid nav/header/footer unless explicitly asked. Choose the most semantically relevant element.
+4. VALIDATE — Ensure your selector will match ONLY ONE element. If not, refine using hierarchy (:nth-child, parent classes, etc.)
+5. PLAN — Decide the MINIMAL change required.
+6. EXECUTE — Generate the structured edit instruction.
+7. VERIFY — Before final output, internally simulate whether the selector affects any unintended elements.
+
+SUPPORTED ACTIONS:
+- replace_text: change text content of an element
+- replace_html: replace innerHTML of an element
+- update_style: change inline CSS styles
+- replace_image: change img src attribute
+- insert_element: insert new HTML before/after an element
+
+OUTPUT FORMAT (STRICT JSON — nothing else):
+{
+  "selector": "unique CSS selector targeting exactly one element",
+  "action": "replace_text|replace_html|update_style|replace_image|insert_element",
+  "value": "new value (text, HTML, or image src)",
+  "styles": {},
+  "position": "before|after",
+  "reasoning": "short explanation of why this element was chosen"
+}
+
+STRICT RULES:
+- NEVER modify navigation, header, or footer unless explicitly asked
+- NEVER return full HTML page
+- NEVER use vague selectors like "div" or "section" alone
+- ALWAYS return a selector that targets exactly ONE element
+- If ambiguity exists, DO NOT GUESS — return: {"error": "Target element is ambiguous. Need more specific instruction."}
+
+Precision is more important than speed. Do not guess. Do not over-edit.`;
 
     const textBlock = {
       type: 'text',
       text: `USER REQUEST: "${editInstruction}"
 
-SECTION TO EDIT (this is the ONLY section you may modify):
+SECTION HTML (this is the ONLY section you may modify):
 \`\`\`blade
 ${sectionContent}
 \`\`\`
 
-PLAN: Describe what exactly will change, then execute.
-
-Return ONLY valid JSON:
-{"old_block":"exact verbatim text from the section above to replace","new_block":"the replacement text"}
-
-RULES:
-- old_block MUST be character-for-character identical to text in the section above
-- Include 2-3 surrounding lines in old_block for uniqueness
-- new_block changes ONLY what the user asked — preserve everything else
-- Do NOT modify any code outside old_block`
+Return ONLY valid JSON.`
     };
 
     const userContent = imageData
@@ -155,24 +193,38 @@ RULES:
     try {
       const response = await this.client.messages.create({
         model: this.model,
-        max_tokens: 4096,
-        system: `You are a precise code editor. You receive a single section of a Blade file and make exactly one surgical edit.
-
-VERIFY before responding:
-- Is old_block copied exactly from the section? (character-for-character)
-- Does new_block change ONLY what was requested?
-- Are no unrelated parts modified?`,
+        max_tokens: 2048,
+        system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
       });
-      const result = this._extractJSON(response.content[0].text);
-      if (result?.old_block !== undefined && result?.new_block !== undefined) {
-        return { mode: 'replace', old_block: result.old_block, new_block: result.new_block };
+      let result;
+      try {
+        result = this._extractJSON(response.content[0].text);
+      } catch (jsonErr) {
+        logger.warn('AI returned invalid JSON in executeEdit', { response: response.content[0].text.substring(0, 500) });
+        return { mode: 'skip' };
       }
+
+      if (result?.error) {
+        logger.warn('AI reported ambiguity', { error: result.error });
+        return { mode: 'skip', reason: result.error };
+      }
+
+      if (result?.selector && result?.action) {
+        logger.info('Edit instruction', { selector: result.selector, action: result.action, reasoning: result.reasoning });
+        return { mode: 'selector', ...result };
+      }
+
+      // Fallback: old_block/new_block format
+      if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        return { mode: 'replace', old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
+      }
+
       logger.warn('AI returned unexpected shape', { keys: Object.keys(result || {}) });
       return { mode: 'skip' };
     } catch (error) {
       logger.error('Edit execution failed', { error: error.message });
-      throw error;
+      return { mode: 'skip' };
     }
   }
 
@@ -496,10 +548,36 @@ Respond ONLY with valid JSON. If a screenshot is provided, use it to understand 
   }
 
   _extractJSON(text) {
-    const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    // Strip markdown fences and any text before/after JSON
+    let cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+    // Find the outermost JSON object
     const match = cleaned.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('No JSON found in AI response');
-    return JSON.parse(match[0]);
+
+    let jsonStr = match[0];
+
+    // Try parsing directly first
+    try { return JSON.parse(jsonStr); } catch {}
+
+    // Fix common issues: literal newlines inside string values
+    // Replace actual newlines inside JSON strings with \\n
+    jsonStr = jsonStr.replace(/:\s*"((?:[^"\\]|\\.)*)"/g, (match) => {
+      return match.replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+    });
+    try { return JSON.parse(jsonStr); } catch {}
+
+    // Last resort: try to extract old_block and new_block with regex
+    const oldMatch = jsonStr.match(/"old_block"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
+    const newMatch = jsonStr.match(/"new_block"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
+    if (oldMatch && newMatch) {
+      return {
+        old_block: oldMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\'),
+        new_block: newMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      };
+    }
+
+    throw new Error('Could not parse JSON from AI response');
   }
 
   _extractCode(text) {

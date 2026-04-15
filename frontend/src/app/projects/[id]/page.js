@@ -45,6 +45,7 @@ export default function ProjectPreview() {
   const [history, setHistory] = useState([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [pendingDiff, setPendingDiff] = useState(null);
+  const [sectionConfirm, setSectionConfirm] = useState(null);
   const [lastAppliedId, setLastAppliedId] = useState(null); // change request id of last applied change
   const [streamingTokens, setStreamingTokens] = useState('');
   const [pushModalOpen, setPushModalOpen] = useState(false);
@@ -201,6 +202,26 @@ export default function ProjectPreview() {
     }
   }
 
+  async function confirmSection() {
+    if (!result?.id) return;
+    try {
+      setSectionConfirm(null);
+      setResult(prev => ({ ...prev, status: 'generating_code', message: 'Applying change…' }));
+      await apiClient.confirmSection(result.id);
+    } catch (err) {
+      setResult(prev => ({ ...prev, status: 'failed', message: err.response?.data?.error || 'Confirm failed' }));
+      setSectionConfirm(null);
+    }
+  }
+
+  async function declineSection() {
+    if (!result?.id) return;
+    try { await apiClient.rejectChangeRequest(result.id); } catch {}
+    setSectionConfirm(null);
+    setActivePrompt(null);
+    setResult(null);
+  }
+
   async function applyChange() {
     if (!result?.id) return;
     try {
@@ -327,41 +348,8 @@ export default function ProjectPreview() {
       // ── Extract DOM context from iframe (0ms) ──────────────────────────
       const pageContext = iframeRef.current ? extractPageContext(iframeRef.current) : null;
 
-      // ── Try quick path first (Tier 1 or Tier 2) — no image ────────────
-      if (!submittedImage) {
-        setResult({ status: 'analyzing', message: 'Applying change…' });
-        try {
-          const qRes = await apiClient.quickChangeRequest({
-            project: { local_path: project.local_path, project_url: project.project_url },
-            prompt: submittedPrompt,
-            current_page_url: livePageUrl,
-            page_context: pageContext
-          });
-          const q = qRes.data;
-
-          if (!q.fallback) {
-            // Tier 1 or 2 succeeded
-            const tierLabel = q.tier === 1 ? 'Instant' : 'Fast';
-            setResult({ status: 'review', message: `${tierLabel} change applied` });
-            setFiles([{ file: q.file, change_type: 'modify', status: 'done' }]);
-
-            // Try DOM update first (no reload), fall back to iframe reload
-            const domApplied = q.dom_update && iframeRef.current
-              ? applyDomUpdate(iframeRef.current, q.dom_update)
-              : false;
-            if (!domApplied) reloadIframe();
-            setImage(null);
-            setSubmitting(false);
-            return;
-          }
-          // q.fallback === true → fall through to full pipeline
-          setResult({ status: 'analyzing', message: 'Running full analysis…' });
-        } catch {
-          // quick endpoint failed → fall through
-        }
-      }
-
-      // ── Full pipeline (Tier 3) ─────────────────────────────────────────
+      // ── All prompts go through 2-step AI flow (identify section → confirm → edit) ──
+      setResult({ status: 'analyzing', message: 'Finding the right section…' });
       const res = await apiClient.createChangeRequest({
         project_id: id,
         title: submittedPrompt.substring(0, 100),
@@ -423,7 +411,38 @@ export default function ProjectPreview() {
         try {
           const pollRes = await apiClient.getChangeRequest(cr.id);
           const s = pollRes.data?.status;
-          if (!s || ['pending', 'analyzing', 'generating_code', 'staging'].includes(s)) return;
+          if (!s || ['pending', 'analyzing', 'staging'].includes(s)) return;
+          // confirm_section: show the section confirmation UI
+          if (s === 'confirm_section') {
+            clearInterval(pollInterval);
+            setResult(prev => ({ ...prev, id: cr.id, status: s }));
+            setStreamingTokens('');
+            // Fetch section info from the change request
+            try {
+              const detail = await apiClient.getChangeRequest(cr.id);
+              console.log('confirm_section detail:', JSON.stringify(detail.data?.generated_code));
+              if (detail.data?.generated_code?.length) {
+                const info = JSON.parse(detail.data.generated_code[0].diff || '{}');
+                console.log('sectionConfirm set:', info.target_section);
+                setSectionConfirm(info);
+              } else {
+                console.log('No generated_code in response');
+              }
+            } catch (e) { console.error('confirm fetch error:', e); }
+            // Start polling for post-confirm status
+            const cp = setInterval(async () => {
+              try {
+                const p = await apiClient.getChangeRequest(cr.id);
+                const st = p.data?.status;
+                if (st === 'pending_review') { clearInterval(cp); setResult(prev => ({ ...prev, status: st, message: 'Preview ready' })); setPendingDiff({ diff: [] }); setSectionConfirm(null); reloadIframe(); }
+                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); setTimeout(() => setResult(null), 5000); }
+              } catch {}
+            }, 2000);
+            setTimeout(() => clearInterval(cp), 120000);
+            return;
+          }
+          // generating_code: keep polling
+          if (s === 'generating_code') return;
           clearInterval(pollInterval);
           if (s === 'pending_review') {
             setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Preview ready' }));
@@ -494,7 +513,7 @@ export default function ProjectPreview() {
           src={project.project_url}
           className="w-full h-full border-0"
           title={project.display_name}
-          sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
+          sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-top-navigation"
           onLoad={() => {
             // Read the actual URL from the iframe on every navigation
             const readUrl = () => {
@@ -593,7 +612,7 @@ export default function ProjectPreview() {
         )}
 
         {/* Status / streaming / accept-reject bar */}
-        {result && (
+        {result && result.status !== 'confirm_section' && (
           <div className="bg-white px-4 py-1.5 border-t border-gray-100 flex items-center gap-2 text-xs">
             {!['review', 'failed', 'rejected', 'pending_review'].includes(result.status) && (
               <div className="w-2.5 h-2.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
@@ -607,6 +626,31 @@ export default function ProjectPreview() {
             <pre className="text-[10px] text-gray-400 font-mono whitespace-pre-wrap max-h-10 overflow-hidden">{streamingTokens.slice(-150)}</pre>
           </div>
         )}
+        {/* AI asks: "Is this the right section?" — chat style */}
+        {sectionConfirm && result?.status === 'confirm_section' && (
+          <div className="border-t border-stone-200 px-4 py-3" style={{ background: 'linear-gradient(135deg, #f5f0eb, #ebe5de)' }}>
+            <div className="w-[65%] mx-auto">
+              <div className="flex items-start gap-3 mb-3">
+                <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-white text-xs font-bold" style={{ background: '#2d6a4f' }}>AI</div>
+                <div className="flex-1">
+                  <p className="text-sm text-gray-800 leading-relaxed">
+                    I think you want to edit the <strong>&ldquo;{sectionConfirm.target_section || 'this section'}&rdquo;</strong> section.
+                    {sectionConfirm.reasoning && <span className="text-gray-500"> {sectionConfirm.reasoning}</span>}
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {sectionConfirm.confidence === 'high' ? "I'm quite sure about this." : sectionConfirm.confidence === 'medium' ? "I'm fairly sure, but please confirm." : "I'm not very sure — please check."}
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 ml-10">
+                <button onClick={declineSection} className="px-4 py-2 text-sm font-medium bg-white border-2 border-stone-300 text-stone-600 rounded-xl hover:bg-stone-50 transition-colors">No, wrong section</button>
+                <button onClick={confirmSection} className="px-4 py-2 text-sm font-medium text-white rounded-xl hover:opacity-90 transition-colors" style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>Yes, edit this</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Accept / Reject after preview */}
         {pendingDiff && (
           <div className="bg-blue-50 px-4 py-2 border-t border-blue-100 flex items-center gap-3">
             <span className="text-xs text-blue-600 flex-1">Preview applied — accept or reject</span>
