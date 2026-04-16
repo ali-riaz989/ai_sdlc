@@ -61,55 +61,78 @@ export default function ProjectPreview() {
 
   const [imageLoading, setImageLoading] = useState(false);
 
-  // Highlight a section in the iframe by drawing an overlay
+  // Highlight a section in the iframe
   function highlightSection(sectionInfo) {
-    if (!iframeRef.current) { setHighlightRect(null); return; }
+    if (!iframeRef.current || !sectionInfo) { setHighlightRect(null); return; }
+
     try {
       const doc = iframeRef.current.contentDocument;
-      if (!doc) { setHighlightRect(null); return; }
+      if (!doc) throw new Error('cross-origin');
 
-      // Try to find the section by its heading text
       const heading = sectionInfo?.target_section;
       if (!heading) { setHighlightRect(null); return; }
 
-      // Search all headings for the closest match
+      // Find the heading element
       const headings = doc.querySelectorAll('h1,h2,h3,h4,h5,h6');
       let targetEl = null;
-      const headingLower = heading.toLowerCase();
-      const keywords = headingLower.split(/\W+/).filter(w => w.length > 2);
+      const keywords = heading.toLowerCase().split(/\W+/).filter(w => w.length > 2);
 
       for (const h of headings) {
         const hText = h.innerText?.toLowerCase() || '';
         const matchCount = keywords.filter(k => hText.includes(k)).length;
         if (matchCount >= Math.min(2, keywords.length)) {
-          // Found the heading — get its parent section
-          targetEl = h.closest('section') || h.parentElement?.closest('section') || h.parentElement;
+          targetEl = h.closest('section') || h.parentElement;
           break;
         }
       }
 
       if (!targetEl) { setHighlightRect(null); return; }
 
-      // Scroll the element into view inside the iframe
+      // Scroll into view
       targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
-      // Get bounding rect relative to the iframe container
+      // Add highlight styles directly to the element
+      targetEl.style.outline = '3px solid #2d6a4f';
+      targetEl.style.outlineOffset = '4px';
+      targetEl.style.borderRadius = '8px';
+      targetEl.style.transition = 'outline 0.3s ease';
+
+      // Store the element ref so we can remove the highlight later
+      iframeRef.current._highlightedEl = targetEl;
+
+      // Also set overlay rect for the label
+      const containerRect = iframeRef.current.parentElement.getBoundingClientRect();
       const iframeRect = iframeRef.current.getBoundingClientRect();
       const elRect = targetEl.getBoundingClientRect();
-
       setHighlightRect({
-        top: elRect.top + iframeRect.top - iframeRef.current.parentElement.getBoundingClientRect().top,
+        top: elRect.top + (iframeRect.top - containerRect.top),
         left: elRect.left,
         width: elRect.width,
-        height: Math.min(elRect.height, 400) // cap height
+        height: Math.min(elRect.height, 400)
       });
     } catch {
-      // Cross-origin — can't access iframe DOM
+      // Cross-origin — try postMessage fallback
+      try {
+        iframeRef.current.contentWindow.postMessage({
+          type: 'highlight-section',
+          keywords: sectionInfo?.target_section?.toLowerCase().split(/\W+/).filter(w => w.length > 2)
+        }, '*');
+      } catch {}
       setHighlightRect(null);
     }
   }
 
-  function clearHighlight() { setHighlightRect(null); }
+  function clearHighlight() {
+    setHighlightRect(null);
+    try {
+      const el = iframeRef.current?._highlightedEl;
+      if (el) {
+        el.style.outline = '';
+        el.style.outlineOffset = '';
+        iframeRef.current._highlightedEl = null;
+      }
+    } catch {}
+  }
 
   // Chat helpers
   function addChat(role, text, type = 'text') {
