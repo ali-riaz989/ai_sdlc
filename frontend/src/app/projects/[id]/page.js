@@ -317,14 +317,15 @@ export default function ProjectPreview() {
       setSelectedElement(info);
       setSelectMode(false);
 
-      // Auto-fill prompt with context
-      const desc = info.isImage
-        ? `Change the image in the "${info.section}" section`
+      // Don't auto-fill prompt — let user describe what they want to do
+      const elDesc = info.isImage
+        ? `an image in "${info.section}"`
         : info.tag.match(/^h[1-6]$/)
-        ? `Change the "${info.text}" heading`
-        : `Edit the "${info.text.substring(0, 40)}" text in "${info.section}"`;
-      setPrompt(desc);
-      addChat('ai', `You selected: ${info.tag} element in "${info.section}" section. ${info.text ? '"' + info.text.substring(0, 50) + '..."' : ''} — describe what to change.`, 'text');
+        ? `the "${info.text}" heading in "${info.section}"`
+        : info.text
+        ? `"${info.text.substring(0, 50)}${info.text.length > 50 ? '...' : ''}" in "${info.section}"`
+        : `a ${info.tag} element in "${info.section}"`;
+      addChat('ai', `Selected: ${elDesc}. What would you like to do? (change text, update style, replace image, etc.)`, 'text');
 
       // Highlight the selected element
       el.style.outline = '3px solid #2d6a4f';
