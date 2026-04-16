@@ -61,8 +61,8 @@ export default function ProjectPreview() {
 
   const [imageLoading, setImageLoading] = useState(false);
 
-  // Highlight a section in the iframe
-  function highlightSection(sectionInfo) {
+  // Highlight the target in the iframe — text element or full section
+  function highlightSection(sectionInfo, userPrompt = '') {
     if (!iframeRef.current || !sectionInfo) { setHighlightRect(null); return; }
 
     try {
@@ -72,18 +72,48 @@ export default function ProjectPreview() {
       const heading = sectionInfo?.target_section;
       if (!heading) { setHighlightRect(null); return; }
 
-      // Find the heading element
-      const headings = doc.querySelectorAll('h1,h2,h3,h4,h5,h6');
-      let targetEl = null;
       const keywords = heading.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+      const prompt = (userPrompt || '').toLowerCase();
 
+      // Determine if user wants a text-level or section-level change
+      const isTextChange = /chang|replac|updat|set|rename|heading|title|text|h1|h2|h3|h4/.test(prompt)
+        && !/section|image|background|layout|style|block|area/.test(prompt);
+
+      // Find the matching heading element first
+      let headingEl = null;
+      const headings = doc.querySelectorAll('h1,h2,h3,h4,h5,h6');
       for (const h of headings) {
         const hText = h.innerText?.toLowerCase() || '';
         const matchCount = keywords.filter(k => hText.includes(k)).length;
         if (matchCount >= Math.min(2, keywords.length)) {
-          targetEl = h.closest('section') || h.parentElement;
+          headingEl = h;
           break;
         }
+      }
+
+      // Choose what to highlight
+      let targetEl;
+      let highlightStyle;
+
+      if (isTextChange && headingEl) {
+        // Text change → highlight just the heading element
+        targetEl = headingEl;
+        highlightStyle = {
+          outline: 'none',
+          background: 'rgba(45, 106, 79, 0.15)',
+          boxShadow: '0 0 0 4px rgba(45, 106, 79, 0.3)',
+          borderRadius: '4px',
+          transition: 'all 0.3s ease'
+        };
+      } else {
+        // Section change → highlight the whole section with a rectangle
+        targetEl = headingEl?.closest('section') || headingEl?.parentElement || null;
+        highlightStyle = {
+          outline: '3px solid #2d6a4f',
+          outlineOffset: '4px',
+          borderRadius: '8px',
+          transition: 'outline 0.3s ease'
+        };
       }
 
       if (!targetEl) { setHighlightRect(null); return; }
@@ -91,33 +121,27 @@ export default function ProjectPreview() {
       // Scroll into view
       targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
-      // Add highlight styles directly to the element
-      targetEl.style.outline = '3px solid #2d6a4f';
-      targetEl.style.outlineOffset = '4px';
-      targetEl.style.borderRadius = '8px';
-      targetEl.style.transition = 'outline 0.3s ease';
-
-      // Store the element ref so we can remove the highlight later
+      // Apply highlight styles
+      Object.assign(targetEl.style, highlightStyle);
       iframeRef.current._highlightedEl = targetEl;
+      iframeRef.current._highlightStyles = highlightStyle;
 
-      // Also set overlay rect for the label
-      const containerRect = iframeRef.current.parentElement.getBoundingClientRect();
-      const iframeRect = iframeRef.current.getBoundingClientRect();
-      const elRect = targetEl.getBoundingClientRect();
-      setHighlightRect({
-        top: elRect.top + (iframeRect.top - containerRect.top),
-        left: elRect.left,
-        width: elRect.width,
-        height: Math.min(elRect.height, 400)
-      });
+      // Set overlay rect for the label
+      setTimeout(() => {
+        try {
+          const containerRect = iframeRef.current.parentElement.getBoundingClientRect();
+          const iframeRect = iframeRef.current.getBoundingClientRect();
+          const elRect = targetEl.getBoundingClientRect();
+          setHighlightRect({
+            top: elRect.top + (iframeRect.top - containerRect.top),
+            left: elRect.left,
+            width: elRect.width,
+            height: Math.min(elRect.height, 400),
+            isText: isTextChange
+          });
+        } catch {}
+      }, 500); // wait for scroll to finish
     } catch {
-      // Cross-origin — try postMessage fallback
-      try {
-        iframeRef.current.contentWindow.postMessage({
-          type: 'highlight-section',
-          keywords: sectionInfo?.target_section?.toLowerCase().split(/\W+/).filter(w => w.length > 2)
-        }, '*');
-      } catch {}
       setHighlightRect(null);
     }
   }
@@ -126,10 +150,13 @@ export default function ProjectPreview() {
     setHighlightRect(null);
     try {
       const el = iframeRef.current?._highlightedEl;
-      if (el) {
-        el.style.outline = '';
-        el.style.outlineOffset = '';
+      const styles = iframeRef.current?._highlightStyles;
+      if (el && styles) {
+        for (const key of Object.keys(styles)) {
+          el.style[key] = '';
+        }
         iframeRef.current._highlightedEl = null;
+        iframeRef.current._highlightStyles = null;
       }
     } catch {}
   }
@@ -525,7 +552,7 @@ export default function ProjectPreview() {
                 const info = JSON.parse(detail.data.generated_code[0].diff || '{}');
                 console.log('sectionConfirm set:', info.target_section);
                 setSectionConfirm(info);
-                highlightSection(info);
+                highlightSection(info, detail.data?.prompt || '');
                 addChat('ai', `I found the "${info.target_section}" section. ${info.reasoning || ''} Should I edit this?`, 'confirm');
               } else {
                 console.log('No generated_code in response');
@@ -630,22 +657,23 @@ export default function ProjectPreview() {
             readUrl();
           }}
         />
-        {/* Highlight overlay — shows which section the AI identified */}
+        {/* Highlight overlay label */}
         {highlightRect && (
           <div className="absolute pointer-events-none transition-all duration-500 ease-out"
             style={{
               top: highlightRect.top,
               left: highlightRect.left,
               width: highlightRect.width,
-              height: highlightRect.height,
-              border: '3px solid #2d6a4f',
-              borderRadius: '8px',
-              background: 'rgba(45, 106, 79, 0.08)',
-              boxShadow: '0 0 0 4000px rgba(0, 0, 0, 0.15)',
+              height: highlightRect.isText ? 'auto' : highlightRect.height,
+              border: highlightRect.isText ? 'none' : '3px solid #2d6a4f',
+              borderRadius: highlightRect.isText ? '4px' : '8px',
+              background: highlightRect.isText ? 'none' : 'rgba(45, 106, 79, 0.05)',
+              boxShadow: highlightRect.isText ? 'none' : '0 0 0 4000px rgba(0, 0, 0, 0.12)',
               zIndex: 5
             }}>
-            <div className="absolute -top-7 left-2 bg-emerald-700 text-white text-xs px-2 py-1 rounded shadow font-medium">
-              {sectionConfirm?.target_section || 'Selected section'}
+            <div className={`absolute left-2 text-white text-xs px-2 py-1 rounded shadow font-medium ${highlightRect.isText ? '-top-6' : '-top-7'}`}
+              style={{ background: highlightRect.isText ? '#b45309' : '#2d6a4f' }}>
+              {highlightRect.isText ? 'Text: ' : 'Section: '}{sectionConfirm?.target_section || 'Selected'}
             </div>
           </div>
         )}
