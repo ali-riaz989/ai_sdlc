@@ -612,7 +612,7 @@ export default function ProjectPreview() {
       <div className="flex-1 overflow-hidden relative">
         <iframe
           ref={iframeRef}
-          src={project.project_url || '/preview/'}
+          src="/preview/"
           className="w-full h-full border-0"
           title={project.display_name}
           onLoad={() => {
