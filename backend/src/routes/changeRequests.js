@@ -221,6 +221,35 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
     };
 
     try {
+      // ── Direct image replacement: if user uploaded an image and section has <img>, replace it directly ──
+      const isImageChange = sectionInfo.saved_image_url && /image|photo|picture|img|replace.*image|change.*image|update.*image|upload/i.test(cr.prompt);
+      if (isImageChange) {
+        const imgMatch = sectionContent.match(/<img\s[^>]*src=["']([^"']+)["'][^>]*>/);
+        if (imgMatch) {
+          const oldImgTag = imgMatch[0];
+          const assetPath = `{{ asset('${sectionInfo.saved_image_url.substring(1)}') }}`;
+          const newImgTag = oldImgTag.replace(/src=["'][^"']+["']/, `src="${assetPath}"`);
+
+          if (originalContent.includes(oldImgTag)) {
+            const finalContent = originalContent.split(oldImgTag).join(newImgTag);
+            const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced image src with uploaded image' };
+
+            await sequelize.query('UPDATE generated_code SET generated_content = $1, diff = $2 WHERE change_request_id = $3',
+              { bind: [finalContent, JSON.stringify(diffInfo), id] });
+
+            const absPath = nodePath.join(cr.local_path, gc.file_path);
+            await fsp.writeFile(absPath, finalContent, 'utf-8');
+            await new Promise(resolve => require('child_process').exec('php artisan view:clear', { cwd: cr.local_path }, () => resolve()));
+
+            await sequelize.query("UPDATE change_requests SET status = 'pending_review', updated_at = NOW() WHERE id = $1", { bind: [id] });
+            emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: gc.file_path, ...diffInfo }] }));
+            require('../utils/logger').info('Direct image replacement', { old_src: imgMatch[1], new_src: assetPath });
+            return;
+          }
+        }
+      }
+
+      // ── AI-powered edit for text/style/layout changes ──
       const generated = await aiService.executeEdit(cr.prompt, sectionContent, gc.file_path, null, sectionInfo.saved_image_url);
 
       if (generated.mode === 'skip') { await fail(generated.reason || 'AI could not determine the edit'); return; }
