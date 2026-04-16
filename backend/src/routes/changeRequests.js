@@ -172,14 +172,14 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
         if (/<h[1-6]/.test(lines[i])) {
           const matchCount = keywords.filter(k => lineLower.includes(k)).length;
           if (matchCount >= Math.min(2, keywords.length)) {
-            // Found the heading — now find the containing sub-block (div.block, article, etc.)
-            // Walk UP to find the nearest container (div with class, or section)
+            // Found the heading — walk UP to find the containing block
+            // Skip inner wrappers (caption, content, inner) — find outer block/card/item
             let blockStart = i;
-            for (let j = i; j >= Math.max(0, i - 30); j--) {
-              if (/<div\s[^>]*class=/.test(lines[j]) || /<section/.test(lines[j]) || /<article/.test(lines[j])) {
-                blockStart = j;
-                break;
-              }
+            const innerWrappers = /caption|content|inner|text|desc|body|detail/i;
+            for (let j = i; j >= Math.max(0, i - 40); j--) {
+              if (/<section/.test(lines[j]) || /<article/.test(lines[j])) { blockStart = j; break; }
+              const classMatch = lines[j].match(/<div\s[^>]*class="([^"]*)"/);
+              if (classMatch && !innerWrappers.test(classMatch[1])) { blockStart = j; break; }
             }
             // Walk DOWN to find the closing of this block
             // Count div depth from blockStart
