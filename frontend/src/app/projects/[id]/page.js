@@ -612,10 +612,9 @@ export default function ProjectPreview() {
       <div className="flex-1 overflow-hidden relative">
         <iframe
           ref={iframeRef}
-          src={project.project_url}
+          src="/preview/"
           className="w-full h-full border-0"
           title={project.display_name}
-          sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-top-navigation"
           onLoad={() => {
             // Read the actual URL from the iframe on every navigation
             const readUrl = () => {
