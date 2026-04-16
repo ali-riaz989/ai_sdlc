@@ -279,9 +279,10 @@ class ChangeRequestController {
     );
 
     if (!section || !section.line_start) {
-      logger.warn('Could not identify section', { requestId });
+      const reason = section?.error || 'Could not identify which section to edit';
+      logger.warn('Could not identify section', { requestId, reason });
       await this._updateStatus(requestId, 'failed');
-      emit('failed', 'Could not identify which section to edit');
+      emit('failed', reason);
       return;
     }
 

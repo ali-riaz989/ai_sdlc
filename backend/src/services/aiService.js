@@ -125,7 +125,12 @@ RULES:
       }
     } catch (error) {
       logger.error('Section identification failed', { error: error.message });
-      return null;
+      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
+        ? 'Rate limit reached — wait a moment and try again'
+        : error.message?.includes('Connection')
+        ? 'API connection error — try again'
+        : error.message || 'unknown error';
+      return { error: reason };
     }
   }
 
@@ -207,7 +212,12 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
       return { mode: 'skip' };
     } catch (error) {
       logger.error('Edit execution failed', { error: error.message });
-      return { mode: 'skip' };
+      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
+        ? 'Rate limit reached — wait a moment and try again'
+        : error.message?.includes('Connection')
+        ? 'API connection error — try again in a moment'
+        : 'AI service error: ' + (error.message || 'unknown');
+      return { mode: 'skip', reason };
     }
   }
 

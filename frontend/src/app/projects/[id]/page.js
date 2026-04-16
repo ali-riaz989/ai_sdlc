@@ -679,7 +679,7 @@ export default function ProjectPreview() {
                 const p = await apiClient.getChangeRequest(cr.id);
                 const st = p.data?.status;
                 if (st === 'pending_review') { clearInterval(cp); setResult(prev => ({ ...prev, status: st, message: 'Preview ready' })); setPendingDiff({ diff: [] }); setSectionConfirm(null); reloadIframe(); addChat('ai', 'Done! Check the preview above. Accept or reject the change.', 'success'); }
-                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); addChat('ai', 'The change failed. Try describing it differently.', 'error'); setTimeout(() => setResult(null), 5000); }
+                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); addChat('ai', p.data?.message || 'The change failed. Try describing it differently.', 'error'); setTimeout(() => setResult(null), 5000); }
               } catch {}
             }, 2000);
             setTimeout(() => clearInterval(cp), 120000);
@@ -702,8 +702,14 @@ export default function ProjectPreview() {
           } else if (s === 'failed') {
             setResult(prev => ({ ...prev, id: cr.id, status: 'failed', message: 'Change failed' }));
             setPendingDiff(null);
+            setSectionConfirm(null);
             setStreamingTokens('');
             setActivePrompt(null);
+            // Fetch actual error reason
+            try {
+              const detail = await apiClient.getChangeRequest(cr.id);
+              addChat('ai', detail.data?.message || 'The change failed. Try again.', 'error');
+            } catch { addChat('ai', 'The change failed. Try again.', 'error'); }
             setTimeout(() => setResult(null), 5000);
           }
         } catch {}
