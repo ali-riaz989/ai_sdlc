@@ -271,7 +271,9 @@ class RouteResolver {
 
   _normPath(pageUrl) {
     if (!pageUrl) return '/';
-    const p = pageUrl.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '').replace(/\/$/, '');
+    let p = pageUrl.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '').replace(/\/$/, '');
+    // Strip /preview prefix from Next.js rewrite proxy
+    if (p.startsWith('/preview')) p = p.replace(/^\/preview/, '') || '/';
     return p || '/';
   }
 
