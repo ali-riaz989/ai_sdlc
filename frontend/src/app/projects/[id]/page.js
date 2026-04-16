@@ -54,7 +54,9 @@ export default function ProjectPreview() {
   const [resetting, setResetting] = useState(false);
   const [activePrompt, setActivePrompt] = useState(null);
   const [chatMessages, setChatMessages] = useState([]); // session chat — destroyed on tab close
-  const [highlightRect, setHighlightRect] = useState(null); // { top, left, width, height } for overlay
+  const [highlightRect, setHighlightRect] = useState(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedElement, setSelectedElement] = useState(null); // { tag, text, section, classes }
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -253,6 +255,118 @@ export default function ProjectPreview() {
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
   }, []);
+
+  // ── Click-to-select mode: hover highlight + click to identify element ──
+  useEffect(() => {
+    if (!selectMode || !iframeRef.current) return;
+    let hoveredEl = null;
+
+    const getDoc = () => {
+      try { return iframeRef.current?.contentDocument; } catch { return null; }
+    };
+
+    const onMouseOver = (e) => {
+      const el = e.target;
+      if (el === hoveredEl) return;
+      // Remove previous hover
+      if (hoveredEl) {
+        hoveredEl.style.outline = '';
+        hoveredEl.style.outlineOffset = '';
+        hoveredEl.style.cursor = '';
+      }
+      // Don't highlight tiny inline elements — find a meaningful parent
+      let target = el;
+      const smallTags = new Set(['SPAN', 'A', 'STRONG', 'EM', 'B', 'I', 'BR', 'IMG']);
+      while (target && smallTags.has(target.tagName) && target.parentElement) {
+        target = target.parentElement;
+      }
+      target.style.outline = '2px dashed #2d6a4f';
+      target.style.outlineOffset = '2px';
+      target.style.cursor = 'pointer';
+      hoveredEl = target;
+    };
+
+    const onMouseOut = (e) => {
+      if (hoveredEl) {
+        hoveredEl.style.outline = '';
+        hoveredEl.style.outlineOffset = '';
+        hoveredEl.style.cursor = '';
+        hoveredEl = null;
+      }
+    };
+
+    const onClick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const el = hoveredEl || e.target;
+
+      // Find the parent section
+      const section = el.closest('section') || el.closest('[class*="section"]') || el.closest('[class*="area"]');
+      const heading = section?.querySelector('h1,h2,h3,h4')?.innerText?.trim() || '';
+
+      // Get element info
+      const info = {
+        tag: el.tagName.toLowerCase(),
+        text: el.innerText?.trim().substring(0, 100) || '',
+        classes: el.className?.substring(0, 80) || '',
+        section: heading || section?.className?.substring(0, 60) || 'unknown section',
+        isImage: el.tagName === 'IMG',
+        src: el.tagName === 'IMG' ? el.src?.substring(0, 100) : null
+      };
+
+      setSelectedElement(info);
+      setSelectMode(false);
+
+      // Auto-fill prompt with context
+      const desc = info.isImage
+        ? `Change the image in the "${info.section}" section`
+        : info.tag.match(/^h[1-6]$/)
+        ? `Change the "${info.text}" heading`
+        : `Edit the "${info.text.substring(0, 40)}" text in "${info.section}"`;
+      setPrompt(desc);
+      addChat('ai', `You selected: ${info.tag} element in "${info.section}" section. ${info.text ? '"' + info.text.substring(0, 50) + '..."' : ''} — describe what to change.`, 'text');
+
+      // Highlight the selected element
+      el.style.outline = '3px solid #2d6a4f';
+      el.style.outlineOffset = '4px';
+      el.style.background = 'rgba(45, 106, 79, 0.1)';
+      iframeRef.current._highlightedEl = el;
+      iframeRef.current._highlightStyles = { outline: '3px solid #2d6a4f', outlineOffset: '4px', background: 'rgba(45, 106, 79, 0.1)' };
+
+      // Clean hover listeners
+      const doc = getDoc();
+      if (doc) {
+        doc.removeEventListener('mouseover', onMouseOver);
+        doc.removeEventListener('mouseout', onMouseOut);
+        doc.removeEventListener('click', onClick, true);
+      }
+    };
+
+    const doc = getDoc();
+    if (doc) {
+      doc.addEventListener('mouseover', onMouseOver);
+      doc.addEventListener('mouseout', onMouseOut);
+      doc.addEventListener('click', onClick, true);
+
+      // Change cursor for the whole iframe
+      doc.body.style.cursor = 'crosshair';
+    }
+
+    return () => {
+      const doc = getDoc();
+      if (doc) {
+        doc.removeEventListener('mouseover', onMouseOver);
+        doc.removeEventListener('mouseout', onMouseOut);
+        doc.removeEventListener('click', onClick, true);
+        doc.body.style.cursor = '';
+      }
+      if (hoveredEl) {
+        hoveredEl.style.outline = '';
+        hoveredEl.style.outlineOffset = '';
+        hoveredEl.style.cursor = '';
+      }
+    };
+  }, [selectMode]);
 
   // Poll iframe URL — catches navigation on same-origin, onLoad handles cross-origin
   useEffect(() => {
@@ -626,6 +740,10 @@ export default function ProjectPreview() {
           <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
             className="text-xs px-2 py-1 bg-gray-100 rounded hover:bg-gray-200 text-gray-600">
             ↻ Refresh
+          </button>
+          <button onClick={() => { clearHighlight(); setSelectMode(v => !v); }}
+            className={`text-xs px-2 py-1 rounded transition-colors ${selectMode ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+            {selectMode ? '✓ Selecting...' : '⊹ Select'}
           </button>
           {result?.status === 'review' && lastAppliedId && (
             <button onClick={handleRestore} className="text-xs px-2 py-1 bg-orange-100 text-orange-700 rounded hover:bg-orange-200">
