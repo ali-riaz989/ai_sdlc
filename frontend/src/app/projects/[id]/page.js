@@ -54,11 +54,62 @@ export default function ProjectPreview() {
   const [resetting, setResetting] = useState(false);
   const [activePrompt, setActivePrompt] = useState(null);
   const [chatMessages, setChatMessages] = useState([]); // session chat — destroyed on tab close
+  const [highlightRect, setHighlightRect] = useState(null); // { top, left, width, height } for overlay
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
 
   const [imageLoading, setImageLoading] = useState(false);
+
+  // Highlight a section in the iframe by drawing an overlay
+  function highlightSection(sectionInfo) {
+    if (!iframeRef.current) { setHighlightRect(null); return; }
+    try {
+      const doc = iframeRef.current.contentDocument;
+      if (!doc) { setHighlightRect(null); return; }
+
+      // Try to find the section by its heading text
+      const heading = sectionInfo?.target_section;
+      if (!heading) { setHighlightRect(null); return; }
+
+      // Search all headings for the closest match
+      const headings = doc.querySelectorAll('h1,h2,h3,h4,h5,h6');
+      let targetEl = null;
+      const headingLower = heading.toLowerCase();
+      const keywords = headingLower.split(/\W+/).filter(w => w.length > 2);
+
+      for (const h of headings) {
+        const hText = h.innerText?.toLowerCase() || '';
+        const matchCount = keywords.filter(k => hText.includes(k)).length;
+        if (matchCount >= Math.min(2, keywords.length)) {
+          // Found the heading — get its parent section
+          targetEl = h.closest('section') || h.parentElement?.closest('section') || h.parentElement;
+          break;
+        }
+      }
+
+      if (!targetEl) { setHighlightRect(null); return; }
+
+      // Scroll the element into view inside the iframe
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      // Get bounding rect relative to the iframe container
+      const iframeRect = iframeRef.current.getBoundingClientRect();
+      const elRect = targetEl.getBoundingClientRect();
+
+      setHighlightRect({
+        top: elRect.top + iframeRect.top - iframeRef.current.parentElement.getBoundingClientRect().top,
+        left: elRect.left,
+        width: elRect.width,
+        height: Math.min(elRect.height, 400) // cap height
+      });
+    } catch {
+      // Cross-origin — can't access iframe DOM
+      setHighlightRect(null);
+    }
+  }
+
+  function clearHighlight() { setHighlightRect(null); }
 
   // Chat helpers
   function addChat(role, text, type = 'text') {
@@ -214,6 +265,7 @@ export default function ProjectPreview() {
   async function confirmSection() {
     if (!result?.id) return;
     addChat('user', 'Yes, edit this section');
+    clearHighlight();
     try {
       setSectionConfirm(null);
       setResult(prev => ({ ...prev, status: 'generating_code', message: 'Applying change…' }));
@@ -230,6 +282,7 @@ export default function ProjectPreview() {
     if (!result?.id) return;
     addChat('user', 'No, wrong section');
     addChat('ai', 'Got it. Tell me which section you meant, or describe the change differently.', 'text');
+    clearHighlight();
     try { await apiClient.rejectChangeRequest(result.id); } catch {}
     setSectionConfirm(null);
     setActivePrompt(null);
@@ -449,6 +502,7 @@ export default function ProjectPreview() {
                 const info = JSON.parse(detail.data.generated_code[0].diff || '{}');
                 console.log('sectionConfirm set:', info.target_section);
                 setSectionConfirm(info);
+                highlightSection(info);
                 addChat('ai', `I found the "${info.target_section}" section. ${info.reasoning || ''} Should I edit this?`, 'confirm');
               } else {
                 console.log('No generated_code in response');
@@ -554,6 +608,26 @@ export default function ProjectPreview() {
             readUrl();
           }}
         />
+        {/* Highlight overlay — shows which section the AI identified */}
+        {highlightRect && (
+          <div className="absolute pointer-events-none transition-all duration-500 ease-out"
+            style={{
+              top: highlightRect.top,
+              left: highlightRect.left,
+              width: highlightRect.width,
+              height: highlightRect.height,
+              border: '3px solid #2d6a4f',
+              borderRadius: '8px',
+              background: 'rgba(45, 106, 79, 0.08)',
+              boxShadow: '0 0 0 4000px rgba(0, 0, 0, 0.15)',
+              zIndex: 5
+            }}>
+            <div className="absolute -top-7 left-2 bg-emerald-700 text-white text-xs px-2 py-1 rounded shadow font-medium">
+              {sectionConfirm?.target_section || 'Selected section'}
+            </div>
+          </div>
+        )}
+
         {/* Current page indicator */}
         {currentPageUrl && (
           <div className="absolute bottom-2 left-2 bg-black/50 text-white text-xs font-mono px-2 py-1 rounded pointer-events-none">
