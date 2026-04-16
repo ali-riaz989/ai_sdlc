@@ -224,11 +224,15 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
       // ── Direct image replacement: if user uploaded an image and section has <img>, replace it directly ──
       const isImageChange = sectionInfo.saved_image_url && /image|photo|picture|img|replace.*image|change.*image|update.*image|upload/i.test(cr.prompt);
       if (isImageChange) {
-        const imgMatch = sectionContent.match(/<img\s[^>]*src=["']([^"']+)["'][^>]*>/);
-        if (imgMatch) {
-          const oldImgTag = imgMatch[0];
+        // Find the first <img in the section — match src attribute carefully (handles Blade {{ }})
+        const imgSrcMatch = sectionContent.match(/<img\s[\s\S]*?src=(["'])([\s\S]*?)\1[\s\S]*?>/);
+        if (imgSrcMatch) {
+          const oldImgTag = imgSrcMatch[0];
+          const oldSrc = imgSrcMatch[2];
+          const quote = imgSrcMatch[1];
           const assetPath = `{{ asset('${sectionInfo.saved_image_url.substring(1)}') }}`;
-          const newImgTag = oldImgTag.replace(/src=["'][^"']+["']/, `src="${assetPath}"`);
+          // Replace only the src value, preserve everything else
+          const newImgTag = oldImgTag.replace(`src=${quote}${oldSrc}${quote}`, `src="${assetPath}"`);
 
           if (originalContent.includes(oldImgTag)) {
             const finalContent = originalContent.split(oldImgTag).join(newImgTag);
