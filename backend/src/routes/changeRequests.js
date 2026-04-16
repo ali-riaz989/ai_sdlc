@@ -215,43 +215,28 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
       const generated = await aiService.executeEdit(cr.prompt, sectionContent, gc.file_path, null, sectionInfo.saved_image_url);
 
       if (generated.mode === 'skip') { await fail(generated.reason || 'AI could not determine the edit'); return; }
+      if (generated.mode !== 'replace' || !generated.old_block) { await fail('AI returned unexpected response'); return; }
 
-      let finalContent;
-      let diffInfo = {};
-
-      if (generated.mode === 'selector') {
-        // ── Selector mode: AI returned { selector, action, value } ──
-        logger.info('Applying selector edit', { selector: generated.selector, action: generated.action });
-        const result = applySelectorEdit(originalContent, generated);
-        if (!result.success) { await fail('Could not apply edit: ' + result.error); return; }
-        finalContent = result.content;
-        diffInfo = { selector: generated.selector, action: generated.action, value: generated.value, reasoning: generated.reasoning };
-
-      } else if (generated.mode === 'replace') {
-        // ── old_block/new_block mode ──
-        let oldBlock = generated.old_block;
-        let newBlock = generated.new_block;
-        if (/^\d+\|\s/.test(oldBlock)) {
-          oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-          newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-        }
-
-        const tryReplace = (content, old_b, new_b) => content.includes(old_b) ? content.split(old_b).join(new_b) : null;
-        const norm = s => s.replace(/\r\n/g, '\n');
-        const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
-        const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, '-');
-
-        finalContent = tryReplace(originalContent, oldBlock, newBlock)
-          || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
-          || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
-          || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
-
-        if (!finalContent) { await fail('Could not locate the text to replace'); return; }
-        diffInfo = { old_block: oldBlock, new_block: newBlock, reasoning: generated.reasoning };
-
-      } else {
-        await fail('AI returned unexpected response'); return;
+      // ── old_block/new_block replacement — like Claude Code ──
+      let oldBlock = generated.old_block;
+      let newBlock = generated.new_block;
+      if (/^\d+\|\s/.test(oldBlock)) {
+        oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+        newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
       }
+
+      const tryReplace = (content, old_b, new_b) => content.includes(old_b) ? content.split(old_b).join(new_b) : null;
+      const norm = s => s.replace(/\r\n/g, '\n');
+      const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
+      const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, '-');
+
+      let finalContent = tryReplace(originalContent, oldBlock, newBlock)
+        || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
+        || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
+        || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
+
+      if (!finalContent) { await fail('Could not locate the text to replace. old_block: ' + oldBlock.substring(0, 80)); return; }
+      const diffInfo = { old_block: oldBlock, new_block: newBlock, reasoning: generated.reasoning };
 
       // PHP syntax check
       if (gc.file_path.endsWith('.php')) {

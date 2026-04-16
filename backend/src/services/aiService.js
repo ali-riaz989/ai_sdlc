@@ -129,7 +129,8 @@ RULES:
     }
   }
 
-  // ─── PHASE 2: Execute edit — returns CSS selector + action ──────────────
+  // ─── PHASE 2: Execute edit — old_block/new_block like Claude Code ───────
+  // AI receives the RAW SOURCE CODE of the section and returns exact text replacement
   async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
     logger.info('Phase 2: Executing edit', { file: filePath });
 
@@ -139,59 +140,38 @@ RULES:
       editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
     }
 
-    const systemPrompt = `You are an advanced web editing AI working inside a live webpage editor.
+    const systemPrompt = `You are a code editor like Claude Code or Cursor. You edit Laravel Blade source files.
 
-You do NOT have direct access to the full DOM.
-You must rely only on the provided section HTML and user intent.
+You receive a section of RAW SOURCE CODE (Blade PHP) — NOT rendered HTML. This includes @include, @foreach, {{ }}, and other Blade directives.
 
-Your goal is to generate a PRECISE and SAFE edit instruction.
+Your job: find the exact lines to change and return a precise find-and-replace.
 
-THINKING PROCESS (MANDATORY — follow these steps internally before answering):
+THINKING PROCESS:
+1. UNDERSTAND what the user wants to change
+2. FIND the exact lines in the source code that need changing
+3. COPY those lines EXACTLY as they appear (character-for-character, including whitespace and Blade syntax)
+4. WRITE the replacement with ONLY the requested change
 
-1. UNDERSTAND — What exactly does the user want to change?
-2. LOCATE — Identify ALL possible matching elements from the provided HTML. Use context like tag type, class names, content, and structure — NOT keyword alone.
-3. DISAMBIGUATE — If multiple matches exist, prefer elements in main content. Avoid nav/header/footer unless explicitly asked. Choose the most semantically relevant element.
-4. VALIDATE — Ensure your selector will match ONLY ONE element. If not, refine using hierarchy (:nth-child, parent classes, etc.)
-5. PLAN — Decide the MINIMAL change required.
-6. EXECUTE — Generate the structured edit instruction.
-7. VERIFY — Before final output, internally simulate whether the selector affects any unintended elements.
+OUTPUT: Return ONLY valid JSON:
+{"old_block":"exact verbatim lines from the source code","new_block":"the replacement lines","reasoning":"what was changed"}
 
-SUPPORTED ACTIONS:
-- replace_text: change text content of an element
-- replace_html: replace innerHTML of an element
-- update_style: change inline CSS styles
-- replace_image: change img src attribute
-- insert_element: insert new HTML before/after an element
-
-OUTPUT FORMAT (STRICT JSON — nothing else):
-{
-  "selector": "unique CSS selector targeting exactly one element",
-  "action": "replace_text|replace_html|update_style|replace_image|insert_element",
-  "value": "new value (text, HTML, or image src)",
-  "styles": {},
-  "position": "before|after",
-  "reasoning": "short explanation of why this element was chosen"
-}
-
-STRICT RULES:
-- NEVER modify navigation, header, or footer unless explicitly asked
-- NEVER return full HTML page
-- NEVER use vague selectors like "div" or "section" alone
-- ALWAYS return a selector that targets exactly ONE element
-- If ambiguity exists, DO NOT GUESS — return: {"error": "Target element is ambiguous. Need more specific instruction."}
-
-Precision is more important than speed. Do not guess. Do not over-edit.`;
+CRITICAL RULES:
+- old_block must be COPIED character-for-character from the provided source — including spaces, tabs, newlines, Blade directives, HTML attributes
+- Include 1-2 surrounding lines in old_block so it matches uniquely
+- new_block changes ONLY what the user asked — everything else stays identical
+- Do NOT invent code that isn't in the source
+- Do NOT convert Blade syntax to plain HTML
+- If the text contains special characters like smart quotes, copy them exactly
+- If ambiguous: {"error":"Need more specific instruction"}`;
 
     const textBlock = {
       type: 'text',
       text: `USER REQUEST: "${editInstruction}"
 
-SECTION HTML (this is the ONLY section you may modify):
-\`\`\`blade
+SOURCE CODE of the section (this is raw Blade PHP, not rendered HTML):
 ${sectionContent}
-\`\`\`
 
-Return ONLY valid JSON.`
+Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
     };
 
     const userContent = imageData
@@ -201,7 +181,7 @@ Return ONLY valid JSON.`
     try {
       const response = await this.client.messages.create({
         model: this.model,
-        max_tokens: 2048,
+        max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
       });
@@ -218,13 +198,8 @@ Return ONLY valid JSON.`
         return { mode: 'skip', reason: result.error };
       }
 
-      if (result?.selector && result?.action) {
-        logger.info('Edit instruction', { selector: result.selector, action: result.action, reasoning: result.reasoning });
-        return { mode: 'selector', ...result };
-      }
-
-      // Fallback: old_block/new_block format
       if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        logger.info('Edit ready', { reasoning: result.reasoning, old_preview: result.old_block.substring(0, 80) });
         return { mode: 'replace', old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
       }
 
