@@ -269,13 +269,15 @@ class ChangeRequestController {
     }
 
     const lines = originalContent.split('\n');
-    let section;
 
     if (selectedElement?.section) {
-      // ── User already clicked on a specific element — skip Phase 1 ──────
-      logger.info('Using selected element, skipping Phase 1', { section: selectedElement.section, tag: selectedElement.tag });
+      // ── DIRECT EDIT: User selected an element → skip Phase 1 + confirmation ──
+      logger.info('Direct edit mode', { section: selectedElement.section, tag: selectedElement.tag });
+      await this._updateStatus(requestId, 'generating_code');
+      emit('generating_code', `Editing: ${selectedElement.section}`);
+      emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
-      // Find the section by the heading text from the selected element
+      // Find the sub-block containing the selected section
       const sectionName = selectedElement.section;
       const keywords = sectionName.toLowerCase().split(/\W+/).filter(w => w.length > 2);
       let foundLine = -1;
@@ -287,68 +289,127 @@ class ChangeRequestController {
         }
       }
 
-      section = {
-        target_section: sectionName,
-        line_start: foundLine >= 0 ? foundLine + 1 : 1,
-        line_end: foundLine >= 0 ? Math.min(foundLine + 80, lines.length) : 80,
-        reasoning: `User clicked on "${selectedElement.tag}" element in "${sectionName}" section`,
-        confidence: 'high'
-      };
-    } else {
-      // ── PHASE 1: AI identifies which section the user means ──────────────
-      const contentForIdentify = originalContent.length > 50000
-        ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
-        : originalContent;
+      // Extract sub-block around the heading
+      let blockStart = foundLine >= 0 ? foundLine : 0;
+      let blockEnd = Math.min(blockStart + 40, lines.length);
+      const innerWrappers = /caption|content|inner|text|desc|body|detail/i;
+      for (let j = foundLine; j >= Math.max(0, foundLine - 40); j--) {
+        if (/<section/.test(lines[j]) || /<article/.test(lines[j])) { blockStart = j; break; }
+        const classMatch = lines[j].match(/<div\s[^>]*class="([^"]*)"/);
+        if (classMatch && !innerWrappers.test(classMatch[1])) { blockStart = j; break; }
+      }
+      let depth = 0;
+      for (let j = blockStart; j < Math.min(blockStart + 80, lines.length); j++) {
+        depth += (lines[j].match(/<div[\s>]/g) || []).length - (lines[j].match(/<\/div>/g) || []).length;
+        if (j > blockStart && depth <= 0) { blockEnd = j + 1; break; }
+        if (/<\/section>/.test(lines[j])) { blockEnd = j + 1; break; }
+      }
 
-      section = await aiService.identifySection(
-        changeRequest.prompt, structuredSections, contentForIdentify,
-        pageBladeFile.blade_file, imageData, conversation
-      );
+      const sectionContent = lines.slice(blockStart, blockEnd).join('\n');
+      logger.info('Extracted sub-block', { section: sectionName, lines: `${blockStart}-${blockEnd}` });
 
-      if (!section || !section.line_start) {
-        const reason = section?.error || 'Could not identify which section to edit';
-        logger.warn('Could not identify section', { requestId, reason });
+      // Direct image replacement if user uploaded an image
+      const isImageChange = savedImageUrl && /image|photo|picture|img|replace.*image|change.*image|update.*image|upload/i.test(changeRequest.prompt);
+      if (isImageChange) {
+        const imgMatch = sectionContent.match(/<img\s[\s\S]*?src=(["'])([\s\S]*?)\1[\s\S]*?>/);
+        if (imgMatch) {
+          const oldImgTag = imgMatch[0];
+          const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+          const newImgTag = oldImgTag.replace(`src=${imgMatch[1]}${imgMatch[2]}${imgMatch[1]}`, `src="${assetPath}"`);
+          if (originalContent.includes(oldImgTag)) {
+            const finalContent = originalContent.split(oldImgTag).join(newImgTag);
+            const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced image' };
+            await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+              { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
+            await fs.writeFile(absPath, finalContent, 'utf-8');
+            await this._clearViewCache(project.local_path);
+            await this._updateStatus(requestId, 'pending_review');
+            emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: pageBladeFile.blade_file, ...diffInfo }] }));
+            return;
+          }
+        }
+      }
+
+      // AI edit for text/style/layout
+      const generated = await aiService.executeEdit(changeRequest.prompt, sectionContent, pageBladeFile.blade_file, imageData, savedImageUrl);
+      if (generated.mode === 'skip') {
         await this._updateStatus(requestId, 'failed');
-        emit('failed', reason);
+        emit('failed', generated.reason || 'AI could not determine the edit');
         return;
       }
+      if (generated.mode !== 'replace' || !generated.old_block) {
+        await this._updateStatus(requestId, 'failed');
+        emit('failed', 'AI returned unexpected response');
+        return;
+      }
+
+      let oldBlock = generated.old_block;
+      let newBlock = generated.new_block;
+      if (/^\d+\|\s/.test(oldBlock)) {
+        oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+        newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+      }
+
+      const tryReplace = (c, o, n) => c.includes(o) ? c.split(o).join(n) : null;
+      const norm = s => s.replace(/\r\n/g, '\n');
+      const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
+      const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"');
+
+      let finalContent = tryReplace(originalContent, oldBlock, newBlock)
+        || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
+        || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
+        || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
+
+      if (!finalContent) {
+        await this._updateStatus(requestId, 'failed');
+        emit('failed', 'Could not locate the text to replace');
+        return;
+      }
+
+      const diffInfo = { old_block: oldBlock, new_block: newBlock, reasoning: generated.reasoning };
+      await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+        { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
+      await fs.writeFile(absPath, finalContent, 'utf-8');
+      await this._clearViewCache(project.local_path);
+      await this._updateStatus(requestId, 'pending_review');
+      emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: pageBladeFile.blade_file, ...diffInfo }] }));
+      logger.info('Direct edit applied', { requestId, reasoning: generated.reasoning });
+      return;
     }
 
-    logger.info('Section identified', {
-      target: section.target_section,
-      lines: `${section.line_start}-${section.line_end}`,
-      confidence: section.confidence,
-      reasoning: section.reasoning
-    });
+    // ── No element selected: use Phase 1 confirmation flow ──────────────
+    const contentForIdentify = originalContent.length > 50000
+      ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
+      : originalContent;
 
-    // ── Extract section preview for confirmation ──────────────────────────
+    const section = await aiService.identifySection(
+      changeRequest.prompt, structuredSections, contentForIdentify,
+      pageBladeFile.blade_file, imageData, conversation
+    );
+
+    if (!section || !section.line_start) {
+      const reason = section?.error || 'Could not identify which section to edit';
+      await this._updateStatus(requestId, 'failed');
+      emit('failed', reason);
+      return;
+    }
+
+    logger.info('Section identified', { target: section.target_section, lines: `${section.line_start}-${section.line_end}`, confidence: section.confidence });
+
     const startIdx = Math.max(0, section.line_start - 3);
     const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 3);
     const sectionPreview = lines.slice(section.line_start - 1, Math.min(section.line_start + 4, lines.length)).join('\n');
 
-    // ── Store section info + original content in DB for Phase 2 ─────────
     await sequelize.query(
       `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
        VALUES ($1, $2, $3, $4, '', 'modify', $5)`,
       { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent,
-        JSON.stringify({
-          line_start: startIdx, line_end: endIdx, saved_image_url: savedImageUrl,
-          target_section: section.target_section, reasoning: section.reasoning,
-          confidence: section.confidence, preview: sectionPreview
-        })
+        JSON.stringify({ line_start: startIdx, line_end: endIdx, saved_image_url: savedImageUrl, target_section: section.target_section, reasoning: section.reasoning, confidence: section.confidence, preview: sectionPreview })
       ]}
     );
 
-    // ── STOP — ask user to confirm before editing ────────────────────────
     await this._updateStatus(requestId, 'confirm_section');
-    emit('confirm_section', JSON.stringify({
-      target_section: section.target_section,
-      reasoning: section.reasoning,
-      confidence: section.confidence,
-      preview: sectionPreview,
-      file: pageBladeFile.blade_file
-    }));
-    logger.info('Waiting for user confirmation', { requestId, section: section.target_section });
+    emit('confirm_section', JSON.stringify({ target_section: section.target_section, reasoning: section.reasoning, confidence: section.confidence, preview: sectionPreview, file: pageBladeFile.blade_file }));
   }
 
   // ── Full pipeline: analyze → generate (scoped to current page file) ────────
