@@ -52,11 +52,20 @@ export default function ProjectPreview() {
   const [commitMsg, setCommitMsg] = useState('');
   const [pushing, setPushing] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [activePrompt, setActivePrompt] = useState(null); // shows submitted prompt above input
+  const [activePrompt, setActivePrompt] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]); // session chat — destroyed on tab close
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
+  const chatEndRef = useRef(null);
 
   const [imageLoading, setImageLoading] = useState(false);
+
+  // Chat helpers
+  function addChat(role, text, type = 'text') {
+    setChatMessages(prev => [...prev, { role, text, type, id: Date.now() + Math.random() }]);
+    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+  }
+  function clearChat() { setChatMessages([]); }
 
   function loadImageFile(file) {
     if (!file || !file.type.startsWith('image/')) return;
@@ -204,18 +213,23 @@ export default function ProjectPreview() {
 
   async function confirmSection() {
     if (!result?.id) return;
+    addChat('user', 'Yes, edit this section');
     try {
       setSectionConfirm(null);
       setResult(prev => ({ ...prev, status: 'generating_code', message: 'Applying change…' }));
+      addChat('ai', 'Making the change...', 'status');
       await apiClient.confirmSection(result.id);
     } catch (err) {
       setResult(prev => ({ ...prev, status: 'failed', message: err.response?.data?.error || 'Confirm failed' }));
+      addChat('ai', 'Failed: ' + (err.response?.data?.error || 'Unknown error'), 'error');
       setSectionConfirm(null);
     }
   }
 
   async function declineSection() {
     if (!result?.id) return;
+    addChat('user', 'No, wrong section');
+    addChat('ai', 'Got it. Tell me which section you meant, or describe the change differently.', 'text');
     try { await apiClient.rejectChangeRequest(result.id); } catch {}
     setSectionConfirm(null);
     setActivePrompt(null);
@@ -224,6 +238,7 @@ export default function ProjectPreview() {
 
   async function applyChange() {
     if (!result?.id) return;
+    addChat('user', 'Accept changes');
     try {
       await apiClient.applyChangeRequest(result.id);
       setPendingDiff(null);
@@ -231,13 +246,16 @@ export default function ProjectPreview() {
       setResult(prev => ({ ...prev, status: 'review', message: 'Changes accepted' }));
       setLastAppliedId(result.id);
       setActivePrompt(null);
+      addChat('ai', 'Changes accepted! You can continue editing or push to your branch.', 'success');
     } catch (err) {
       setResult(prev => ({ ...prev, status: 'failed', message: err.response?.data?.error || 'Apply failed' }));
+      addChat('ai', 'Failed to apply: ' + (err.response?.data?.error || 'Unknown error'), 'error');
     }
   }
 
   async function rejectChange() {
     if (!result?.id) return;
+    addChat('user', 'Reject changes');
     try {
       await apiClient.rejectChangeRequest(result.id);
       setPendingDiff(null);
@@ -245,6 +263,7 @@ export default function ProjectPreview() {
       setActivePrompt(null);
       setResult({ status: 'rejected', message: 'Reverted to original' });
       reloadIframe();
+      addChat('ai', 'Reverted to original. Tell me what to change instead.', 'text');
       setTimeout(() => setResult(null), 3000);
     } catch (err) {
       alert(err.response?.data?.error || 'Reject failed');
@@ -306,6 +325,7 @@ export default function ProjectPreview() {
     const submittedImage = image; // capture image before state changes
     setPrompt('');
     setActivePrompt(submittedPrompt);
+    addChat('user', submittedPrompt);
 
     try {
       // ── Auto-reject any pending review before submitting new prompt ────
@@ -350,6 +370,9 @@ export default function ProjectPreview() {
 
       // ── All prompts go through 2-step AI flow (identify section → confirm → edit) ──
       setResult({ status: 'analyzing', message: 'Finding the right section…' });
+      // Build conversation context for AI (last 6 messages for context)
+      const conversationContext = chatMessages.slice(-6).map(m => ({ role: m.role, text: m.text }));
+
       const res = await apiClient.createChangeRequest({
         project_id: id,
         title: submittedPrompt.substring(0, 100),
@@ -357,6 +380,7 @@ export default function ProjectPreview() {
         category: 'content',
         current_page_url: livePageUrl,
         page_context: pageContext,
+        conversation: conversationContext,
         ...(submittedImage && {
           image_base64: submittedImage.base64,
           image_media_type: submittedImage.mediaType
@@ -425,6 +449,7 @@ export default function ProjectPreview() {
                 const info = JSON.parse(detail.data.generated_code[0].diff || '{}');
                 console.log('sectionConfirm set:', info.target_section);
                 setSectionConfirm(info);
+                addChat('ai', `I found the "${info.target_section}" section. ${info.reasoning || ''} Should I edit this?`, 'confirm');
               } else {
                 console.log('No generated_code in response');
               }
@@ -434,8 +459,8 @@ export default function ProjectPreview() {
               try {
                 const p = await apiClient.getChangeRequest(cr.id);
                 const st = p.data?.status;
-                if (st === 'pending_review') { clearInterval(cp); setResult(prev => ({ ...prev, status: st, message: 'Preview ready' })); setPendingDiff({ diff: [] }); setSectionConfirm(null); reloadIframe(); }
-                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); setTimeout(() => setResult(null), 5000); }
+                if (st === 'pending_review') { clearInterval(cp); setResult(prev => ({ ...prev, status: st, message: 'Preview ready' })); setPendingDiff({ diff: [] }); setSectionConfirm(null); reloadIframe(); addChat('ai', 'Done! Check the preview above. Accept or reject the change.', 'success'); }
+                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); addChat('ai', 'The change failed. Try describing it differently.', 'error'); setTimeout(() => setResult(null), 5000); }
               } catch {}
             }, 2000);
             setTimeout(() => clearInterval(cp), 120000);
@@ -663,15 +688,40 @@ export default function ProjectPreview() {
         <div className="border-t-2 border-stone-300 py-3" style={{ background: 'linear-gradient(135deg, #e8e4df 0%, #f0ece7 40%, #e8e4df 100%)' }}>
           <div className="w-[65%] mx-auto">
 
-            {/* Active prompt bubble */}
-            {activePrompt && (
-              <div className="mb-3 flex items-start gap-2">
-                <div className="flex-1 text-sm px-4 py-2.5 rounded-2xl rounded-bl-sm shadow-md text-white" style={{ background: 'linear-gradient(135deg, #2d6a4f, #40916c)' }}>
-                  {activePrompt}
-                </div>
-                {!['review', 'failed', 'rejected', 'pending_review'].includes(result?.status) && (
-                  <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin flex-shrink-0 mt-1.5" />
+            {/* ── Chat thread ── */}
+            {chatMessages.length > 0 && (
+              <div className="mb-3 max-h-48 overflow-y-auto space-y-2 pr-1" style={{ scrollbarWidth: 'thin' }}>
+                {chatMessages.map(msg => (
+                  <div key={msg.id} className={`flex items-start gap-2 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                    {msg.role === 'ai' && (
+                      <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold mt-0.5" style={{ background: '#2d6a4f' }}>AI</div>
+                    )}
+                    <div className={`max-w-[80%] text-sm px-3 py-2 rounded-2xl ${
+                      msg.role === 'user'
+                        ? 'rounded-br-sm text-white shadow-sm'
+                        : msg.type === 'error'
+                        ? 'bg-red-50 text-red-700 border border-red-200'
+                        : msg.type === 'success'
+                        ? 'bg-green-50 text-green-700 border border-green-200'
+                        : msg.type === 'confirm'
+                        ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                        : 'bg-white text-gray-700 border border-stone-200'
+                    }`} style={msg.role === 'user' ? { background: 'linear-gradient(135deg, #2d6a4f, #40916c)' } : {}}>
+                      {msg.text}
+                    </div>
+                  </div>
+                ))}
+                {submitting && (
+                  <div className="flex items-start gap-2">
+                    <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold" style={{ background: '#2d6a4f' }}>AI</div>
+                    <div className="flex items-center gap-1.5 px-3 py-2 bg-white border border-stone-200 rounded-2xl">
+                      <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </div>
+                  </div>
                 )}
+                <div ref={chatEndRef} />
               </div>
             )}
 
@@ -752,6 +802,9 @@ export default function ProjectPreview() {
             {/* Bottom controls */}
             <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-stone-300/50">
               <div className="flex items-center gap-2">
+                {chatMessages.length > 0 && (
+                  <button onClick={clearChat} className="text-[11px] px-2.5 py-1 text-stone-500 hover:text-stone-700 transition-colors">New chat</button>
+                )}
                 {result?.status === 'review' && lastAppliedId && (
                   <button onClick={handleRestore} className="text-[11px] px-2.5 py-1 text-amber-700 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors font-medium">Undo last</button>
                 )}

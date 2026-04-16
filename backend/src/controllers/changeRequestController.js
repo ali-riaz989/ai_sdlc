@@ -15,7 +15,7 @@ const fs = require('fs').promises;
 class ChangeRequestController {
   async create(req, res, next) {
     try {
-      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context } = req.body;
+      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation } = req.body;
       const userId = req.user.id;
 
       const [projects] = await sequelize.query(
@@ -56,7 +56,7 @@ class ChangeRequestController {
       const _this = this;
       (async function() {
         try {
-          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context);
+          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation);
         } catch (error) {
           console.error('>>> PROCESS ERROR:', error.message, error.stack);
           logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
@@ -116,7 +116,7 @@ class ChangeRequestController {
   }
 
   // ── Main processor ─────────────────────────────────────────────────────────
-  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null) {
+  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null) {
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -148,7 +148,7 @@ class ChangeRequestController {
 
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
-        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData);
+        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation);
       } else {
         // No page resolved (no URL sent) — fall back to full pipeline
         await this._updateStatus(requestId, 'analyzing');
@@ -220,7 +220,7 @@ class ChangeRequestController {
   }
 
   // ── 2-step flow: AI identifies section → confirms → edits ──────────────────
-  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null) {
+  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null) {
     await this._updateStatus(requestId, 'analyzing');
     emit('analyzing', 'Finding the right section…');
 
@@ -275,7 +275,7 @@ class ChangeRequestController {
 
     const section = await aiService.identifySection(
       changeRequest.prompt, structuredSections, contentForIdentify,
-      pageBladeFile.blade_file, imageData
+      pageBladeFile.blade_file, imageData, conversation
     );
 
     if (!section || !section.line_start) {

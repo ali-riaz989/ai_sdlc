@@ -61,14 +61,21 @@ class AIService {
   // ─── PHASE 1: Identify target section using structured DOM + file ────────
   // AI thinks through: understand → locate → validate
   // Returns { target_section, line_start, line_end, reasoning, confidence }
-  async identifySection(prompt, structuredSections, fileContent, filePath, imageData = null) {
-    logger.info('Phase 1: Identifying section', { prompt: prompt.substring(0, 80) });
+  async identifySection(prompt, structuredSections, fileContent, filePath, imageData = null, conversation = null) {
+    logger.info('Phase 1: Identifying section', { prompt: prompt.substring(0, 80), hasConversation: !!(conversation?.length) });
 
     const numberedContent = fileContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
 
+    // Build conversation context so AI understands corrections
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (use this to understand corrections):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
+
     const textBlock = {
       type: 'text',
-      text: `USER REQUEST: "${prompt}"
+      text: `USER REQUEST: "${prompt}"${conversationNote}
 
 PAGE STRUCTURE (each section with its role and content):
 ${JSON.stringify(structuredSections, null, 2)}
@@ -77,7 +84,7 @@ FILE (with line numbers):
 ${numberedContent}
 
 Follow this thinking process:
-UNDERSTAND: What does the user want to change?
+UNDERSTAND: What does the user want to change? If there is a PREVIOUS CONVERSATION, the user may be correcting a previous attempt — pay attention to what they said was wrong.
 LOCATE: Which section from the PAGE STRUCTURE matches? Use context and meaning, not just keywords.
 VALIDATE: Is this the ONLY correct match? If multiple sections match, pick the content section (not navigation).
 
@@ -106,6 +113,7 @@ RULES:
 - Use meaning and context, not just keyword matching
 - "Leeds golf" could mean a heading that says "Leeds Golf Centre" — fuzzy match is OK
 - If the user mentions text that's slightly different from the file, still match the closest section
+- If the user previously said "no, wrong section", pick a DIFFERENT section this time
 - Return the line range that covers the FULL section (from <section> to </section>)`,
         messages: [{ role: 'user', content: userContent }]
       });
