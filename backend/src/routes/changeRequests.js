@@ -166,27 +166,36 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
     let endLine = sectionInfo.line_end;
 
     if (sectionInfo.target_section) {
-      // Extract key words from the target section name
       const keywords = sectionInfo.target_section.toLowerCase().split(/\W+/).filter(w => w.length > 3);
       for (let i = 0; i < lines.length; i++) {
         const lineLower = lines[i].toLowerCase();
-        // Look for section tags or headings containing the keywords
-        if (/<section|<h[1-6]/.test(lines[i])) {
+        if (/<h[1-6]/.test(lines[i])) {
           const matchCount = keywords.filter(k => lineLower.includes(k)).length;
           if (matchCount >= Math.min(2, keywords.length)) {
-            // Found the section — extract from the previous <section> tag
-            let sectionStart = i;
-            for (let j = i; j >= Math.max(0, i - 10); j--) {
-              if (/<section/.test(lines[j])) { sectionStart = j; break; }
+            // Found the heading — now find the containing sub-block (div.block, article, etc.)
+            // Walk UP to find the nearest container (div with class, or section)
+            let blockStart = i;
+            for (let j = i; j >= Math.max(0, i - 30); j--) {
+              if (/<div\s[^>]*class=/.test(lines[j]) || /<section/.test(lines[j]) || /<article/.test(lines[j])) {
+                blockStart = j;
+                break;
+              }
             }
-            // Find the end (next </section> or +120 lines)
-            let sectionEnd = Math.min(i + 120, lines.length);
-            for (let j = i + 1; j < Math.min(i + 200, lines.length); j++) {
-              if (/<\/section>/.test(lines[j])) { sectionEnd = j + 1; break; }
+            // Walk DOWN to find the closing of this block
+            // Count div depth from blockStart
+            let depth = 0;
+            let blockEnd = Math.min(i + 40, lines.length);
+            for (let j = blockStart; j < Math.min(blockStart + 80, lines.length); j++) {
+              const opens = (lines[j].match(/<div[\s>]/g) || []).length;
+              const closes = (lines[j].match(/<\/div>/g) || []).length;
+              depth += opens - closes;
+              if (j > blockStart && depth <= 0) { blockEnd = j + 1; break; }
+              // Also stop at </section>
+              if (/<\/section>/.test(lines[j])) { blockEnd = j + 1; break; }
             }
-            startLine = sectionStart;
-            endLine = sectionEnd;
-            require('../utils/logger').info('Found section by keyword search', { keywords, line: i, range: `${startLine}-${endLine}` });
+            startLine = blockStart;
+            endLine = blockEnd;
+            require('../utils/logger').info('Found sub-block by heading', { keywords, headingLine: i, range: `${startLine}-${endLine}` });
             break;
           }
         }
