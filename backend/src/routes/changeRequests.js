@@ -26,21 +26,19 @@ function applySelectorEdit(fileContent, generated) {
   const idMatch = target.match(/#([a-zA-Z0-9_-]+)/);
   const tag = tagMatch ? tagMatch[1] : null;
 
-  // Build a regex to find the element in HTML
-  // Match opening tag with the right tag name, classes, and id
+  // Build a regex to find the element in HTML (handles multi-line attributes)
   let pattern = '<';
   if (tag) {
     pattern += tag;
   } else {
     pattern += '[a-z][a-z0-9]*';
   }
-  pattern += '[^>]*';
-  if (idMatch) pattern += `id=["']${idMatch[1]}["'][^>]*`;
-  for (const cls of classMatches) pattern += `(?=[^>]*class=["'][^"']*\\b${cls}\\b)`;
+  pattern += '[\\s\\S]*?'; // match attributes across multiple lines
+  if (idMatch) pattern += `id=["']${idMatch[1]}["'][\\s\\S]*?`;
+  for (const cls of classMatches) pattern += `(?=[\\s\\S]*?class=["'][^"']*\\b${cls}\\b)`;
   pattern += '>';
 
-  // If there are ancestors, we need to be inside them — but for simplicity we'll find the element directly
-  // and verify ancestors exist around it
+  // Verify ancestors exist by checking if the match is inside them
   const elementRegex = new RegExp(pattern, 'i');
   const match = fileContent.match(elementRegex);
   if (!match) return { success: false, error: `Element not found for selector: ${selector}` };
