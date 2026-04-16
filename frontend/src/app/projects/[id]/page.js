@@ -599,11 +599,16 @@ export default function ProjectPreview() {
         current_page_url: livePageUrl,
         page_context: pageContext,
         conversation: conversationContext,
+        // If user clicked on a specific element, pass it so backend skips Phase 1
+        selected_element: selectedElement || null,
         ...(submittedImage && {
           image_base64: submittedImage.base64,
           image_media_type: submittedImage.mediaType
         })
       });
+      // Clear selection after submit
+      setSelectedElement(null);
+      clearHighlight();
       const cr = res.data;
       setImage(null);
       setResult({ id: cr.id, status: cr.status, message: 'Processing…', stagingUrl: null });

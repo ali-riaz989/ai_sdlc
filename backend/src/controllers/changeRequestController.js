@@ -15,7 +15,7 @@ const fs = require('fs').promises;
 class ChangeRequestController {
   async create(req, res, next) {
     try {
-      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation } = req.body;
+      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element } = req.body;
       const userId = req.user.id;
 
       const [projects] = await sequelize.query(
@@ -56,7 +56,7 @@ class ChangeRequestController {
       const _this = this;
       (async function() {
         try {
-          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation);
+          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation, selected_element);
         } catch (error) {
           console.error('>>> PROCESS ERROR:', error.message, error.stack);
           logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
@@ -116,7 +116,7 @@ class ChangeRequestController {
   }
 
   // ── Main processor ─────────────────────────────────────────────────────────
-  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null) {
+  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null, selectedElement = null) {
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -148,7 +148,7 @@ class ChangeRequestController {
 
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
-        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation);
+        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement);
       } else {
         // No page resolved (no URL sent) — fall back to full pipeline
         await this._updateStatus(requestId, 'analyzing');
@@ -220,7 +220,7 @@ class ChangeRequestController {
   }
 
   // ── 2-step flow: AI identifies section → confirms → edits ──────────────────
-  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null) {
+  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null) {
     await this._updateStatus(requestId, 'analyzing');
     emit('analyzing', 'Finding the right section…');
 
@@ -268,22 +268,50 @@ class ChangeRequestController {
       logger.info('Built structured sections from code', { count: structuredSections.length });
     }
 
-    // ── PHASE 1: AI identifies which section the user means ──────────────
-    const contentForIdentify = originalContent.length > 50000
-      ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
-      : originalContent;
+    const lines = originalContent.split('\n');
+    let section;
 
-    const section = await aiService.identifySection(
-      changeRequest.prompt, structuredSections, contentForIdentify,
-      pageBladeFile.blade_file, imageData, conversation
-    );
+    if (selectedElement?.section) {
+      // ── User already clicked on a specific element — skip Phase 1 ──────
+      logger.info('Using selected element, skipping Phase 1', { section: selectedElement.section, tag: selectedElement.tag });
 
-    if (!section || !section.line_start) {
-      const reason = section?.error || 'Could not identify which section to edit';
-      logger.warn('Could not identify section', { requestId, reason });
-      await this._updateStatus(requestId, 'failed');
-      emit('failed', reason);
-      return;
+      // Find the section by the heading text from the selected element
+      const sectionName = selectedElement.section;
+      const keywords = sectionName.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+      let foundLine = -1;
+      for (let i = 0; i < lines.length; i++) {
+        if (/<h[1-6]/.test(lines[i])) {
+          const lineLower = lines[i].toLowerCase();
+          const matchCount = keywords.filter(k => lineLower.includes(k)).length;
+          if (matchCount >= Math.min(2, keywords.length)) { foundLine = i; break; }
+        }
+      }
+
+      section = {
+        target_section: sectionName,
+        line_start: foundLine >= 0 ? foundLine + 1 : 1,
+        line_end: foundLine >= 0 ? Math.min(foundLine + 80, lines.length) : 80,
+        reasoning: `User clicked on "${selectedElement.tag}" element in "${sectionName}" section`,
+        confidence: 'high'
+      };
+    } else {
+      // ── PHASE 1: AI identifies which section the user means ──────────────
+      const contentForIdentify = originalContent.length > 50000
+        ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
+        : originalContent;
+
+      section = await aiService.identifySection(
+        changeRequest.prompt, structuredSections, contentForIdentify,
+        pageBladeFile.blade_file, imageData, conversation
+      );
+
+      if (!section || !section.line_start) {
+        const reason = section?.error || 'Could not identify which section to edit';
+        logger.warn('Could not identify section', { requestId, reason });
+        await this._updateStatus(requestId, 'failed');
+        emit('failed', reason);
+        return;
+      }
     }
 
     logger.info('Section identified', {
@@ -294,7 +322,6 @@ class ChangeRequestController {
     });
 
     // ── Extract section preview for confirmation ──────────────────────────
-    const lines = originalContent.split('\n');
     const startIdx = Math.max(0, section.line_start - 3);
     const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 3);
     const sectionPreview = lines.slice(section.line_start - 1, Math.min(section.line_start + 4, lines.length)).join('\n');
