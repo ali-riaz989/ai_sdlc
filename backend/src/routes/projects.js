@@ -695,6 +695,11 @@ router.post('/:id/reset', authenticateToken, requireRole('admin'), async (req, r
     if (!projects.length) return res.status(404).json({ error: 'Project not found' });
     const project = projects[0];
 
+    const fs = require('fs');
+    if (!fs.existsSync(require('path').join(project.local_path, '.git'))) {
+      return res.status(400).json({ error: 'Not a git repo — cannot reset. Use git init first or re-clone the project.' });
+    }
+
     const git = simpleGit(project.local_path);
     await git.checkout(['.']);
     await git.clean('f', ['-d']);
