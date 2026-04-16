@@ -473,8 +473,8 @@ export default function ProjectPreview() {
 
       // ── All prompts go through 2-step AI flow (identify section → confirm → edit) ──
       setResult({ status: 'analyzing', message: 'Finding the right section…' });
-      // Build conversation context for AI (last 6 messages for context)
-      const conversationContext = chatMessages.slice(-6).map(m => ({ role: m.role, text: m.text }));
+      // Pass full chat history to AI for complete context
+      const conversationContext = chatMessages.map(m => ({ role: m.role, text: m.text }));
 
       const res = await apiClient.createChangeRequest({
         project_id: id,
