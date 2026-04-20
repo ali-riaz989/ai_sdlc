@@ -145,6 +145,7 @@ router.get('/:id', authenticateToken, (req, res, next) =>
 router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
   try {
     const { id } = req.params;
+    const conversation = req.body?.conversation || null;
     const [requests] = await sequelize.query(
       'SELECT cr.*, p.local_path, p.project_url FROM change_requests cr JOIN projects p ON cr.project_id = p.id WHERE cr.id = $1',
       { bind: [id] }
@@ -216,8 +217,10 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
     const emit = (status, message) => { if (io) io.to(`cr-${id}`).emit(`change-request:${id}`, { status, message }); };
 
     const fail = async (msg) => {
-      await sequelize.query("UPDATE change_requests SET status = 'failed', updated_at = NOW() WHERE id = $1", { bind: [id] });
-      emit('failed', msg);
+      const reason = msg || 'Unknown error';
+      await sequelize.query("UPDATE change_requests SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2", { bind: [reason, id] });
+      require('../utils/logger').warn('Change request failed', { id, reason });
+      emit('failed', reason);
     };
 
     try {
@@ -254,7 +257,7 @@ router.post('/:id/confirm', authenticateToken, async (req, res, next) => {
       }
 
       // ── AI-powered edit for text/style/layout changes ──
-      const generated = await aiService.executeEdit(cr.prompt, sectionContent, gc.file_path, null, sectionInfo.saved_image_url);
+      const generated = await aiService.executeEdit(cr.prompt, sectionContent, gc.file_path, null, sectionInfo.saved_image_url, 'blade', conversation);
 
       if (generated.mode === 'skip') { await fail(generated.reason || 'AI could not determine the edit'); return; }
       if (generated.mode !== 'replace' || !generated.old_block) { await fail('AI returned unexpected response'); return; }

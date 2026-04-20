@@ -136,8 +136,8 @@ RULES:
 
   // ─── PHASE 2: Execute edit — old_block/new_block like Claude Code ───────
   // AI receives the RAW SOURCE CODE of the section and returns exact text replacement
-  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
-    logger.info('Phase 2: Executing edit', { file: filePath });
+  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null, language = 'blade', conversation = null) {
+    logger.info('Phase 2: Executing edit', { file: filePath, language, hasConversation: !!(conversation?.length) });
 
     let editInstruction = prompt;
     if (savedImageUrl) {
@@ -145,35 +145,46 @@ RULES:
       editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
     }
 
-    const systemPrompt = `You are a code editor like Claude Code or Cursor. You edit Laravel Blade source files.
+    // Thread full chat history so the AI can interpret corrections and follow-ups
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references like "change it to", "make that bigger"):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
 
-You receive a section of RAW SOURCE CODE (Blade PHP) — NOT rendered HTML. This includes @include, @foreach, {{ }}, and other Blade directives.
+    const languageDesc = language === 'css'
+      ? { name: 'CSS', sourceDesc: 'RAW CSS source (selectors, declarations, media queries)', extras: '- Preserve selector syntax exactly (. # : pseudo-classes, nesting)\n- Keep units, !important, vendor prefixes intact' }
+      : { name: 'Laravel Blade', sourceDesc: 'RAW SOURCE CODE (Blade PHP) — NOT rendered HTML. This includes @include, @foreach, {{ }}, and other Blade directives', extras: '- Do NOT convert Blade syntax to plain HTML' };
+
+    const systemPrompt = `You are a code editor like Claude Code or Cursor. You edit ${languageDesc.name} source files.
+
+You receive a section of ${languageDesc.sourceDesc}.
 
 Your job: find the exact lines to change and return a precise find-and-replace.
 
 THINKING PROCESS:
 1. UNDERSTAND what the user wants to change
 2. FIND the exact lines in the source code that need changing
-3. COPY those lines EXACTLY as they appear (character-for-character, including whitespace and Blade syntax)
+3. COPY those lines EXACTLY as they appear (character-for-character, including whitespace and syntax)
 4. WRITE the replacement with ONLY the requested change
 
 OUTPUT: Return ONLY valid JSON:
 {"old_block":"exact verbatim lines from the source code","new_block":"the replacement lines","reasoning":"what was changed"}
 
 CRITICAL RULES:
-- old_block must be COPIED character-for-character from the provided source — including spaces, tabs, newlines, Blade directives, HTML attributes
+- old_block must be COPIED character-for-character from the provided source — including spaces, tabs, newlines, syntax
 - Include 1-2 surrounding lines in old_block so it matches uniquely
 - new_block changes ONLY what the user asked — everything else stays identical
 - Do NOT invent code that isn't in the source
-- Do NOT convert Blade syntax to plain HTML
+${languageDesc.extras}
 - If the text contains special characters like smart quotes, copy them exactly
 - If ambiguous: {"error":"Need more specific instruction"}`;
 
     const textBlock = {
       type: 'text',
-      text: `USER REQUEST: "${editInstruction}"
+      text: `USER REQUEST: "${editInstruction}"${conversationNote}
 
-SOURCE CODE of the section (this is raw Blade PHP, not rendered HTML):
+SOURCE CODE of the section (this is raw ${languageDesc.name}):
 ${sectionContent}
 
 Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
@@ -212,6 +223,110 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
       return { mode: 'skip' };
     } catch (error) {
       logger.error('Edit execution failed', { error: error.message });
+      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
+        ? 'Rate limit reached — wait a moment and try again'
+        : error.message?.includes('Connection')
+        ? 'API connection error — try again in a moment'
+        : 'AI service error: ' + (error.message || 'unknown');
+      return { mode: 'skip', reason };
+    }
+  }
+
+  // ─── Claude-Code-style edit: AI picks which file to edit from multiple candidates ───
+  // candidates: [{ path, content, type }]  (e.g. blade, css, js)
+  // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
+  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null }) {
+    logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
+
+    let editInstruction = prompt;
+    if (savedImageUrl) {
+      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
+    }
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
+
+    const elInfo = selectedElement ? `
+SELECTED ELEMENT (what the user clicked):
+- tag: <${selectedElement.tag || '?'}>
+- classes: "${selectedElement.classes || ''}"
+- heading/section: "${selectedElement.section || ''}"
+- inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
+- is image: ${selectedElement.isImage ? 'yes' : 'no'}` : '';
+
+    const filesBlock = candidates.map(c =>
+      `\n===== FILE: ${c.path}  [type: ${c.type}] =====\n${c.content}\n===== END FILE: ${c.path} =====\n`
+    ).join('\n');
+
+    const systemPrompt = `You are a code editor, like Claude Code or Cursor, operating on a website codebase.
+
+You receive:
+- Metadata about the element the user clicked in the browser
+- The user's request (and prior chat history)
+- One or more CANDIDATE FILES (Blade PHP, CSS, JS, etc.) that are relevant to that element
+
+Your job: decide WHICH single file to edit to fulfill the request, then return a precise find-and-replace.
+
+DECISION RULES:
+- For styling/visual changes (color, spacing, size, layout): prefer editing the CSS file that defines the element's class rule
+- For text/content/structure/image changes: edit the Blade template
+- For behavior/interaction: edit the JS file
+- Only pick from the files provided; do not reference files that aren't in the candidates
+
+OUTPUT: Return ONLY valid JSON:
+{"file_path":"<exact FILE path from the header>","old_block":"<exact verbatim lines from that file>","new_block":"<replacement lines>","reasoning":"<what changed>"}
+
+CRITICAL RULES:
+- file_path MUST exactly match one of the FILE headers above
+- old_block MUST be copied character-for-character from the chosen file (including whitespace, quotes, Blade directives, CSS syntax)
+- Include 1-2 surrounding lines in old_block so the match is unique
+- new_block changes ONLY what the user asked for
+- Do NOT invent code not present in the files
+- ADDING NEW CONTENT (e.g. a new CSS rule that does not exist yet):
+  - Find a nearby existing block (like the previous CSS rule or a section header)
+  - Put those existing lines in old_block EXACTLY as they appear
+  - Put those same lines PLUS your new content in new_block
+  - This ensures the replace is unique and appends cleanly
+- If truly appending to end of file is the only option: set "old_block" to the LAST 2–5 non-empty lines of the file exactly as they appear, and "new_block" to those same lines followed by your new content
+- If ambiguous: {"error":"<why>"}`;
+
+    const textBlock = {
+      type: 'text',
+      text: `USER REQUEST: "${editInstruction}"${conversationNote}
+${elInfo}
+
+CANDIDATE FILES:${filesBlock}
+
+Return ONLY valid JSON: {"file_path":"...","old_block":"...","new_block":"...","reasoning":"..."}`
+    };
+
+    const userContent = imageData
+      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
+      : [textBlock];
+
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userContent }]
+      });
+      let result;
+      try { result = this._extractJSON(response.content[0].text); }
+      catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
+
+      if (result?.error) return { mode: 'skip', reason: result.error };
+      if (result?.file_path && result?.old_block !== undefined && result?.new_block !== undefined) {
+        logger.info('Multi-file edit ready', { file: result.file_path, reasoning: result.reasoning });
+        return { mode: 'replace', file_path: result.file_path, old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
+      }
+      logger.warn('AI returned unexpected shape in executeEditMulti', { keys: Object.keys(result || {}) });
+      return { mode: 'skip' };
+    } catch (error) {
+      logger.error('Multi-file edit failed', { error: error.message });
       const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
         ? 'Rate limit reached — wait a moment and try again'
         : error.message?.includes('Connection')

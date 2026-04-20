@@ -280,8 +280,9 @@ export default function ProjectPreview() {
       while (target && smallTags.has(target.tagName) && target.parentElement) {
         target = target.parentElement;
       }
-      target.style.outline = '2px dashed #2d6a4f';
-      target.style.outlineOffset = '2px';
+      target.style.outline = '3px solid #dc2626';
+      target.style.outlineOffset = '3px';
+      target.style.boxShadow = '0 0 0 6px rgba(220, 38, 38, 0.25)';
       target.style.cursor = 'pointer';
       hoveredEl = target;
     };
@@ -290,6 +291,7 @@ export default function ProjectPreview() {
       if (hoveredEl) {
         hoveredEl.style.outline = '';
         hoveredEl.style.outlineOffset = '';
+        hoveredEl.style.boxShadow = '';
         hoveredEl.style.cursor = '';
         hoveredEl = null;
       }
@@ -327,12 +329,16 @@ export default function ProjectPreview() {
         : `a ${info.tag} element in "${info.section}"`;
       addChat('ai', `Selected: ${elDesc}. What would you like to do? (change text, update style, replace image, etc.)`, 'text');
 
-      // Highlight the selected element
-      el.style.outline = '3px solid #2d6a4f';
-      el.style.outlineOffset = '4px';
-      el.style.background = 'rgba(45, 106, 79, 0.1)';
+      // Highlight the selected element — bold red to stand out
+      const selectedStyles = {
+        outline: '4px solid #dc2626',
+        outlineOffset: '4px',
+        boxShadow: '0 0 0 8px rgba(220, 38, 38, 0.3), 0 0 24px rgba(220, 38, 38, 0.4)',
+        background: 'rgba(220, 38, 38, 0.08)'
+      };
+      Object.assign(el.style, selectedStyles);
       iframeRef.current._highlightedEl = el;
-      iframeRef.current._highlightStyles = { outline: '3px solid #2d6a4f', outlineOffset: '4px', background: 'rgba(45, 106, 79, 0.1)' };
+      iframeRef.current._highlightStyles = selectedStyles;
 
       // Clean hover listeners
       const doc = getDoc();
@@ -364,6 +370,7 @@ export default function ProjectPreview() {
       if (hoveredEl) {
         hoveredEl.style.outline = '';
         hoveredEl.style.outlineOffset = '';
+        hoveredEl.style.boxShadow = '';
         hoveredEl.style.cursor = '';
       }
     };
@@ -639,6 +646,11 @@ export default function ProjectPreview() {
           setPendingDiff(null);
           setStreamingTokens('');
           reloadIframe(); // reload to show restored original
+          if (update.status === 'failed') {
+            const reason = update.message || 'The change failed. Try again.';
+            addChat('ai', reason, 'error');
+            setActivePrompt(null);
+          }
         }
       }, (fileUpdate) => {
         setFiles(prev => {
@@ -684,7 +696,7 @@ export default function ProjectPreview() {
                 const p = await apiClient.getChangeRequest(cr.id);
                 const st = p.data?.status;
                 if (st === 'pending_review') { clearInterval(cp); setResult(prev => ({ ...prev, status: st, message: 'Preview ready' })); setPendingDiff({ diff: [] }); setSectionConfirm(null); reloadIframe(); addChat('ai', 'Done! Check the preview above. Accept or reject the change.', 'success'); }
-                else if (st === 'failed') { clearInterval(cp); setResult(prev => ({ ...prev, status: 'failed', message: 'Change failed' })); setSectionConfirm(null); setActivePrompt(null); addChat('ai', p.data?.message || 'The change failed. Try describing it differently.', 'error'); setTimeout(() => setResult(null), 5000); }
+                else if (st === 'failed') { clearInterval(cp); const reason = p.data?.error_message || p.data?.message || 'The change failed. Try describing it differently.'; setResult(prev => ({ ...prev, status: 'failed', message: reason })); setSectionConfirm(null); setActivePrompt(null); addChat('ai', reason, 'error'); setTimeout(() => setResult(null), 8000); }
               } catch {}
             }, 2000);
             setTimeout(() => clearInterval(cp), 120000);
@@ -713,9 +725,11 @@ export default function ProjectPreview() {
             // Fetch actual error reason
             try {
               const detail = await apiClient.getChangeRequest(cr.id);
-              addChat('ai', detail.data?.message || 'The change failed. Try again.', 'error');
+              const reason = detail.data?.error_message || detail.data?.message || 'The change failed. Try again.';
+              setResult(prev => ({ ...prev, status: 'failed', message: reason }));
+              addChat('ai', reason, 'error');
             } catch { addChat('ai', 'The change failed. Try again.', 'error'); }
-            setTimeout(() => setResult(null), 5000);
+            setTimeout(() => setResult(null), 8000);
           }
         } catch {}
       }, 2000);

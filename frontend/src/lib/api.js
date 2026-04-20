@@ -50,7 +50,7 @@ export const apiClient = {
   applyChangeRequest: (id) => api.post(`/api/change-requests/${id}/apply`),
   rejectChangeRequest: (id) => api.post(`/api/change-requests/${id}/reject`),
   restoreChangeRequest: (id) => api.post(`/api/change-requests/${id}/restore`),
-  confirmSection: (id) => api.post(`/api/change-requests/${id}/confirm`),
+  confirmSection: (id, conversation = null) => api.post(`/api/change-requests/${id}/confirm`, { conversation }),
 
   // Git operations
   pushProject: (id, commitMessage, gitToken) => api.post(`/api/projects/${id}/push`, { commit_message: commitMessage, git_token: gitToken }),

@@ -163,9 +163,8 @@ class ChangeRequestController {
         }
       }
     } catch (error) {
-      logger.error('Change request processing failed', { requestId, error: error.message });
-      await this._updateStatus(requestId, 'failed');
-      emit('failed', `Processing failed: ${error.message}`);
+      logger.error('Change request processing failed', { requestId, error: error.message, stack: error.stack });
+      await this._fail(requestId, emit, `Processing failed: ${error.message}`);
     }
   }
 
@@ -228,8 +227,7 @@ class ChangeRequestController {
     let originalContent = null;
     try { originalContent = await fs.readFile(absPath, 'utf-8'); } catch {}
     if (!originalContent) {
-      await this._updateStatus(requestId, 'failed');
-      emit('failed', 'Could not read file');
+      await this._fail(requestId, emit, `Could not read file: ${pageBladeFile.blade_file}`);
       return;
     }
 
@@ -270,55 +268,30 @@ class ChangeRequestController {
 
     const lines = originalContent.split('\n');
 
-    if (selectedElement?.section) {
+    if (selectedElement?.section || selectedElement?.text || selectedElement?.classes || selectedElement?.isImage) {
       // ── DIRECT EDIT: User selected an element → skip Phase 1 + confirmation ──
-      logger.info('Direct edit mode', { section: selectedElement.section, tag: selectedElement.tag });
+      logger.info('Direct edit mode', { section: selectedElement.section, tag: selectedElement.tag, isImage: selectedElement.isImage });
       await this._updateStatus(requestId, 'generating_code');
-      emit('generating_code', `Editing: ${selectedElement.section}`);
-      emitFile(pageBladeFile.blade_file, 'modify', 'generating');
+      emit('generating_code', `Editing: ${selectedElement.section || selectedElement.tag || 'selected element'}`);
 
-      // Find the sub-block containing the selected section
-      const sectionName = selectedElement.section;
-      const keywords = sectionName.toLowerCase().split(/\W+/).filter(w => w.length > 2);
-      let foundLine = -1;
-      for (let i = 0; i < lines.length; i++) {
-        if (/<h[1-6]/.test(lines[i])) {
-          const lineLower = lines[i].toLowerCase();
-          const matchCount = keywords.filter(k => lineLower.includes(k)).length;
-          if (matchCount >= Math.min(2, keywords.length)) { foundLine = i; break; }
-        }
-      }
+      // Image-upload intent: if the user uploaded an image, do the mechanical src swap (fast + deterministic)
+      const hasUploadedImage = selectedElement.isImage === true || !!savedImageUrl;
 
-      // Extract sub-block around the heading
-      let blockStart = foundLine >= 0 ? foundLine : 0;
-      let blockEnd = Math.min(blockStart + 40, lines.length);
-      const innerWrappers = /caption|content|inner|text|desc|body|detail/i;
-      for (let j = foundLine; j >= Math.max(0, foundLine - 40); j--) {
-        if (/<section/.test(lines[j]) || /<article/.test(lines[j])) { blockStart = j; break; }
-        const classMatch = lines[j].match(/<div\s[^>]*class="([^"]*)"/);
-        if (classMatch && !innerWrappers.test(classMatch[1])) { blockStart = j; break; }
-      }
-      let depth = 0;
-      for (let j = blockStart; j < Math.min(blockStart + 80, lines.length); j++) {
-        depth += (lines[j].match(/<div[\s>]/g) || []).length - (lines[j].match(/<\/div>/g) || []).length;
-        if (j > blockStart && depth <= 0) { blockEnd = j + 1; break; }
-        if (/<\/section>/.test(lines[j])) { blockEnd = j + 1; break; }
-      }
+      // Locate where the user clicked in the source
+      const clickLine = this._locateElementInSource(lines, selectedElement);
+      logger.info('Located click in source', { clickLine, section: selectedElement.section, classes: selectedElement.classes, textPreview: (selectedElement.text || '').substring(0, 60) });
 
-      const sectionContent = lines.slice(blockStart, blockEnd).join('\n');
-      logger.info('Extracted sub-block', { section: sectionName, lines: `${blockStart}-${blockEnd}` });
-
-      // Direct image replacement if user uploaded an image
-      const isImageChange = savedImageUrl && /image|photo|picture|img|replace.*image|change.*image|update.*image|upload/i.test(changeRequest.prompt);
-      if (isImageChange) {
-        const imgMatch = sectionContent.match(/<img\s[\s\S]*?src=(["'])([\s\S]*?)\1[\s\S]*?>/);
-        if (imgMatch) {
-          const oldImgTag = imgMatch[0];
+      // ── Image upload: mechanical src swap — no AI needed ─────────────
+      if (hasUploadedImage && savedImageUrl) {
+        const oldImgTag = this._findSelectedImgTag(originalContent, selectedElement, clickLine);
+        if (oldImgTag) {
+          logger.info('Targeted <img>', { preview: oldImgTag.substring(0, 160) });
           const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-          const newImgTag = oldImgTag.replace(`src=${imgMatch[1]}${imgMatch[2]}${imgMatch[1]}`, `src="${assetPath}"`);
-          if (originalContent.includes(oldImgTag)) {
+          const newImgTag = oldImgTag.replace(/src\s*=\s*(["'])[\s\S]*?\1/, `src="${assetPath}"`);
+          if (newImgTag !== oldImgTag && originalContent.includes(oldImgTag)) {
+            emitFile(pageBladeFile.blade_file, 'modify', 'generating');
             const finalContent = originalContent.split(oldImgTag).join(newImgTag);
-            const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced image' };
+            const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced selected image' };
             await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
               { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
             await fs.writeFile(absPath, finalContent, 'utf-8');
@@ -327,53 +300,125 @@ class ChangeRequestController {
             emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: pageBladeFile.blade_file, ...diffInfo }] }));
             return;
           }
+          logger.warn('Image tag found but replace produced no change', { oldImgTag: oldImgTag.substring(0, 120) });
+        }
+        await this._fail(requestId, emit, 'Could not find an image near the selected element. Click directly on the image you want to replace.');
+        logger.warn('Image intent but no <img> located', { clickLine, selectedElement });
+        return;
+      }
+
+      // ── Unified AI edit (Claude-Code style): give AI the blade section + linked CSS,
+      //    and let it decide which file to edit for ANY kind of change. ────────
+      const CONTEXT_BEFORE = 40;
+      const CONTEXT_AFTER = 80;
+      const foundLine = clickLine >= 0 ? clickLine : 0;
+      let blockStart = Math.max(0, foundLine - CONTEXT_BEFORE);
+      let blockEnd = Math.min(lines.length, foundLine + CONTEXT_AFTER);
+      if (clickLine >= 0) {
+        for (let j = foundLine; j >= blockStart; j--) {
+          if (/<section|<article/i.test(lines[j])) { blockStart = j; break; }
+        }
+        for (let j = foundLine; j < blockEnd; j++) {
+          if (/<\/section>|<\/article>/i.test(lines[j])) { blockEnd = j + 1; break; }
+        }
+      }
+      const bladeSection = lines.slice(blockStart, blockEnd).join('\n');
+      logger.info('Blade candidate window', { foundLine, lines: `${blockStart}-${blockEnd}` });
+
+      const candidates = [
+        { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade' }
+      ];
+
+      // Attach linked CSS files (scoped around the element's classes)
+      try {
+        const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
+        for (const f of cssFiles) {
+          try {
+            let content = await fs.readFile(f.abs, 'utf-8');
+            if (content.length > 12000 && selectedElement.classes) {
+              const classes = selectedElement.classes.split(/\s+/).filter(c => c.length > 1);
+              const cssLines = content.split('\n');
+              let best = -1, bestScore = 0;
+              for (let i = 0; i < cssLines.length; i++) {
+                let s = 0;
+                for (const cls of classes) if (cssLines[i].includes('.' + cls)) s++;
+                if (s > bestScore) { bestScore = s; best = i; }
+              }
+              if (best >= 0) {
+                const s = Math.max(0, best - 60);
+                const e = Math.min(cssLines.length, best + 180);
+                content = cssLines.slice(s, e).join('\n');
+              } else {
+                content = content.substring(0, 12000);
+              }
+            } else if (content.length > 12000) {
+              content = content.substring(0, 12000);
+            }
+            candidates.push({ path: f.rel, content, type: 'css' });
+          } catch {}
+        }
+      } catch (cssErr) {
+        logger.warn('CSS discovery failed', { error: cssErr.message });
+      }
+
+      logger.info('Sending candidates to AI', { files: candidates.map(c => `${c.path} (${c.type})`) });
+      emitFile(pageBladeFile.blade_file, 'modify', 'generating');
+
+      const generated = await aiService.executeEditMulti({
+        prompt: changeRequest.prompt,
+        selectedElement,
+        candidates,
+        conversation,
+        imageData,
+        savedImageUrl
+      });
+
+      if (generated.mode === 'skip' || !generated.file_path) {
+        await this._fail(requestId, emit, generated.reason || 'AI could not determine the edit');
+        return;
+      }
+
+      // Load the full file the AI chose
+      const targetAbs = path.join(project.local_path, generated.file_path);
+      let targetOriginal;
+      try { targetOriginal = await fs.readFile(targetAbs, 'utf-8'); }
+      catch {
+        await this._fail(requestId, emit, `AI picked a file that cannot be read: ${generated.file_path}`);
+        return;
+      }
+
+      // Append mode: AI wants to add new content with no existing block to replace
+      let finalContent;
+      if (!generated.old_block || generated.old_block.trim() === '') {
+        if (!generated.new_block || generated.new_block.trim() === '') {
+          await this._fail(requestId, emit, 'AI returned empty edit — nothing to change');
+          return;
+        }
+        const sep = targetOriginal.endsWith('\n') ? '' : '\n';
+        finalContent = targetOriginal + sep + generated.new_block + (generated.new_block.endsWith('\n') ? '' : '\n');
+        logger.info('Append mode', { file: generated.file_path, added: generated.new_block.length });
+      } else {
+        finalContent = this._applyBlockReplace(targetOriginal, generated.old_block, generated.new_block);
+        if (!finalContent) {
+          logger.warn('Block replace failed', {
+            file: generated.file_path,
+            old_preview: generated.old_block.substring(0, 200),
+            new_preview: (generated.new_block || '').substring(0, 200)
+          });
+          await this._fail(requestId, emit, `Could not locate the text to replace in ${generated.file_path}. The AI's old_block didn't match the file verbatim — try again or rephrase.`);
+          return;
         }
       }
 
-      // AI edit for text/style/layout
-      const generated = await aiService.executeEdit(changeRequest.prompt, sectionContent, pageBladeFile.blade_file, imageData, savedImageUrl);
-      if (generated.mode === 'skip') {
-        await this._updateStatus(requestId, 'failed');
-        emit('failed', generated.reason || 'AI could not determine the edit');
-        return;
-      }
-      if (generated.mode !== 'replace' || !generated.old_block) {
-        await this._updateStatus(requestId, 'failed');
-        emit('failed', 'AI returned unexpected response');
-        return;
-      }
-
-      let oldBlock = generated.old_block;
-      let newBlock = generated.new_block;
-      if (/^\d+\|\s/.test(oldBlock)) {
-        oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-        newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
-      }
-
-      const tryReplace = (c, o, n) => c.includes(o) ? c.split(o).join(n) : null;
-      const norm = s => s.replace(/\r\n/g, '\n');
-      const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
-      const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"');
-
-      let finalContent = tryReplace(originalContent, oldBlock, newBlock)
-        || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
-        || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
-        || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
-
-      if (!finalContent) {
-        await this._updateStatus(requestId, 'failed');
-        emit('failed', 'Could not locate the text to replace');
-        return;
-      }
-
-      const diffInfo = { old_block: oldBlock, new_block: newBlock, reasoning: generated.reasoning };
+      const diffInfo = { old_block: generated.old_block, new_block: generated.new_block, reasoning: generated.reasoning };
+      emitFile(generated.file_path, 'modify', 'generating');
       await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
-        { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
-      await fs.writeFile(absPath, finalContent, 'utf-8');
+        { bind: [uuidv4(), requestId, generated.file_path, targetOriginal, finalContent, JSON.stringify(diffInfo)] });
+      await fs.writeFile(targetAbs, finalContent, 'utf-8');
       await this._clearViewCache(project.local_path);
       await this._updateStatus(requestId, 'pending_review');
-      emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: pageBladeFile.blade_file, ...diffInfo }] }));
-      logger.info('Direct edit applied', { requestId, reasoning: generated.reasoning });
+      emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: generated.file_path, ...diffInfo }] }));
+      logger.info('Unified edit applied', { requestId, file: generated.file_path, reasoning: generated.reasoning });
       return;
     }
 
@@ -388,9 +433,7 @@ class ChangeRequestController {
     );
 
     if (!section || !section.line_start) {
-      const reason = section?.error || 'Could not identify which section to edit';
-      await this._updateStatus(requestId, 'failed');
-      emit('failed', reason);
+      await this._fail(requestId, emit, section?.error || 'Could not identify which section to edit');
       return;
     }
 
@@ -410,6 +453,286 @@ class ChangeRequestController {
 
     await this._updateStatus(requestId, 'confirm_section');
     emit('confirm_section', JSON.stringify({ target_section: section.target_section, reasoning: section.reasoning, confidence: section.confidence, preview: sectionPreview, file: pageBladeFile.blade_file }));
+  }
+
+  // ── Locate selected element in source using every signal available ─────────
+  _locateElementInSource(lines, sel) {
+    // Tier 1: User clicked an <img> directly — match by src filename
+    if (sel.isImage && sel.src) {
+      const filename = sel.src.split(/[?#]/)[0].split('/').pop();
+      if (filename && filename.length > 2) {
+        for (let i = 0; i < lines.length; i++) {
+          if (/<img/i.test(lines[i]) && lines[i].includes(filename)) return i;
+        }
+      }
+    }
+
+    // Collect candidate heading/text phrases (section name + first line of innerText)
+    const phrases = [];
+    if (sel.section && sel.section.length > 2) phrases.push(sel.section);
+    if (sel.text) {
+      for (const ln of sel.text.split('\n')) {
+        const t = ln.trim();
+        if (t.length > 2 && !phrases.includes(t)) { phrases.push(t.substring(0, 60)); break; }
+      }
+    }
+    const looksLikeHeadingText = (s) => /[a-z]/i.test(s) && /\s/.test(s) || /[a-z]/i.test(s) && !/^[a-z0-9_-]+$/i.test(s);
+
+    // Tier 2: Phrase in a <h1-6> line (e.g. "Wike Ridge" → <h4>Wike Ridge</h4>)
+    for (const p of phrases) {
+      if (!looksLikeHeadingText(p)) continue;
+      const needle = p.toLowerCase();
+      for (let i = 0; i < lines.length; i++) {
+        if (/<h[1-6]/i.test(lines[i]) && lines[i].toLowerCase().includes(needle)) return i;
+      }
+    }
+
+    // Tier 3: Phrase anywhere on a line (substring match, ignoring newlines)
+    for (const p of phrases) {
+      if (!looksLikeHeadingText(p)) continue;
+      const needle = p.toLowerCase();
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].toLowerCase().includes(needle)) return i;
+      }
+    }
+
+    // Tier 4: CSS classes — token-aware match (not substring), rarest class first
+    if (sel.classes) {
+      const targetClasses = sel.classes.split(/\s+/).filter(c => c.length > 1 && !/^[0-9]/.test(c));
+      if (targetClasses.length) {
+        const counts = targetClasses.map(cls => {
+          let n = 0;
+          for (const line of lines) {
+            for (const m of line.matchAll(/class\s*=\s*["']([^"']*)["']/gi)) {
+              if (m[1].split(/\s+/).includes(cls)) n++;
+            }
+          }
+          return { cls, n };
+        }).filter(x => x.n > 0).sort((a, b) => a.n - b.n);
+
+        for (const { cls } of counts) {
+          for (let i = 0; i < lines.length; i++) {
+            for (const m of lines[i].matchAll(/class\s*=\s*["']([^"']*)["']/gi)) {
+              if (m[1].split(/\s+/).includes(cls)) return i;
+            }
+          }
+        }
+      }
+    }
+
+    // Tier 5: heading-keyword fallback (split classname-ish strings and score)
+    const sectionName = sel.section || '';
+    const keywords = sectionName.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+    if (keywords.length) {
+      for (let i = 0; i < lines.length; i++) {
+        if (/<h[1-6]/.test(lines[i])) {
+          const ll = lines[i].toLowerCase();
+          const matchCount = keywords.filter(k => ll.includes(k)).length;
+          if (matchCount >= Math.min(2, keywords.length)) return i;
+        }
+      }
+    }
+
+    return -1;
+  }
+
+  // ── Find the <img> tag the user is targeting ──────────────────────────────
+  // Case A: user clicked the <img> directly → match by src filename
+  // Case B: user clicked a container → return the <img> closest to the click line
+  _findSelectedImgTag(content, sel, clickLine = -1) {
+    // Case A: direct IMG click
+    if (sel?.isImage && sel?.src) {
+      const filename = sel.src.split(/[?#]/)[0].split('/').pop();
+      if (filename && filename.length > 2) {
+        for (const m of content.matchAll(/<img\b[^>]*>/gi)) {
+          if (m[0].includes(filename)) return m[0];
+        }
+        const pathTail = sel.src.split(/[?#]/)[0].split('/').slice(-2).join('/');
+        if (pathTail && pathTail !== filename) {
+          for (const m of content.matchAll(/<img\b[^>]*>/gi)) {
+            if (m[0].includes(pathTail)) return m[0];
+          }
+        }
+      }
+    }
+
+    // Case B: find the <img> nearest to the click line (within 120 lines)
+    if (clickLine >= 0) {
+      let best = null;
+      let bestDist = Infinity;
+      for (const m of content.matchAll(/<img\b[^>]*>/gi)) {
+        const lineNum = content.slice(0, m.index).split('\n').length - 1;
+        const dist = Math.abs(lineNum - clickLine);
+        if (dist < bestDist && dist <= 120) { bestDist = dist; best = m[0]; }
+      }
+      return best;
+    }
+
+    return null;
+  }
+
+  // ── Robust block replace with whitespace/quote normalisation ──────────────
+  _applyBlockReplace(originalContent, oldBlock, newBlock) {
+    if (/^\d+\|\s/.test(oldBlock)) {
+      oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+      newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
+    }
+    const tryReplace = (c, o, n) => c.includes(o) ? c.split(o).join(n) : null;
+    const norm = s => s.replace(/\r\n/g, '\n');
+    const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
+    const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"');
+
+    return tryReplace(originalContent, oldBlock, newBlock)
+      || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
+      || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
+      || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
+  }
+
+  // ── Find CSS files referenced from the page blade + its extends/include tree ──
+  // Generic: walks @extends / @include / @component refs from ANY blade.
+  async _findLinkedCssFiles(projectPath, pageBladeFile) {
+    const viewsRoot = path.join(projectPath, 'resources', 'views');
+    const visited = new Set();
+    const bladeContents = [];
+
+    const resolveBladeName = async (dottedName) => {
+      // Try a few common resolutions Laravel supports
+      const parts = dottedName.replace(/^\/+/, '').split(/[./]/).join('/');
+      const candidates = [
+        path.join(viewsRoot, parts + '.blade.php'),
+        path.join(viewsRoot, parts, 'index.blade.php')
+      ];
+      for (const c of candidates) {
+        try { await fs.access(c); return c; } catch {}
+      }
+      return null;
+    };
+
+    const walk = async (absPath) => {
+      if (!absPath || visited.has(absPath)) return;
+      visited.add(absPath);
+      let content;
+      try { content = await fs.readFile(absPath, 'utf-8'); } catch { return; }
+      bladeContents.push(content);
+      const refPattern = /@(?:extends|include|includeIf|includeWhen|includeUnless|includeFirst|component|yield)\s*\(\s*['"]([^'"]+)['"]/g;
+      const seenRefs = new Set();
+      for (const m of content.matchAll(refPattern)) seenRefs.add(m[1]);
+      for (const ref of seenRefs) {
+        const child = await resolveBladeName(ref);
+        if (child) await walk(child);
+      }
+    };
+
+    await walk(path.join(projectPath, pageBladeFile.blade_file));
+
+    const combined = bladeContents.join('\n');
+    const seenCss = new Set();
+    const refs = [];
+    const pushRef = (raw) => {
+      let p = raw.replace(/^\/+/, '').replace(/\?.*$/, '').replace(/#.*$/, '');
+      if (!p.toLowerCase().endsWith('.css') || seenCss.has(p)) return;
+      seenCss.add(p); refs.push(p);
+    };
+    for (const m of combined.matchAll(/href\s*=\s*["']([^"']+\.css[^"']*)["']/gi)) pushRef(m[1]);
+    for (const m of combined.matchAll(/asset\(\s*['"]([^'"]+\.css)['"]\s*\)/gi)) pushRef(m[1]);
+    for (const m of combined.matchAll(/url\(\s*['"]?([^'")]+\.css)['"]?\s*\)/gi)) pushRef(m[1]);
+
+    const resolved = [];
+    for (const p of refs) {
+      const tries = [
+        path.join(projectPath, 'public', p),
+        path.join(projectPath, p),
+        path.join(projectPath, 'resources', p),
+        path.join(projectPath, 'resources', 'css', path.basename(p))
+      ];
+      for (const abs of tries) {
+        try { await fs.access(abs); resolved.push({ rel: path.relative(projectPath, abs), abs }); break; } catch {}
+      }
+    }
+    return resolved;
+  }
+
+  // ── Pick the CSS file most likely to own the selected element's classes ──
+  async _pickCssFileForClasses(cssFiles, classesStr) {
+    if (!cssFiles?.length) return null;
+    const classes = (classesStr || '').split(/\s+/).filter(c => c.length > 1);
+    if (!classes.length) {
+      try { const content = await fs.readFile(cssFiles[0].abs, 'utf-8'); return { ...cssFiles[0], content }; } catch { return null; }
+    }
+    let best = null;
+    let bestScore = 0;
+    for (const f of cssFiles) {
+      try {
+        const content = await fs.readFile(f.abs, 'utf-8');
+        let score = 0;
+        for (const cls of classes) {
+          const safe = cls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const re = new RegExp('\\.' + safe + '\\b', 'g');
+          const matches = content.match(re);
+          if (matches) score += matches.length;
+        }
+        if (score > bestScore) { bestScore = score; best = { ...f, content }; }
+      } catch {}
+    }
+    if (!best) {
+      try { const content = await fs.readFile(cssFiles[0].abs, 'utf-8'); best = { ...cssFiles[0], content }; } catch {}
+    }
+    return best;
+  }
+
+  // ── Apply a CSS edit to the file that owns the selected element's classes ─
+  async _applyCssEdit({ requestId, project, changeRequest, selectedElement, imageData, pageBladeFile, emit, emitFile, conversation }) {
+    const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
+    if (!cssFiles.length) {
+      logger.info('No linked CSS files found', { page: pageBladeFile.blade_file });
+      return { applied: false, reason: 'no_css_found' };
+    }
+    const picked = await this._pickCssFileForClasses(cssFiles, selectedElement.classes);
+    if (!picked) return { applied: false, reason: 'css_read_failed' };
+
+    logger.info('Editing CSS file', { file: picked.rel, size: picked.content.length });
+    emit('generating_code', `Editing stylesheet: ${picked.rel}`);
+    emitFile(picked.rel, 'modify', 'generating');
+
+    // Scope large files to a window around the most relevant class
+    let scoped = picked.content;
+    if (scoped.length > 15000 && selectedElement.classes) {
+      const classes = selectedElement.classes.split(/\s+/).filter(c => c.length > 1);
+      const cssLines = picked.content.split('\n');
+      let bestLine = -1, bestScore = 0;
+      for (let i = 0; i < cssLines.length; i++) {
+        let s = 0;
+        for (const cls of classes) if (cssLines[i].includes('.' + cls)) s++;
+        if (s > bestScore) { bestScore = s; bestLine = i; }
+      }
+      if (bestLine >= 0) {
+        const s = Math.max(0, bestLine - 80);
+        const e = Math.min(cssLines.length, bestLine + 200);
+        scoped = cssLines.slice(s, e).join('\n');
+      } else {
+        scoped = picked.content.substring(0, 15000);
+      }
+    }
+
+    const styledPrompt = `The user selected an element <${selectedElement.tag || 'div'}> with classes: "${selectedElement.classes || ''}". Edit the CSS rule(s) that target those classes.\n\nRequest: ${changeRequest.prompt}`;
+    const generated = await aiService.executeEdit(styledPrompt, scoped, picked.rel, imageData, null, 'css', conversation);
+
+    if (generated.mode !== 'replace' || !generated.old_block) {
+      return { applied: false, reason: generated.reason || 'ai_skip' };
+    }
+
+    const finalCss = this._applyBlockReplace(picked.content, generated.old_block, generated.new_block);
+    if (!finalCss) return { applied: false, reason: 'replace_failed' };
+
+    const diffInfo = { old_block: generated.old_block, new_block: generated.new_block, reasoning: generated.reasoning };
+    await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+      { bind: [uuidv4(), requestId, picked.rel, picked.content, finalCss, JSON.stringify(diffInfo)] });
+    await fs.writeFile(picked.abs, finalCss, 'utf-8');
+    await this._clearViewCache(project.local_path);
+    await this._updateStatus(requestId, 'pending_review');
+    emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: picked.rel, ...diffInfo }] }));
+    logger.info('CSS edit applied', { requestId, file: picked.rel, reasoning: generated.reasoning });
+    return { applied: true };
   }
 
   // ── Full pipeline: analyze → generate (scoped to current page file) ────────
@@ -797,6 +1120,21 @@ class ChangeRequestController {
       { bind: [newStatus, requestId] }
     );
     logger.info('Status updated', { requestId, status: newStatus });
+  }
+
+  // Set status='failed' AND persist the reason so the frontend can display the real error.
+  async _fail(requestId, emit, reason) {
+    const msg = reason || 'Unknown error';
+    try {
+      await sequelize.query(
+        `UPDATE change_requests SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
+        { bind: [msg, requestId] }
+      );
+    } catch (e) {
+      logger.warn('Failed to persist error_message', { error: e.message });
+    }
+    logger.warn('Change request failed', { requestId, reason: msg });
+    if (emit) emit('failed', msg);
   }
 
   // Fetch the last 8 completed changes for a project — used to build AI change history.

@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS change_requests (
     category VARCHAR(50) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
     priority VARCHAR(20) DEFAULT 'medium',
+    error_message TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
