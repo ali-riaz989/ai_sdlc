@@ -131,6 +131,7 @@ class ChangeRequestController {
 
       // ── Resolve current page → blade file (always, even with images) ────────
       let pageBladeFile = null;
+      let routeUnresolved = false;
       if (currentPageUrl) {
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
@@ -142,15 +143,24 @@ class ChangeRequestController {
             logger.info('Page resolved', { blade: resolved.blade_file });
           } catch {
             logger.warn('Resolved blade file not found on disk', { abs: resolved.abs_path });
+            routeUnresolved = true;
           }
+        } else {
+          routeUnresolved = true;
         }
       }
 
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
         await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement);
+      } else if (routeUnresolved) {
+        // The user is on a specific page but we cannot map the URL to a blade file.
+        // Scanning the whole project is unsafe — it will pick an unrelated file. Fail clearly.
+        const urlPath = (currentPageUrl || '').replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '') || '/';
+        await this._fail(requestId, emit,
+          `Could not find the Laravel route for "${urlPath}". The link in the page may be broken, or the route is missing from routes/web.php. Navigate to a page with a working route, then try again.`);
       } else {
-        // No page resolved (no URL sent) — fall back to full pipeline
+        // No page URL was sent at all — fall back to full pipeline (e.g. dashboard prompt)
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Classifying change…');
         const classification = await aiService.classifyChange(changeRequest.prompt);
@@ -329,6 +339,41 @@ class ChangeRequestController {
         { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade' }
       ];
 
+      // Is this a CMS-style template? (content rendered via @foreach($page->sections) + @includeIf)
+      const isCmsTemplate = /@foreach\s*\(\s*\$page->sections/.test(originalContent)
+        || /@includeIf\s*\(\s*['"][^'"]*sections?\./.test(originalContent);
+
+      // If the primary blade doesn't contain the selected element's text, the content
+      // likely lives in an included partial — search for it.
+      const primaryHasText = clickLine >= 0;
+
+      if (!primaryHasText) {
+        try {
+          const partialMatches = await this._findBladeFilesMatchingElement(
+            project.local_path, selectedElement, pageBladeFile.blade_file, isCmsTemplate
+          );
+          for (const match of partialMatches) {
+            const pLines = match.content.split('\n');
+            const s = Math.max(0, match.line - 40);
+            const e = Math.min(pLines.length, match.line + 80);
+            const scoped = pLines.slice(s, e).join('\n');
+            candidates.push({ path: match.rel, content: scoped, type: 'blade' });
+          }
+          if (partialMatches.length) {
+            logger.info('Additional blade partials matched', {
+              matches: partialMatches.map(m => `${m.rel} (line ${m.line}, score ${m.score})`)
+            });
+          } else if (isCmsTemplate && selectedElement.text) {
+            // CMS page + text not found anywhere in blade partials → it's in the DB.
+            await this._fail(requestId, emit,
+              `The text "${selectedElement.text.substring(0, 60)}" is not in any blade template — it's managed through the CMS database. This platform edits code, not database content. Edit it through the site's admin panel.`);
+            return;
+          }
+        } catch (pErr) {
+          logger.warn('Partial discovery failed', { error: pErr.message });
+        }
+      }
+
       // Attach linked CSS files (scoped around the element's classes)
       try {
         const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
@@ -362,7 +407,6 @@ class ChangeRequestController {
       }
 
       logger.info('Sending candidates to AI', { files: candidates.map(c => `${c.path} (${c.type})`) });
-      emitFile(pageBladeFile.blade_file, 'modify', 'generating');
 
       const generated = await aiService.executeEditMulti({
         prompt: changeRequest.prompt,
@@ -586,6 +630,107 @@ class ChangeRequestController {
       || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
       || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
       || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
+  }
+
+  // ── Find blade partials containing the selected element's text or classes ─────
+  // Laravel CMS pages use @foreach + @includeIf to pull content from partials.
+  // The route-resolved blade is often just a skeleton; the real text lives elsewhere.
+  // This grep-ranks all blade files under resources/views/ and returns the best matches.
+  async _findBladeFilesMatchingElement(projectPath, selectedElement, excludeRel, isCmsTemplate = false) {
+    const viewsRoot = path.join(projectPath, 'resources', 'views');
+    const allBlades = [];
+    const walk = async (dir) => {
+      let entries;
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const fp = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(fp);
+        else if (e.name.endsWith('.blade.php')) allBlades.push(fp);
+      }
+    };
+    await walk(viewsRoot);
+
+    // Skip admin views — user is editing the frontend
+    let bladesToScan = allBlades.filter(p => !/[\\/]admin[\\/]/.test(p));
+
+    // For CMS templates, restrict strictly to sections/partials directories.
+    // Otherwise, matches like navigation menus in static_pages dominate.
+    if (isCmsTemplate) {
+      bladesToScan = bladesToScan.filter(p => /[\\/]frontend[\\/](sections|partials)[\\/]/.test(p));
+    }
+
+    // Build search needles — only the most specific signals
+    const needles = [];
+    if (selectedElement.text) {
+      const firstLine = selectedElement.text.split('\n').map(s => s.trim()).find(s => s.length > 4 && /[a-z]/i.test(s));
+      if (firstLine) {
+        needles.push({ type: 'text', value: firstLine.substring(0, 50).toLowerCase(), weight: 10 });
+      }
+    }
+    if (selectedElement.classes) {
+      for (const cls of selectedElement.classes.split(/\s+/)) {
+        if (cls.length > 3 && !/^[0-9]/.test(cls) && !['row','col','btn','img','div','block','text','content','card','item','main','wrapper','inner','container'].includes(cls)) {
+          needles.push({ type: 'class', value: cls, weight: 4 });
+        }
+      }
+    }
+    if (!needles.length) return [];
+
+    const tag = (selectedElement.tag || '').toLowerCase();
+    const isHeading = /^h[1-6]$/.test(tag);
+
+    const results = [];
+    for (const abs of bladesToScan) {
+      const rel = path.relative(projectPath, abs);
+      if (rel === excludeRel) continue; // already included as primary
+      let content;
+      try { content = await fs.readFile(abs, 'utf-8'); } catch { continue; }
+
+      let score = 0;
+      let bestLine = -1;
+      let tagMatched = false;
+      const lines = content.split('\n');
+      for (const n of needles) {
+        if (n.type === 'text') {
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].toLowerCase();
+            if (!line.includes(n.value)) continue;
+            let lineScore = n.weight;
+            // Tag bonus: if user clicked h2 and line has <h2>, big bonus. Wrong tag family: small penalty.
+            if (isHeading) {
+              if (line.includes(`<${tag}`) || line.includes(`<${tag} `) || line.includes(`<${tag}>`)) { lineScore += 8; tagMatched = true; }
+              else if (/<h[1-6]/.test(line)) lineScore -= 2;
+            } else if (tag && (line.includes(`<${tag} `) || line.includes(`<${tag}>`))) {
+              lineScore += 4; tagMatched = true;
+            }
+            score += lineScore;
+            if (bestLine < 0) bestLine = i;
+            break;
+          }
+        } else if (n.type === 'class') {
+          const safe = n.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const re = new RegExp(`class\\s*=\\s*["'][^"']*\\b${safe}\\b`, 'i');
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              score += n.weight;
+              if (bestLine < 0) bestLine = i;
+              break;
+            }
+          }
+        }
+      }
+
+      // Prefer CMS partial directories (sections/, partials/) where content lives in CMS apps
+      if (/[\\/]frontend[\\/](sections|partials)[\\/]/.test(rel)) score += 2;
+
+      // Require a strong match — text + correct tag, or classes + text. Drop weak single-word hits.
+      if (score < 10 || (needles.some(n => n.type === 'text') && !tagMatched && score < 14)) continue;
+
+      results.push({ rel, abs, content, score, line: Math.max(0, bestLine) });
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, 3); // top 3 partials
   }
 
   // ── Find CSS files referenced from the page blade + its extends/include tree ──

@@ -392,7 +392,13 @@ export default function ProjectPreview() {
 
   useEffect(() => {
     if (!id || !user) return;
-    apiClient.getProject(id).then(res => setProject(res.data)).catch(() => router.replace('/'));
+    apiClient.getProject(id).then(res => {
+      setProject(res.data);
+      // Tell the /preview proxy which Laravel URL to forward to (per-project).
+      if (res.data?.project_url) {
+        document.cookie = `preview_target=${encodeURIComponent(res.data.project_url)}; path=/; SameSite=Lax`;
+      }
+    }).catch(() => router.replace('/'));
 
     // Restore Accept/Reject UI if a recent pending_review request exists (e.g. after page refresh)
     apiClient.listChangeRequests({ project_id: id, status: 'pending_review', limit: 1 })
@@ -428,10 +434,17 @@ export default function ProjectPreview() {
 
 
   function reloadIframe() {
-    if (iframeRef.current) {
-      const base = iframeRef.current.src.split('?')[0];
-      iframeRef.current.src = base + '?_t=' + Date.now();
-    }
+    if (!iframeRef.current) return;
+    // Prefer the actual current URL (same-origin via /preview proxy) so we stay on the page the user navigated to.
+    // Fallbacks: tracked currentPageUrl state, then the iframe's initial src.
+    let target = null;
+    try {
+      const href = iframeRef.current.contentWindow?.location?.href;
+      if (href && !href.startsWith('about:')) target = href;
+    } catch { /* cross-origin — shouldn't happen with proxy, but be safe */ }
+    if (!target) target = currentPageUrl || iframeRef.current.src;
+    const base = target.split('?')[0];
+    iframeRef.current.src = base + '?_t=' + Date.now();
   }
 
   async function confirmSection() {

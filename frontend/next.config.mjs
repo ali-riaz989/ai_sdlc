@@ -7,12 +7,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const nextConfig = {
   outputFileTracingRoot: __dirname,
   async rewrites() {
+    // Note: /preview/* is served by app/preview/[[...slug]]/route.js
+    //  which proxies + rewrites absolute URLs in the response body and injects a URL beacon.
+    // Static asset paths below are passive rewrites (faster) and target the default dev port.
     return [
-      {
-        source: '/preview/:path*',
-        destination: 'http://localhost:8100/:path*',
-      },
-      // Proxy Laravel static assets (fonts, images, css, js) so they work same-origin
       { source: '/fonts/:path*', destination: 'http://localhost:8100/fonts/:path*' },
       { source: '/images/:path*', destination: 'http://localhost:8100/images/:path*' },
       { source: '/css/:path*', destination: 'http://localhost:8100/css/:path*' },
