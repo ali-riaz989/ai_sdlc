@@ -102,6 +102,20 @@ export default function ProjectPreview() {
   const filesRef = useRef([]);
   useEffect(() => { filesRef.current = files; }, [files]);
 
+  // Dedup failure messages: socket and polling can both fire 'failed' for the same request.
+  const handledFailuresRef = useRef(new Set());
+
+  // Heuristic: an AI "failure" message that asks for clarification (ambiguous element,
+  // multiple matches, "did you mean…") is really a question, not an error. Render it
+  // dark blue rather than alarming red.
+  function classifyAiFailureMessage(s) {
+    if (!s) return 'error';
+    const t = s.toLowerCase();
+    const looksLikeQuestion = t.includes('?')
+      || /\b(ambiguous|clarify|please specify|please clarify|did you mean|do you want|do you mean|which (one|element|section)|please choose|which of)\b/.test(t);
+    return looksLikeQuestion ? 'question' : 'error';
+  }
+
   function loadImageFile(file) {
     if (!file || !file.type.startsWith('image/')) return;
     setImageLoading(true);
@@ -807,9 +821,10 @@ export default function ProjectPreview() {
           setPendingDiff(null);
           setStreamingTokens('');
           reloadIframe(); // reload to show restored original
-          if (update.status === 'failed') {
+          if (update.status === 'failed' && !handledFailuresRef.current.has(cr.id)) {
+            handledFailuresRef.current.add(cr.id);
             const reason = update.message || 'The change failed. Try again.';
-            addChat('ai', reason, 'error');
+            addChat('ai', reason, classifyAiFailureMessage(reason));
             setActivePrompt(null);
           }
         }
@@ -860,13 +875,22 @@ export default function ProjectPreview() {
             setPendingDiff(null);
             setStreamingTokens('');
             setActivePrompt(null);
-            // Fetch actual error reason
+            // Fetch actual error reason. Skip the chat addition if the socket handler
+            // already showed it for this requestId.
             try {
               const detail = await apiClient.getChangeRequest(cr.id);
               const reason = detail.data?.error_message || detail.data?.message || 'The change failed. Try again.';
               setResult(prev => ({ ...prev, status: 'failed', message: reason }));
-              addChat('ai', reason, 'error');
-            } catch { addChat('ai', 'The change failed. Try again.', 'error'); }
+              if (!handledFailuresRef.current.has(cr.id)) {
+                handledFailuresRef.current.add(cr.id);
+                addChat('ai', reason, classifyAiFailureMessage(reason));
+              }
+            } catch {
+              if (!handledFailuresRef.current.has(cr.id)) {
+                handledFailuresRef.current.add(cr.id);
+                addChat('ai', 'The change failed. Try again.', 'error');
+              }
+            }
             setTimeout(() => setResult(null), 8000);
           }
         } catch {}
@@ -988,6 +1012,8 @@ export default function ProjectPreview() {
                       ? 'rounded-br-sm text-white shadow-sm'
                       : msg.type === 'error'
                       ? 'bg-red-50 text-red-700 border border-red-200'
+                      : msg.type === 'question'
+                      ? 'bg-blue-50 text-blue-900 border border-blue-200'
                       : msg.type === 'success'
                       ? 'bg-green-50 text-green-700 border border-green-200'
                       : msg.type === 'confirm'
