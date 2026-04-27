@@ -68,6 +68,183 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
   }
 });
 
+// GET /api/projects/:id/sections - List all available section partials in
+// resources/views/sections/ so the frontend can show a picker for new-page creation.
+router.get('/:id/sections', authenticateToken, async (req, res, next) => {
+  try {
+    const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+
+    const sectionsDir = path.join(projects[0].local_path, 'resources', 'views', 'sections');
+    let entries;
+    try { entries = await fs.readdir(sectionsDir); }
+    catch { return res.status(404).json({ error: 'sections directory not found at resources/views/sections' }); }
+
+    // Sections that aren't yet usable as standalone snippets — exclude from picker
+    const denylist = new Set(['partner', 'blogs_section']);
+    const sections = entries
+      .filter(f => f.endsWith('.blade.php'))
+      .map(f => f.replace(/\.blade\.php$/, ''))
+      .filter(name => !denylist.has(name))
+      .map(name => ({
+        name,
+        displayName: name.replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      }))
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+    res.json({ sections });
+  } catch (error) { next(error); }
+});
+
+// Insert a Route::get(...) line into routes/web.php immediately above the real catch-all
+// dynamic page route — i.e. the one that uses `{slug}` AND chains `->where('slug', '.*')`.
+// The naive regex approach can match a `{slug}` route inside an earlier admin group, so we
+// scan line-by-line and pick the last qualifying occurrence (which is always the bottom-of-file
+// catch-all in a Laravel routes file).
+function insertRouteAboveCatchAll(webContent, routeLine) {
+  const lines = webContent.split('\n');
+  let insertIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/Route::get\s*\(\s*['"]\{slug\}['"]/.test(lines[i])) {
+      const lookahead = lines.slice(i, Math.min(i + 5, lines.length)).join('\n');
+      if (/->where\s*\(\s*['"]slug['"]\s*,\s*['"]\.\*['"]/.test(lookahead)) {
+        insertIdx = i; // keep looking — last match wins
+      }
+    }
+  }
+  if (insertIdx >= 0) {
+    lines.splice(insertIdx, 0, routeLine, '');
+    return lines.join('\n');
+  }
+  return webContent.trimEnd() + '\n\n' + routeLine + '\n';
+}
+
+// POST /api/projects/:id/ensure-section-previews - Idempotently install the preview
+// wrapper view + param route in the LGC project so each section can render standalone
+// via /__preview_section/<name>. Called when the new-page modal opens.
+router.post('/:id/ensure-section-previews', authenticateToken, async (req, res, next) => {
+  try {
+    const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+    const localPath = projects[0].local_path;
+
+    // 1) Preview wrapper — extends layouts.static (DB-free) so any section can render
+    //    standalone without bringing the full layout's runtime data dependencies.
+    const wrapperRel = path.join('resources', 'views', '__preview_wrapper.blade.php');
+    const wrapperAbs = path.join(localPath, wrapperRel);
+    const wrapperContent = `@extends('layouts.static')
+
+@section('content')
+    @include('sections.' . $section_name)
+@endsection
+`;
+    // Always overwrite so future tweaks to this wrapper roll out
+    await fs.writeFile(wrapperAbs, wrapperContent, 'utf-8');
+
+    // 2) Route: param route for any section name (validated server-side via view()->exists)
+    const webPhpAbs = path.join(localPath, 'routes', 'web.php');
+    let webContent;
+    try { webContent = await fs.readFile(webPhpAbs, 'utf-8'); }
+    catch { return res.status(500).json({ error: 'routes/web.php not found in project' }); }
+
+    const previewRouteMarker = "Route::get('/__preview_section/{name}'";
+    if (!webContent.includes(previewRouteMarker)) {
+      const previewRoute = `Route::get('/__preview_section/{name}', function (\$name) {
+    if (!preg_match('/^[a-z0-9_-]+$/i', \$name)) abort(400);
+    if (!view()->exists('sections.' . \$name)) abort(404);
+    return view('__preview_wrapper', ['section_name' => \$name]);
+});`;
+      const newWebContent = insertRouteAboveCatchAll(webContent, previewRoute);
+      await fs.writeFile(webPhpAbs, newWebContent, 'utf-8');
+    }
+
+    // 3) Clear Laravel view cache so the wrapper compiles fresh
+    const { exec } = require('child_process');
+    await new Promise(resolve => exec('php artisan view:clear', { cwd: localPath }, () => resolve()));
+
+    res.json({ ok: true, preview_url_template: '/__preview_section/<name>' });
+  } catch (error) { next(error); }
+});
+
+// POST /api/projects/:id/pages - Scaffold a new page from a list of sections + URL.
+// Body: { url: "/play/coaching", sections: ["hero_banner", "faqs", ...] }
+// Effect:
+//   1. Writes resources/views/frontend/static_pages/<lastSegment>.blade.php
+//   2. Inserts a Route::get(...) line into routes/web.php above the catch-all dynamic page route
+// Returns: { url, blade_file, route }
+router.post('/:id/pages', authenticateToken, async (req, res, next) => {
+  try {
+    const { url, sections } = req.body || {};
+    if (typeof url !== 'string' || !url.trim()) return res.status(400).json({ error: 'url is required' });
+    if (!Array.isArray(sections) || !sections.length) return res.status(400).json({ error: 'sections must be a non-empty array' });
+
+    const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+    const localPath = projects[0].local_path;
+
+    // Normalise URL: trim, leading slash, no trailing slash, no double slashes
+    const cleanUrl = '/' + url.trim().replace(/^\/+|\/+$/g, '').replace(/\/+/g, '/');
+    if (cleanUrl === '/') return res.status(400).json({ error: 'URL cannot be empty / root' });
+    const segments = cleanUrl.slice(1).split('/');
+    const slug = segments[segments.length - 1];
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(slug)) {
+      return res.status(400).json({ error: 'last URL segment must contain only letters, digits, underscores, dashes' });
+    }
+
+    // Validate every section file exists in resources/views/sections/
+    const sectionsDir = path.join(localPath, 'resources', 'views', 'sections');
+    for (const s of sections) {
+      if (typeof s !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(s)) {
+        return res.status(400).json({ error: `invalid section name: ${s}` });
+      }
+      try { await fs.access(path.join(sectionsDir, `${s}.blade.php`)); }
+      catch { return res.status(400).json({ error: `section "${s}" not found in resources/views/sections/` }); }
+    }
+
+    // Collision: blade file
+    const bladeRel = path.join('resources', 'views', 'frontend', 'static_pages', `${slug}.blade.php`);
+    const bladeAbs = path.join(localPath, bladeRel);
+    try { await fs.access(bladeAbs); return res.status(409).json({ error: 'URL already exist, type a different url' }); }
+    catch {}
+
+    // Collision: route in web.php (any Route::get / Route::any with matching path)
+    const webPhpRel = 'routes/web.php';
+    const webPhpAbs = path.join(localPath, webPhpRel);
+    let webContent;
+    try { webContent = await fs.readFile(webPhpAbs, 'utf-8'); }
+    catch { return res.status(500).json({ error: 'routes/web.php not found in project' }); }
+
+    const routePath = cleanUrl;
+    const routePathNoSlash = routePath.startsWith('/') ? routePath.slice(1) : routePath;
+    // Match Route::<verb>('/play/coaching', ...) or 'play/coaching' (with optional leading slash)
+    const escaped = routePathNoSlash.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const routeCollisionRe = new RegExp(`Route::\\w+\\s*\\(\\s*['"]\\/?${escaped}['"]`);
+    if (routeCollisionRe.test(webContent)) {
+      return res.status(409).json({ error: 'URL already exist, type a different url' });
+    }
+
+    // Write blade file (uses layouts.static — the DB-free layout for scaffolded pages)
+    const bladeBody = sections.map(s => `    @include('sections.${s}')`).join('\n');
+    const bladeContent = `@extends('layouts.static')
+
+@section('content')
+${bladeBody}
+@endsection
+`;
+    await fs.mkdir(path.dirname(bladeAbs), { recursive: true });
+    await fs.writeFile(bladeAbs, bladeContent, 'utf-8');
+
+    // Insert route into web.php — above the catch-all dynamic page route if present, else append
+    const viewName = `frontend.static_pages.${slug}`;
+    const routeLine = `Route::get('${routePath}', function () { return view('${viewName}'); });`;
+    const newWebContent = insertRouteAboveCatchAll(webContent, routeLine);
+    await fs.writeFile(webPhpAbs, newWebContent, 'utf-8');
+
+    logger.info('Page scaffolded', { url: routePath, blade: bladeRel, sections: sections.length });
+    res.json({ url: routePath, blade_file: bladeRel, route: routeLine });
+  } catch (error) { next(error); }
+});
+
 // POST /api/projects/:id/resolve-route - Map a live page URL to its blade file once,
 // so the chat-edit flow can skip repeating this on every prompt.
 router.post('/:id/resolve-route', authenticateToken, async (req, res, next) => {
@@ -90,6 +267,34 @@ router.post('/:id/resolve-route', authenticateToken, async (req, res, next) => {
     catch { return res.status(404).json({ error: 'Blade file missing on disk', blade_file: resolved.blade_file }); }
 
     res.json({ blade_file: resolved.blade_file, abs_path: resolved.abs_path, url });
+
+    // Fire-and-forget: pre-warm Anthropic's prompt cache for the resolved page so the
+    // user's first edit hits a warm cache (~2s) instead of cold (~4s). Builds the SAME
+    // candidate set as _directGenerate so the cache key matches at edit time.
+    setImmediate(async () => {
+      try {
+        const aiService = require('../services/aiService');
+        const ctrl = require('../controllers/changeRequestController');
+        const localPath = projects[0].local_path;
+        const bladeAbs = resolved.abs_path;
+        const bladeContent = await fs.readFile(bladeAbs, 'utf-8');
+        const candidates = [{ path: resolved.blade_file, content: bladeContent, type: 'blade' }];
+        try {
+          const cssFiles = await ctrl._findLinkedCssFiles(localPath, { blade_file: resolved.blade_file });
+          for (const f of cssFiles) {
+            try {
+              let content = await fs.readFile(f.abs, 'utf-8');
+              if (content.length > 12000) content = content.substring(0, 12000);
+              candidates.push({ path: f.rel, content, type: 'css' });
+            } catch {}
+          }
+        } catch {}
+        await aiService.warmEditCache({ candidates });
+      } catch (e) {
+        // Warmer is best-effort — never fail the user's request because of it
+        require('../utils/logger').warn('Cache warm failed', { error: e.message });
+      }
+    });
   } catch (error) {
     next(error);
   }

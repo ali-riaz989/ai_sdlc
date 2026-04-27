@@ -368,8 +368,28 @@ class ChangeRequestController {
         logger.info('Blade candidate window (large file)', { foundLine, lines: `${blockStart}-${blockEnd}`, bytes: originalContent.length });
       }
 
+      // Build a "click region" — a numbered window of ~30 lines around where the
+      // user clicked, with a marker on the click line. This is the unambiguous
+      // signal Claude needs to disambiguate when the same markup repeats (e.g.
+      // multiple testimonial cards with identical structure). Verbatim file is
+      // still sent separately so old_block can be copied character-for-character.
+      let clickRegion = null;
+      if (clickLine >= 0) {
+        const before = 12, after = 18;
+        const start = Math.max(0, clickLine - before);
+        const end = Math.min(lines.length, clickLine + after + 1);
+        const numbered = [];
+        const lineWidth = String(end).length;
+        for (let i = start; i < end; i++) {
+          const num = String(i + 1).padStart(lineWidth, ' ');
+          const marker = i === clickLine ? '▶' : ' ';
+          numbered.push(`${marker} ${num} | ${lines[i]}`);
+        }
+        clickRegion = numbered.join('\n');
+      }
+
       const candidates = [
-        { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade', clickAnchor }
+        { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade', clickAnchor, clickLine: clickLine >= 0 ? clickLine + 1 : null, clickRegion }
       ];
 
       // Is this a CMS-style template? (content rendered via @foreach($page->sections) + @includeIf)
@@ -441,13 +461,20 @@ class ChangeRequestController {
 
       logger.info('Sending candidates to AI', { files: candidates.map(c => `${c.path} (${c.type})`) });
 
+      // Stream tokens back to the frontend as Claude generates — the existing
+      // change-request:{id}:token socket channel feeds the streaming-tokens UI panel.
+      const onToken = (chunk) => {
+        if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
+      };
+
       const generated = await aiService.executeEditMulti({
         prompt: changeRequest.prompt,
         selectedElement,
         candidates,
         conversation,
         imageData,
-        savedImageUrl
+        savedImageUrl,
+        onToken,
       });
 
       if (generated.mode === 'skip' || !generated.file_path) {
@@ -462,6 +489,31 @@ class ChangeRequestController {
       catch {
         await this._fail(requestId, emit, `AI picked a file that cannot be read: ${generated.file_path}`);
         return;
+      }
+
+      // Click-region validation: when the AI edits the same file the user clicked in,
+      // the proposed old_block MUST overlap the click region. Without this guard, Claude
+      // sometimes picks a similar-looking element elsewhere in the file (e.g. an <h6> in
+      // a different section that has the same class) and silently edits the wrong thing.
+      if (generated.mode === 'replace' && generated.file_path === pageBladeFile.blade_file && clickLine >= 0 && generated.old_block) {
+        const oldBlockIdx = targetOriginal.indexOf(generated.old_block);
+        if (oldBlockIdx >= 0) {
+          // Convert byte offset → line number
+          const oldBlockStartLine = targetOriginal.slice(0, oldBlockIdx).split('\n').length - 1;
+          const oldBlockEndLine = oldBlockStartLine + generated.old_block.split('\n').length - 1;
+          // Allow a 40-line slack on either side of the click — accommodates wrapping <section>/<div>
+          const SLACK = 40;
+          const inRegion = oldBlockEndLine >= clickLine - SLACK && oldBlockStartLine <= clickLine + SLACK;
+          if (!inRegion) {
+            logger.warn('AI edit lands outside click region', {
+              clickLine: clickLine + 1, oldBlockLines: `${oldBlockStartLine + 1}-${oldBlockEndLine + 1}`,
+              old_preview: generated.old_block.substring(0, 120),
+            });
+            await this._fail(requestId, emit,
+              `The AI tried to edit lines ${oldBlockStartLine + 1}–${oldBlockEndLine + 1}, but you clicked around line ${clickLine + 1}. Please retry with a more specific prompt that names the element you want to change.`);
+            return;
+          }
+        }
       }
 
       // Structural-move mode: AI returned 3 anchor lines; we do the cut/paste mechanically.
@@ -603,22 +655,87 @@ class ChangeRequestController {
     }
     const looksLikeHeadingText = (s) => /[a-z]/i.test(s) && /\s/.test(s) || /[a-z]/i.test(s) && !/^[a-z0-9_-]+$/i.test(s);
 
-    // Tier 2: Phrase in a <h1-6> line (e.g. "Wike Ridge" → <h4>Wike Ridge</h4>)
-    for (const p of phrases) {
-      if (!looksLikeHeadingText(p)) continue;
-      const needle = p.toLowerCase();
+    // The exact tag the user clicked, if known. We use this to bias matches toward
+    // the right tag family instead of grabbing any heading that happens to mention
+    // the same words.
+    const clickedTag = (sel.tag || '').toLowerCase();
+    const tagPattern = /^h[1-6]$/.test(clickedTag) ? clickedTag : null;
+
+    // When the page has N peer elements with identical tag+text (3 testimonial cards
+    // saying "test testimonial", etc.), the frontend tells us WHICH occurrence the user
+    // clicked. We then need to return the Nth match in source order, not the 1st.
+    const occurrenceIdx = Math.max(0, parseInt(sel.occurrenceIndex || 0, 10) || 0);
+    // Helper that "consumes" the first N matches and returns the (N+1)th. If no Nth
+    // match exists (file has fewer matches than the page does — unlikely, but possible
+    // when blade @foreach renders), it falls back to the last available match.
+    const pickNth = (matchFn) => {
+      let lastFound = -1;
+      let seen = 0;
       for (let i = 0; i < lines.length; i++) {
-        if (/<h[1-6]/i.test(lines[i]) && lines[i].toLowerCase().includes(needle)) return i;
+        if (matchFn(i)) {
+          if (seen === occurrenceIdx) return i;
+          lastFound = i;
+          seen++;
+        }
+      }
+      return lastFound; // graceful fallback: best of what we found
+    };
+
+    // Tier 2a: TAG-SPECIFIC multi-line match (occurrence-aware). When the user clicked
+    // an h1, look for <h1 ...> openings (which may not have the text on the same line)
+    // and check the heading's textual content. If multiple peers share the same text
+    // (e.g. duplicate testimonial titles), pickNth selects the occurrenceIdx-th match.
+    if (tagPattern) {
+      for (const p of phrases) {
+        if (!looksLikeHeadingText(p)) continue;
+        const needle = p.toLowerCase();
+        const openRe = new RegExp(`<${tagPattern}\\b`, 'i');
+        const closeRe = new RegExp(`</${tagPattern}\\s*>`, 'i');
+        const idx = pickNth((i) => {
+          if (!openRe.test(lines[i])) return false;
+          const blockEnd = Math.min(i + 7, lines.length);
+          let block = '';
+          let foundClose = false;
+          for (let j = i; j < blockEnd; j++) {
+            block += lines[j].toLowerCase() + ' ';
+            if (closeRe.test(lines[j])) { foundClose = true; break; }
+          }
+          return foundClose && block.includes(needle);
+        });
+        if (idx >= 0) return idx;
       }
     }
 
-    // Tier 3: Phrase anywhere on a line (substring match, ignoring newlines)
+    // Tier 2b: Generic h1-h6 multi-line match (occurrence-aware).
     for (const p of phrases) {
       if (!looksLikeHeadingText(p)) continue;
       const needle = p.toLowerCase();
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].toLowerCase().includes(needle)) return i;
-      }
+      const idx = pickNth((i) => {
+        if (!/<h[1-6]\b/i.test(lines[i])) return false;
+        const blockEnd = Math.min(i + 7, lines.length);
+        let block = '';
+        let foundClose = false;
+        for (let j = i; j < blockEnd; j++) {
+          block += lines[j].toLowerCase() + ' ';
+          if (/<\/h[1-6]\s*>/i.test(lines[j])) { foundClose = true; break; }
+        }
+        return foundClose && block.includes(needle);
+      });
+      if (idx >= 0) return idx;
+    }
+
+    // Tier 3: Phrase anywhere on a line (substring match, occurrence-aware).
+    // Skip <title> / <meta> matches in document head — those are SEO, not the click target.
+    for (const p of phrases) {
+      if (!looksLikeHeadingText(p)) continue;
+      const needle = p.toLowerCase();
+      const idx = pickNth((i) => {
+        const ll = lines[i].toLowerCase();
+        if (!ll.includes(needle)) return false;
+        if (/<(title|meta|link|script)\b/.test(ll)) return false;
+        return true;
+      });
+      if (idx >= 0) return idx;
     }
 
     // Tier 4: CSS classes — token-aware match (not substring), rarest class first

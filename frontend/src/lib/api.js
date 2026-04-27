@@ -41,6 +41,9 @@ export const apiClient = {
   createProject: (data) => api.post('/api/projects', data),
   syncProject: (id, gitToken) => api.post(`/api/projects/${id}/sync`, { git_token: gitToken }),
   resolveRoute: (id, url) => api.post(`/api/projects/${id}/resolve-route`, { url }),
+  listSections: (id) => api.get(`/api/projects/${id}/sections`),
+  ensureSectionPreviews: (id) => api.post(`/api/projects/${id}/ensure-section-previews`),
+  createPage: (id, data) => api.post(`/api/projects/${id}/pages`, data, { timeout: 30000 }),
   deleteProject: (id) => api.delete(`/api/projects/${id}`),
 
   // Change Requests

@@ -1,4 +1,9 @@
 require('dotenv').config();
+// Force IPv4-first DNS resolution. The host's IPv6 route is broken for
+// api.anthropic.com (and most outbound), so without this Node will pick IPv6
+// first and the Anthropic SDK throws "Connection error." within 1ms.
+require('dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');

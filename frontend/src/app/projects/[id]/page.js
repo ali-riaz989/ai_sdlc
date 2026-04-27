@@ -52,6 +52,15 @@ export default function ProjectPreview() {
   const [streamingTokens, setStreamingTokens] = useState('');
   const [pushModalOpen, setPushModalOpen] = useState(false);
   const [commitMsg, setCommitMsg] = useState('');
+  // New-page modal state
+  const [newPageOpen, setNewPageOpen] = useState(false);
+  const [newPageUrl, setNewPageUrl] = useState('');
+  const [newPageError, setNewPageError] = useState('');
+  const [newPageCreating, setNewPageCreating] = useState(false);
+  const [availableSections, setAvailableSections] = useState([]); // [{ name, displayName }]
+  const [chosenSections, setChosenSections] = useState([]); // [name, name, ...] in order
+  const [dragIndex, setDragIndex] = useState(null); // index of chosen item currently being dragged
+  const [dragOverIndex, setDragOverIndex] = useState(null); // index where drop indicator shows
   const [pushing, setPushing] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [activePrompt, setActivePrompt] = useState(null);
@@ -168,11 +177,17 @@ export default function ProjectPreview() {
     if (!loading && !user) router.replace('/login');
   }, [user, loading, router]);
 
-  // Listen for postMessage from iframe (cross-origin URL tracking)
+  // Listen for postMessage from iframe (cross-origin URL tracking).
+  // Filter to ONLY the main preview iframe — modal thumbnails also fire these beacons
+  // and their preview-section URLs would otherwise pollute currentPageUrl + spam the
+  // route resolver.
   useEffect(() => {
     const handler = (e) => {
+      if (e.source && iframeRef.current && e.source !== iframeRef.current.contentWindow) return;
       if (e.data?.type === 'iframe-navigation' && e.data?.url) {
-        setCurrentPageUrl(e.data.url.split('?')[0]);
+        const url = e.data.url.split('?')[0];
+        if (url.includes('/__preview_section/')) return; // belt-and-braces guard
+        setCurrentPageUrl(url);
       }
     };
     window.addEventListener('message', handler);
@@ -332,6 +347,27 @@ export default function ProjectPreview() {
         }
       }
 
+      // Disambiguator for repeated identical-looking elements (e.g. 3 testimonial cards
+      // with the same heading): walk every element on the page that matches our
+      // tag + visible text and find which occurrence-in-DOM-order the clicked one is.
+      // Backend uses this to skip past earlier matches when locating in source.
+      let occurrenceIndex = 0;
+      let occurrenceCount = 1;
+      try {
+        const doc = el.ownerDocument;
+        const myKey = (el.innerText?.trim() || '').substring(0, 80);
+        if (myKey.length > 2) {
+          const tagMatches = doc.querySelectorAll(el.tagName);
+          const peers = [];
+          for (const c of tagMatches) {
+            const k = (c.innerText?.trim() || '').substring(0, 80);
+            if (k === myKey) peers.push(c);
+          }
+          occurrenceIndex = Math.max(0, peers.indexOf(el));
+          occurrenceCount = peers.length;
+        }
+      } catch { /* cross-origin etc. */ }
+
       // Get element info
       const info = {
         tag: el.tagName.toLowerCase(),
@@ -339,7 +375,9 @@ export default function ProjectPreview() {
         classes: el.className?.substring(0, 80) || '',
         section: sectionLabel || 'unknown section',
         isImage: el.tagName === 'IMG',
-        src: el.tagName === 'IMG' ? el.src?.substring(0, 200) : null
+        src: el.tagName === 'IMG' ? el.src?.substring(0, 200) : null,
+        occurrenceIndex, // 0-based: when N peers share the same tag+text, this is which one was clicked
+        occurrenceCount,
       };
 
       setSelectedElement(info);
@@ -549,6 +587,78 @@ export default function ProjectPreview() {
       alert(err.response?.data?.error || 'Reset failed');
     } finally {
       setResetting(false);
+    }
+  }
+
+  // ── New-page modal: load section list, manage choices, submit ─────────────
+  async function openNewPage() {
+    setNewPageError('');
+    setNewPageUrl('');
+    setChosenSections([]);
+    setNewPageOpen(true);
+    // Ensure the preview wrapper view + /__preview_section/{name} route exist in
+    // the Laravel project, so the iframe thumbnails below have something to render.
+    apiClient.ensureSectionPreviews(id).catch(() => {});
+    if (availableSections.length === 0) {
+      try {
+        const res = await apiClient.listSections(id);
+        setAvailableSections(res.data?.sections || []);
+      } catch {
+        setNewPageError('Failed to load sections');
+      }
+    }
+  }
+
+  function toggleSection(name) {
+    setChosenSections(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
+  }
+
+  function moveSection(name, dir) {
+    setChosenSections(prev => {
+      const i = prev.indexOf(name);
+      if (i < 0) return prev;
+      const j = i + dir;
+      if (j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  }
+
+  // Drag-to-reorder for the chosen-sections list. Pure HTML5 drag/drop, no deps.
+  function reorderChosenSections(fromIdx, toIdx) {
+    if (fromIdx === toIdx || fromIdx == null || toIdx == null) return;
+    setChosenSections(prev => {
+      if (fromIdx < 0 || fromIdx >= prev.length || toIdx < 0 || toIdx > prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIdx, 1);
+      // After splice, dropping at an index >= source shifts down by 1
+      const adjusted = toIdx > fromIdx ? toIdx - 1 : toIdx;
+      next.splice(adjusted, 0, moved);
+      return next;
+    });
+  }
+
+  async function submitNewPage() {
+    setNewPageError('');
+    if (!newPageUrl.trim()) { setNewPageError('Enter a URL like /play/coaching'); return; }
+    if (chosenSections.length === 0) { setNewPageError('Pick at least one section'); return; }
+    setNewPageCreating(true);
+    try {
+      const res = await apiClient.createPage(id, { url: newPageUrl.trim(), sections: chosenSections });
+      const createdUrl = res.data?.url;
+      setNewPageOpen(false);
+      setChosenSections([]);
+      setNewPageUrl('');
+      // Navigate the iframe to the freshly-scaffolded page
+      if (createdUrl && iframeRef.current) {
+        iframeRef.current.src = '/preview' + createdUrl + '?_t=' + Date.now();
+      }
+      addChat('ai', `Page created at ${createdUrl} with ${chosenSections.length} section${chosenSections.length === 1 ? '' : 's'}.`, 'success');
+    } catch (err) {
+      setNewPageError(err.response?.data?.error || 'Failed to create page');
+    } finally {
+      setNewPageCreating(false);
     }
   }
 
@@ -794,6 +904,8 @@ export default function ProjectPreview() {
                 <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium flex-shrink-0">Live</span>
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
+                <button onClick={openNewPage} title="Create a new page from sections"
+                  className="text-[11px] px-2 py-1 bg-emerald-50 text-emerald-700 rounded hover:bg-emerald-100 font-semibold">+ Page</button>
                 <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
                   title="Refresh preview"
                   className="text-[11px] px-2 py-1 bg-gray-100 rounded hover:bg-gray-200 text-gray-600">↻</button>
@@ -1139,6 +1251,173 @@ export default function ProjectPreview() {
 
         </div>
       </div>
+
+      {newPageOpen && (
+        <>
+          <div className="fixed inset-0 bg-black/40" style={{ zIndex: 50 }} onClick={() => !newPageCreating && setNewPageOpen(false)} />
+          <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-2xl shadow-2xl w-[min(96vw,1200px)] flex flex-col" style={{ zIndex: 51, maxHeight: '92vh' }}>
+            <div className="flex items-center justify-between px-5 pt-4 pb-3 border-b border-gray-100">
+              <h3 className="text-sm font-semibold text-gray-900">Create new page</h3>
+              <button onClick={() => !newPageCreating && setNewPageOpen(false)}
+                className="text-gray-400 hover:text-gray-700 text-lg leading-none">×</button>
+            </div>
+
+            <div className="px-5 py-4 overflow-y-auto" style={{ scrollbarWidth: 'thin' }}>
+              <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">URL</label>
+              <input value={newPageUrl} onChange={e => { setNewPageUrl(e.target.value); setNewPageError(''); }}
+                placeholder="/play/coaching" autoFocus
+                onKeyDown={e => { if (e.key === 'Enter') submitNewPage(); }}
+                className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm text-black focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 mb-1 placeholder:text-stone-400" />
+              <p className="text-[10px] text-stone-500 mb-4">The last segment becomes the blade filename. Letters, digits, dashes, underscores only.</p>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div className="col-span-2">
+                  <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">
+                    Available sections — click a thumbnail to add
+                    {availableSections.length > 0 && (
+                      <span className="ml-1 text-stone-400 font-normal normal-case">({availableSections.length - chosenSections.length})</span>
+                    )}
+                  </label>
+                  <div className="border-2 border-stone-200 rounded-xl overflow-y-auto p-2" style={{ maxHeight: '60vh' }}>
+                    {availableSections.length === 0 ? (
+                      <p className="text-center text-stone-400 text-xs py-6">Loading…</p>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        {availableSections.filter(s => !chosenSections.includes(s.name)).map(s => (
+                          <button key={s.name} type="button" onClick={() => toggleSection(s.name)}
+                            className="group block text-left rounded-lg border-2 border-stone-200 hover:border-emerald-400 bg-white transition-colors overflow-hidden">
+                            <div className="relative w-full bg-stone-50" style={{ height: '140px' }}>
+                              {/* Iframe scaled down: render at 1280px wide, scale to fit thumbnail width.
+                                  pointer-events disabled so the whole tile remains clickable. */}
+                              <div className="absolute inset-0 overflow-hidden pointer-events-none">
+                                <iframe
+                                  src={`/preview/__preview_section/${encodeURIComponent(s.name)}`}
+                                  loading="lazy"
+                                  className="border-0 bg-white"
+                                  style={{
+                                    width: '1280px',
+                                    height: '700px',
+                                    transform: 'scale(0.22)',
+                                    transformOrigin: 'top left',
+                                  }}
+                                  title={s.displayName}
+                                />
+                              </div>
+                              <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-emerald-600 text-white text-[10px] font-bold opacity-0 group-hover:opacity-100 transition-opacity">+ Add</span>
+                            </div>
+                            <div className="px-2.5 py-1.5 border-t border-stone-100 bg-white">
+                              <span className="text-[11px] font-medium text-stone-700">{s.displayName}</span>
+                            </div>
+                          </button>
+                        ))}
+                        {availableSections.filter(s => !chosenSections.includes(s.name)).length === 0 && (
+                          <p className="col-span-2 text-center text-stone-400 text-xs py-6">All sections picked</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">
+                    Chosen <span className="ml-1 text-stone-400 font-normal normal-case">({chosenSections.length}, top → bottom)</span>
+                  </label>
+                  <div className="border-2 border-stone-200 rounded-xl overflow-y-auto p-2" style={{ maxHeight: '60vh' }}>
+                    {chosenSections.length === 0 ? (
+                      <p className="text-center text-stone-400 text-xs py-6 px-3">Click a section on the left to add it</p>
+                    ) : (
+                      <div className="space-y-2"
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={e => {
+                          e.preventDefault();
+                          // Drop on the container background (e.g. below the last item) → append to end
+                          if (dragIndex != null) reorderChosenSections(dragIndex, chosenSections.length);
+                          setDragIndex(null);
+                          setDragOverIndex(null);
+                        }}>
+                        {chosenSections.map((name, i) => {
+                          const meta = availableSections.find(s => s.name === name);
+                          const isDragging = dragIndex === i;
+                          const showIndicatorAbove = dragOverIndex === i && dragIndex !== i && dragIndex !== i - 1;
+                          return (
+                            <div key={name}>
+                              {showIndicatorAbove && <div className="h-0.5 bg-emerald-500 rounded-full mb-1" />}
+                              <div
+                                draggable
+                                onDragStart={e => { setDragIndex(i); e.dataTransfer.effectAllowed = 'move'; }}
+                                onDragEnd={() => { setDragIndex(null); setDragOverIndex(null); }}
+                                onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverIndex(i); }}
+                                onDragLeave={() => { if (dragOverIndex === i) setDragOverIndex(null); }}
+                                onDrop={e => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  if (dragIndex != null) reorderChosenSections(dragIndex, i);
+                                  setDragIndex(null);
+                                  setDragOverIndex(null);
+                                }}
+                                className={`group rounded-lg border-2 bg-white overflow-hidden transition-all ${
+                                  isDragging ? 'opacity-40 border-emerald-400' : 'border-stone-200 hover:border-stone-400'
+                                }`}
+                                style={{ cursor: 'grab' }}
+                                title="Drag to reorder">
+                                <div className="flex items-stretch">
+                                  {/* Drag grip */}
+                                  <div className="flex flex-col items-center justify-center px-1.5 bg-stone-50 border-r border-stone-200 text-stone-400 select-none">
+                                    <span className="text-[8px] leading-tight">⋮⋮</span>
+                                    <span className="text-[10px] font-mono mt-0.5">{i + 1}</span>
+                                  </div>
+                                  {/* Iframe thumbnail */}
+                                  <div className="relative flex-1 bg-stone-50" style={{ height: '110px' }}>
+                                    <div className="absolute inset-0 overflow-hidden pointer-events-none">
+                                      <iframe
+                                        src={`/preview/__preview_section/${encodeURIComponent(name)}`}
+                                        loading="lazy"
+                                        className="border-0 bg-white"
+                                        style={{
+                                          width: '1280px',
+                                          height: '600px',
+                                          transform: 'scale(0.18)',
+                                          transformOrigin: 'top left',
+                                        }}
+                                        title={meta?.displayName || name}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                                <div className="px-2 py-1.5 border-t border-stone-100 flex items-center gap-1 bg-white">
+                                  <span className="flex-1 text-[11px] font-medium text-stone-700 truncate">{meta?.displayName || name}</span>
+                                  <button type="button" onClick={() => moveSection(name, -1)} disabled={i === 0}
+                                    title="Move up" className="px-1.5 py-0.5 rounded hover:bg-stone-100 text-stone-500 disabled:opacity-30 text-xs">↑</button>
+                                  <button type="button" onClick={() => moveSection(name, 1)} disabled={i === chosenSections.length - 1}
+                                    title="Move down" className="px-1.5 py-0.5 rounded hover:bg-stone-100 text-stone-500 disabled:opacity-30 text-xs">↓</button>
+                                  <button type="button" onClick={() => toggleSection(name)}
+                                    title="Remove" className="px-1.5 py-0.5 rounded hover:bg-red-50 text-red-500 text-xs">×</button>
+                                </div>
+                              </div>
+                              {dragOverIndex === i && i === chosenSections.length - 1 && dragIndex !== i && <div className="h-0.5 bg-emerald-500 rounded-full mt-1" />}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {newPageError && <p className="mt-3 text-xs text-red-600">{newPageError}</p>}
+            </div>
+
+            <div className="flex gap-2 px-5 py-4 border-t border-gray-100 bg-gray-50 rounded-b-2xl">
+              <button onClick={() => !newPageCreating && setNewPageOpen(false)}
+                className="flex-1 py-2 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-100">Cancel</button>
+              <button onClick={submitNewPage} disabled={newPageCreating || !newPageUrl.trim() || chosenSections.length === 0}
+                className="flex-1 py-2 text-white rounded-xl text-sm font-semibold disabled:opacity-50"
+                style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
+                {newPageCreating ? 'Creating…' : 'Create page'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
 
       {pushModalOpen && (
         <>

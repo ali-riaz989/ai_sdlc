@@ -3,8 +3,15 @@ const logger = require('../utils/logger');
 
 class AIService {
   constructor() {
-    this.client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    this.client = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      timeout: 60000,    // hard cap per request (ms) — prevents the SDK from sitting forever on a half-open socket
+      maxRetries: 3,     // retry transient network/5xx failures with exponential backoff
+    });
     this.model = 'claude-sonnet-4-5';
+    // Surgical find-and-replace edits don't need Sonnet's depth — Haiku 4.5 returns
+    // ~3-5x faster on the same task with no quality regression for these patterns.
+    this.editModel = 'claude-haiku-4-5';
   }
 
   // ─── Step 1: Fast classifier (<2 s) ────────────────────────────────────────
@@ -157,38 +164,10 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
     }
   }
 
-  // ─── Claude-Code-style edit: AI picks which file to edit from multiple candidates ───
-  // candidates: [{ path, content, type }]  (e.g. blade, css, js)
-  // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
-  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null }) {
-    logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
-
-    let editInstruction = prompt;
-    if (savedImageUrl) {
-      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
-    }
-    let conversationNote = '';
-    if (conversation?.length) {
-      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references):\n' +
-        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
-    }
-
-    const clickAnchor = candidates.find(c => c.clickAnchor)?.clickAnchor;
-    const elInfo = selectedElement ? `
-SELECTED ELEMENT (what the user clicked):
-- tag: <${selectedElement.tag || '?'}>
-- classes: "${selectedElement.classes || ''}"
-- heading/section: "${selectedElement.section || ''}"
-- inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
-- is image: ${selectedElement.isImage ? 'yes' : 'no'}${clickAnchor ? `
-- click-landed on this exact line in the blade file: ${JSON.stringify(clickAnchor.substring(0, 160))}` : ''}` : '';
-
-    const filesBlock = candidates.map(c =>
-      `\n===== FILE: ${c.path}  [type: ${c.type}] =====\n${c.content}\n===== END FILE: ${c.path} =====\n`
-    ).join('\n');
-
-    const systemPrompt = `You are a code editor, like Claude Code or Cursor, operating on a website codebase.
+  // ── Static system prompt for the edit path. Hoisted so warmEditCache can use the
+  //    exact same bytes — cache hits depend on byte-identical prefixes.
+  get _editSystemPrompt() {
+    return `You are a code editor, like Claude Code or Cursor, operating on a website codebase.
 
 You receive:
 - Metadata about the element the user clicked in the browser
@@ -239,28 +218,128 @@ SHAPE B RULES (move op):
 - NEVER fake a move with a comment like "<!-- MOVED -->" — the backend verifies anchors and will reject.
 
 AMBIGUITY: If the request is unclear or you can't identify the target, return {"error":"<why>"}.`;
+  }
 
-    const textBlock = {
-      type: 'text',
-      text: `USER REQUEST: "${editInstruction}"${conversationNote}
+  // Shared with warmEditCache — both callers must produce IDENTICAL bytes for cache hits.
+  _buildFilesBlock(candidates) {
+    return candidates.map(c =>
+      `\n===== FILE: ${c.path}  [type: ${c.type}] =====\n${c.content}\n===== END FILE: ${c.path} =====\n`
+    ).join('\n');
+  }
+
+  // ── Pre-warm the prompt cache for an upcoming edit. Called when the iframe lands on a
+  //    new URL — by the time the user types a prompt, Anthropic has the system+files
+  //    prefix cached, so the visible edit is the warm path (~2s) instead of cold (~4s).
+  //    Fire-and-forget; failures are non-fatal.
+  async warmEditCache({ candidates }) {
+    if (!candidates?.length) return;
+    const filesContext = `CANDIDATE FILES:${this._buildFilesBlock(candidates)}`;
+    try {
+      const t0 = Date.now();
+      const response = await this.client.messages.create({
+        model: this.editModel,
+        max_tokens: 8,    // tiny output — we only care about populating the cache
+        system: [{ type: 'text', text: this._editSystemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: filesContext, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: 'ack' },
+        ]}]
+      });
+      const u = response.usage || {};
+      logger.info('Cache warmed', {
+        ms: Date.now() - t0,
+        files: candidates.map(c => c.path).join(','),
+        input: u.input_tokens,
+        cache_read: u.cache_read_input_tokens || 0,
+        cache_create: u.cache_creation_input_tokens || 0,
+      });
+    } catch (e) {
+      logger.warn('Cache warm failed', { error: e.message });
+    }
+  }
+
+  // ─── Claude-Code-style edit: AI picks which file to edit from multiple candidates ───
+  // candidates: [{ path, content, type }]  (e.g. blade, css, js)
+  // onToken (optional): callback invoked with each text delta as Claude streams the response —
+  //                     hook this to socket emission for live UI feedback.
+  // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
+  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null }) {
+    logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
+
+    let editInstruction = prompt;
+    if (savedImageUrl) {
+      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
+    }
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
+
+    const clickCandidate = candidates.find(c => c.clickAnchor || c.clickRegion);
+    const clickAnchor = clickCandidate?.clickAnchor;
+    const clickLine = clickCandidate?.clickLine;
+    const clickRegion = clickCandidate?.clickRegion;
+    const elInfo = selectedElement ? `
+SELECTED ELEMENT (what the user clicked):
+- tag: <${selectedElement.tag || '?'}>
+- classes: "${selectedElement.classes || ''}"
+- heading/section: "${selectedElement.section || ''}"
+- inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
+- is image: ${selectedElement.isImage ? 'yes' : 'no'}${clickLine ? `
+- click landed at line ${clickLine} of the file (use the CLICK REGION below to identify the exact instance when the same markup repeats)` : ''}${clickAnchor ? `
+- click-landed on this exact line: ${JSON.stringify(clickAnchor.substring(0, 200))}` : ''}` : '';
+
+    // The click region is a numbered ~30-line window centred on the click point.
+    // It's the unambiguous disambiguator when a page has multiple identical-looking
+    // blocks (e.g. several testimonial cards). Tell Claude explicitly to use this
+    // window to find WHICH instance to edit, then copy the verbatim text from
+    // CANDIDATE FILES (which has no line numbers) into old_block.
+    const clickRegionBlock = clickRegion ? `
+CLICK REGION (line numbers shown for reference; the ▶ marker is the line under the user's click):
+\`\`\`
+${clickRegion}
+\`\`\`
+The user's intent is targeted at the markup AT or IMMEDIATELY ENCLOSING the marked line. When multiple similar blocks exist in the file, this region overrides any other heuristic — only edit the block that contains or surrounds line ${clickLine || '?'}. Copy old_block VERBATIM from the CANDIDATE FILES section (no line numbers there).
+` : '';
+
+    // Build the cacheable prefix (system + filesContext) using the SAME bytes as warmEditCache
+    // — this is what makes pre-warming actually pay off.
+    const filesContext = `CANDIDATE FILES:${this._buildFilesBlock(candidates)}`;
+    const variableContent = `USER REQUEST: "${editInstruction}"${conversationNote}
 ${elInfo}
+${clickRegionBlock}
+Return ONLY valid JSON.`;
 
-CANDIDATE FILES:${filesBlock}
-
-Return ONLY valid JSON: {"file_path":"...","old_block":"...","new_block":"...","reasoning":"..."}`
-    };
-
+    const textBlocks = [
+      { type: 'text', text: filesContext, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: variableContent },
+    ];
     const userContent = imageData
-      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
-      : [textBlock];
+      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, ...textBlocks]
+      : textBlocks;
 
     try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 4096,
-        system: systemPrompt,
+      const t0 = Date.now();
+      // Stream the response so the frontend's streaming-tokens UI fills in live as Claude
+      // generates. Total wall-clock time is the same; perceived latency is much better.
+      const stream = this.client.messages.stream({
+        model: this.editModel,           // Haiku 4.5 — fast path for surgical edits
+        max_tokens: 2048,                // tighter cap; Shape A/B responses fit easily under 1K
+        system: [{ type: 'text', text: this._editSystemPrompt, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: userContent }]
       });
+      if (typeof onToken === 'function') stream.on('text', (delta) => onToken(delta));
+      const finalMessage = await stream.finalMessage();
+      const u = finalMessage.usage || {};
+      logger.info('Edit token usage', {
+        ms: Date.now() - t0, model: this.editModel,
+        input: u.input_tokens, cache_read: u.cache_read_input_tokens || 0,
+        cache_create: u.cache_creation_input_tokens || 0, output: u.output_tokens,
+      });
+      // Synthesise a response-shaped object so the rest of the function reads identically.
+      const response = finalMessage;
       let result;
       try { result = this._extractJSON(response.content[0].text); }
       catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
