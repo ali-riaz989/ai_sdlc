@@ -6,6 +6,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   outputFileTracingRoot: __dirname,
+  devIndicators: false,
   async rewrites() {
     // Note: /preview/* is served by app/preview/[[...slug]]/route.js
     //  which proxies + rewrites absolute URLs in the response body and injects a URL beacon.

@@ -40,6 +40,7 @@ export const apiClient = {
   getProject: (id) => api.get(`/api/projects/${id}`),
   createProject: (data) => api.post('/api/projects', data),
   syncProject: (id, gitToken) => api.post(`/api/projects/${id}/sync`, { git_token: gitToken }),
+  resolveRoute: (id, url) => api.post(`/api/projects/${id}/resolve-route`, { url }),
   deleteProject: (id) => api.delete(`/api/projects/${id}`),
 
   // Change Requests
@@ -50,7 +51,6 @@ export const apiClient = {
   applyChangeRequest: (id) => api.post(`/api/change-requests/${id}/apply`),
   rejectChangeRequest: (id) => api.post(`/api/change-requests/${id}/reject`),
   restoreChangeRequest: (id) => api.post(`/api/change-requests/${id}/restore`),
-  confirmSection: (id, conversation = null) => api.post(`/api/change-requests/${id}/confirm`, { conversation }),
 
   // Git operations
   pushProject: (id, commitMessage, gitToken) => api.post(`/api/projects/${id}/push`, { commit_message: commitMessage, git_token: gitToken }),

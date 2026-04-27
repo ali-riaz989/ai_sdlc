@@ -58,86 +58,11 @@ class AIService {
     }
   }
 
-  // ─── PHASE 1: Identify target section using structured DOM + file ────────
-  // AI thinks through: understand → locate → validate
-  // Returns { target_section, line_start, line_end, reasoning, confidence }
-  async identifySection(prompt, structuredSections, fileContent, filePath, imageData = null, conversation = null) {
-    logger.info('Phase 1: Identifying section', { prompt: prompt.substring(0, 80), hasConversation: !!(conversation?.length) });
 
-    const numberedContent = fileContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
-
-    // Build conversation context so AI understands corrections
-    let conversationNote = '';
-    if (conversation?.length) {
-      conversationNote = '\n\nPREVIOUS CONVERSATION (use this to understand corrections):\n' +
-        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
-    }
-
-    const textBlock = {
-      type: 'text',
-      text: `USER REQUEST: "${prompt}"${conversationNote}
-
-PAGE STRUCTURE (each section with its role and content):
-${JSON.stringify(structuredSections, null, 2)}
-
-FILE (with line numbers):
-${numberedContent}
-
-Follow this thinking process:
-UNDERSTAND: What does the user want to change? If there is a PREVIOUS CONVERSATION, the user may be correcting a previous attempt — pay attention to what they said was wrong.
-LOCATE: Which section from the PAGE STRUCTURE matches? Use context and meaning, not just keywords.
-VALIDATE: Is this the ONLY correct match? If multiple sections match, pick the content section (not navigation).
-
-Return ONLY valid JSON:
-{
-  "target_section": "heading or description of the matched section",
-  "line_start": 100,
-  "line_end": 150,
-  "reasoning": "why this section matches the user's request",
-  "confidence": "high|medium|low"
-}`
-    };
-
-    const userContent = imageData
-      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
-      : [textBlock];
-
-    try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 500,
-        system: `You are an intelligent section identifier. Your job is to find which section of a webpage the user wants to edit.
-
-RULES:
-- Prefer CONTENT sections over navigation/header/footer
-- Use meaning and context, not just keyword matching
-- "Leeds golf" could mean a heading that says "Leeds Golf Centre" — fuzzy match is OK
-- If the user mentions text that's slightly different from the file, still match the closest section
-- If the user previously said "no, wrong section", pick a DIFFERENT section this time
-- Return the line range that covers the FULL section (from <section> to </section>)`,
-        messages: [{ role: 'user', content: userContent }]
-      });
-      try {
-        return this._extractJSON(response.content[0].text);
-      } catch (jsonErr) {
-        logger.warn('AI returned invalid JSON in identifySection', { response: response.content[0].text.substring(0, 500) });
-        return null;
-      }
-    } catch (error) {
-      logger.error('Section identification failed', { error: error.message });
-      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
-        ? 'Rate limit reached — wait a moment and try again'
-        : error.message?.includes('Connection')
-        ? 'API connection error — try again'
-        : error.message || 'unknown error';
-      return { error: reason };
-    }
-  }
-
-  // ─── PHASE 2: Execute edit — old_block/new_block like Claude Code ───────
+  // ─── Execute edit — old_block/new_block like Claude Code ────────────────
   // AI receives the RAW SOURCE CODE of the section and returns exact text replacement
   async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null, language = 'blade', conversation = null) {
-    logger.info('Phase 2: Executing edit', { file: filePath, language, hasConversation: !!(conversation?.length) });
+    logger.info('Executing edit', { file: filePath, language, hasConversation: !!(conversation?.length) });
 
     let editInstruction = prompt;
     if (savedImageUrl) {
@@ -249,13 +174,15 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
         conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
     }
 
+    const clickAnchor = candidates.find(c => c.clickAnchor)?.clickAnchor;
     const elInfo = selectedElement ? `
 SELECTED ELEMENT (what the user clicked):
 - tag: <${selectedElement.tag || '?'}>
 - classes: "${selectedElement.classes || ''}"
 - heading/section: "${selectedElement.section || ''}"
 - inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
-- is image: ${selectedElement.isImage ? 'yes' : 'no'}` : '';
+- is image: ${selectedElement.isImage ? 'yes' : 'no'}${clickAnchor ? `
+- click-landed on this exact line in the blade file: ${JSON.stringify(clickAnchor.substring(0, 160))}` : ''}` : '';
 
     const filesBlock = candidates.map(c =>
       `\n===== FILE: ${c.path}  [type: ${c.type}] =====\n${c.content}\n===== END FILE: ${c.path} =====\n`
@@ -266,32 +193,52 @@ SELECTED ELEMENT (what the user clicked):
 You receive:
 - Metadata about the element the user clicked in the browser
 - The user's request (and prior chat history)
-- One or more CANDIDATE FILES (Blade PHP, CSS, JS, etc.) that are relevant to that element
+- One or more CANDIDATE FILES (Blade PHP, CSS, JS, etc.). For blade files you usually receive the FULL file so you can work across sections if the request requires it.
 
-Your job: decide WHICH single file to edit to fulfill the request, then return a precise find-and-replace.
+FIRST: figure out what the user is actually asking for. Examples of intents:
+- "change text / color / style / size" → in-place edit of the element or its CSS rule
+- "move / shift / relocate / reorder / swap / place X above-or-below Y" → structural MOVE of a block of markup within the blade file
+- "add a new section / append X / create Y" → additive edit (new content)
+- "replace this image" → image src swap in the blade
+- "delete / remove X" → removal edit
 
-DECISION RULES:
-- For styling/visual changes (color, spacing, size, layout): prefer editing the CSS file that defines the element's class rule
-- For text/content/structure/image changes: edit the Blade template
-- For behavior/interaction: edit the JS file
-- Only pick from the files provided; do not reference files that aren't in the candidates
+The user will NOT always spell the intent out literally. Infer it from the phrasing and from the SELECTED ELEMENT context. Do NOT keyword-match — understand the request.
 
-OUTPUT: Return ONLY valid JSON:
-{"file_path":"<exact FILE path from the header>","old_block":"<exact verbatim lines from that file>","new_block":"<replacement lines>","reasoning":"<what changed>"}
+Then pick ONE of these two output shapes, whichever fits the request. Return ONLY valid JSON.
 
-CRITICAL RULES:
-- file_path MUST exactly match one of the FILE headers above
-- old_block MUST be copied character-for-character from the chosen file (including whitespace, quotes, Blade directives, CSS syntax)
-- Include 1-2 surrounding lines in old_block so the match is unique
-- new_block changes ONLY what the user asked for
-- Do NOT invent code not present in the files
-- ADDING NEW CONTENT (e.g. a new CSS rule that does not exist yet):
-  - Find a nearby existing block (like the previous CSS rule or a section header)
-  - Put those existing lines in old_block EXACTLY as they appear
-  - Put those same lines PLUS your new content in new_block
-  - This ensures the replace is unique and appends cleanly
-- If truly appending to end of file is the only option: set "old_block" to the LAST 2–5 non-empty lines of the file exactly as they appear, and "new_block" to those same lines followed by your new content
-- If ambiguous: {"error":"<why>"}`;
+OUTPUT SHAPE A — in-place find-and-replace (default for edits, additions, image swaps, deletions):
+{"file_path":"<exact path from a FILE header>","old_block":"<exact verbatim lines from that file>","new_block":"<replacement lines>","reasoning":"<short>"}
+
+OUTPUT SHAPE B — structural move (use ONLY when the user wants to relocate a block of markup):
+{"file_path":"<exact path from a FILE header>","move":{"source_start":"<verbatim first line of the block to MOVE>","source_end":"<verbatim last line of the block to MOVE>","insert_before":"<verbatim first line of where the block should land>"},"reasoning":"<short>"}
+
+OUTPUT SHAPE C — error / no-op:
+{"error":"<why>"}
+
+DECISION RULES (when to pick which file):
+- Styling/visual changes (color, spacing, size, layout): prefer the CSS file that defines the clicked element's class rule.
+- Text, content, structure, image, move, add, delete: edit the Blade template.
+- Behavior/interaction: edit a JS file.
+- Only pick from files provided in CANDIDATE FILES headers.
+
+SHAPE A RULES (old_block / new_block):
+- old_block is copied character-for-character from the chosen file (whitespace, quotes, Blade directives, CSS syntax — all verbatim).
+- Include 1-2 surrounding lines so the match is unique.
+- new_block changes ONLY what the user asked for.
+- Do NOT invent code not present in the files.
+- ADDING NEW CONTENT: find a nearby existing block; put those lines in old_block EXACTLY; put those same lines PLUS your new content in new_block.
+- If truly appending to the very end: old_block = last 2–5 non-empty lines verbatim; new_block = those same lines followed by your new content.
+
+SHAPE B RULES (move op):
+- source_start, source_end, insert_before are EACH a SINGLE line copied character-for-character from the file.
+- Each must be unique enough to identify the position — prefer opening <section class="..."> tags, HTML comment markers, or other lines that appear exactly once. Avoid generic lines like "</div>".
+- source_start and source_end bracket the block to relocate (inclusive on both ends).
+- insert_before is the first line of the destination; the moved block is placed IMMEDIATELY BEFORE that line.
+- "move X below Y" / "after Y" → set insert_before to the line AFTER Y's closing tag (usually the next section's opening tag).
+- If the block is already in the requested position: {"error":"already in that position"}.
+- NEVER fake a move with a comment like "<!-- MOVED -->" — the backend verifies anchors and will reject.
+
+AMBIGUITY: If the request is unclear or you can't identify the target, return {"error":"<why>"}.`;
 
     const textBlock = {
       type: 'text',
@@ -319,9 +266,33 @@ Return ONLY valid JSON: {"file_path":"...","old_block":"...","new_block":"...","
       catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
 
       if (result?.error) return { mode: 'skip', reason: result.error };
-      if (result?.file_path && result?.old_block !== undefined && result?.new_block !== undefined) {
-        logger.info('Multi-file edit ready', { file: result.file_path, reasoning: result.reasoning });
-        return { mode: 'replace', file_path: result.file_path, old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
+
+      // Infer file_path if Claude forgot to include it: look for a candidate whose content
+      // contains the old_block (or the move anchors) verbatim.
+      const inferFilePath = (needle) => {
+        if (!needle) return null;
+        const hits = candidates.filter(c => c.content && c.content.includes(needle));
+        if (hits.length === 1) return hits[0].path;
+        return null;
+      };
+
+      if (result?.move?.source_start && result?.move?.source_end && result?.move?.insert_before) {
+        const filePath = result.file_path || inferFilePath(result.move.source_start) || inferFilePath(result.move.insert_before);
+        if (!filePath) {
+          logger.warn('Move anchors not unique to any candidate', { source_start: result.move.source_start?.substring(0, 60) });
+          return { mode: 'skip', reason: 'Could not determine which file to move within' };
+        }
+        logger.info('Structural move ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        return { mode: 'move', file_path: filePath, ...result.move, reasoning: result.reasoning };
+      }
+      if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        const filePath = result.file_path || inferFilePath(result.old_block);
+        if (!filePath) {
+          logger.warn('old_block not unique to any candidate — Claude must specify file_path', { old_preview: (result.old_block || '').substring(0, 80) });
+          return { mode: 'skip', reason: 'AI edit did not specify which file, and the target text appears in multiple files' };
+        }
+        logger.info('Multi-file edit ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        return { mode: 'replace', file_path: filePath, old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
       }
       logger.warn('AI returned unexpected shape in executeEditMulti', { keys: Object.keys(result || {}) });
       return { mode: 'skip' };

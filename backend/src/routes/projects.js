@@ -68,6 +68,33 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
   }
 });
 
+// POST /api/projects/:id/resolve-route - Map a live page URL to its blade file once,
+// so the chat-edit flow can skip repeating this on every prompt.
+router.post('/:id/resolve-route', authenticateToken, async (req, res, next) => {
+  try {
+    const { url } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'url required' });
+
+    const [projects] = await sequelize.query(
+      'SELECT local_path FROM projects WHERE id = $1',
+      { bind: [req.params.id] }
+    );
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+
+    const routeResolver = require('../services/routeResolver');
+    const resolved = await routeResolver.resolve(projects[0].local_path, url);
+    if (!resolved) return res.status(404).json({ error: 'No route matched', url });
+
+    // Confirm the blade file actually exists on disk before returning
+    try { await fs.access(resolved.abs_path); }
+    catch { return res.status(404).json({ error: 'Blade file missing on disk', blade_file: resolved.blade_file }); }
+
+    res.json({ blade_file: resolved.blade_file, abs_path: resolved.abs_path, url });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // POST /api/projects - Create and clone a new project (async clone)
 router.post('/', authenticateToken, requireRole('admin'), validateProject, async (req, res, next) => {
   try {
@@ -181,6 +208,7 @@ function mysqlExec(rootPassword, sql) {
     const child = spawn('mysql', ['-u', 'root', `-p${rootPassword}`], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', d => { stderr += d; });
+    child.on('error', err => reject(err.code === 'ENOENT' ? new Error('mysql binary not found on server (install: sudo apt install mysql-client)') : err));
     child.on('close', code => {
       if (code === 0) resolve();
       else reject(new Error(stderr.replace(/^mysql: \[Warning\][^\n]*\n/m, '').trim()));
@@ -279,9 +307,14 @@ async function _setupProjectInBackground({ project, setup_action, mysql_root_pas
 
     let errBuf = '';
     child.stderr.on('data', d => { errBuf += d; });
+    child.on('error', err => {
+      clearInterval(heartbeat);
+      if (err.code === 'ENOENT') reject(new Error(`${cmd}: command not found on server (install it or check PATH)`));
+      else reject(err);
+    });
     child.on('close', code => {
       clearInterval(heartbeat);
-      code === 0 ? resolve() : reject(new Error(errBuf.trim()));
+      code === 0 ? resolve() : reject(new Error(errBuf.trim() || `${cmd} exited with code ${code}`));
     });
   });
 
@@ -527,6 +560,7 @@ MAIL_MAILER=log
               { stdio: ['pipe', 'pipe', 'pipe'] });
             let err = '';
             child.stderr.on('data', d => { err += d; });
+            child.on('error', e => reject(e.code === 'ENOENT' ? new Error('mysql binary not found on server') : e));
             child.on('close', code => code === 0 ? resolve() : reject(new Error(err.replace(/^mysql: \[Warning\][^\n]*\n/m, '').trim())));
             require('fs').createReadStream(db_file_path).pipe(child.stdin);
           });
@@ -555,6 +589,7 @@ MAIL_MAILER=log
     // Stop old instance if exists
     await new Promise(resolve => {
       const stop = spawn(PM2, ['pm2', 'delete', pm2Name], { stdio: 'ignore' });
+      stop.on('error', () => resolve());
       stop.on('close', resolve);
     });
     // Start fresh
@@ -566,6 +601,7 @@ MAIL_MAILER=log
         '--',
         'artisan', 'serve', `--port=${port}`, '--host=0.0.0.0'
       ], { env: childEnv, stdio: 'ignore' });
+      start.on('error', err => reject(err.code === 'ENOENT' ? new Error('npx/pm2 not found on server') : err));
       start.on('close', code => code === 0 ? resolve() : reject(new Error(`pm2 start failed (code ${code})`)));
     });
     log(`✓ Server started with pm2 as "${pm2Name}"`, 'success');

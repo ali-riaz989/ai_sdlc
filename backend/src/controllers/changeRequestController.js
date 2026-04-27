@@ -15,7 +15,7 @@ const fs = require('fs').promises;
 class ChangeRequestController {
   async create(req, res, next) {
     try {
-      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element } = req.body;
+      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element, resolved_blade_file } = req.body;
       const userId = req.user.id;
 
       const [projects] = await sequelize.query(
@@ -56,7 +56,7 @@ class ChangeRequestController {
       const _this = this;
       (async function() {
         try {
-          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation, selected_element);
+          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation, selected_element, resolved_blade_file);
         } catch (error) {
           console.error('>>> PROCESS ERROR:', error.message, error.stack);
           logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
@@ -116,7 +116,7 @@ class ChangeRequestController {
   }
 
   // ── Main processor ─────────────────────────────────────────────────────────
-  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null, selectedElement = null) {
+  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null, selectedElement = null, clientResolvedBlade = null) {
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -129,10 +129,23 @@ class ChangeRequestController {
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
 
-      // ── Resolve current page → blade file (always, even with images) ────────
+      // ── Resolve current page → blade file ────────────────────────────────
+      // Prefer the client-provided blade (pre-resolved once per URL, cached in the
+      // chat session). Falls back to running the resolver here only if the client
+      // didn't send one or sent something that no longer exists on disk.
       let pageBladeFile = null;
       let routeUnresolved = false;
-      if (currentPageUrl) {
+      if (clientResolvedBlade?.blade_file) {
+        const abs = path.join(project.local_path, clientResolvedBlade.blade_file);
+        try {
+          await fs.access(abs);
+          pageBladeFile = { blade_file: clientResolvedBlade.blade_file, abs_path: abs };
+          logger.info('Page blade reused from client cache', { blade: pageBladeFile.blade_file });
+        } catch {
+          logger.warn('Client-provided blade missing on disk, falling back to resolver', { blade: clientResolvedBlade.blade_file });
+        }
+      }
+      if (!pageBladeFile && currentPageUrl) {
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
         const resolved = await routeResolver.resolve(project.local_path, currentPageUrl);
@@ -228,10 +241,17 @@ class ChangeRequestController {
     logger.info('Fast text swap complete', { requestId, files: changedFiles.length });
   }
 
-  // ── 2-step flow: AI identifies section → confirms → edits ──────────────────
+  // ── Direct-edit flow: user selects an element in the iframe, AI edits it ──
+  // Select-first is the only supported path — if nothing is selected, we fail fast
+  // rather than guessing a section and asking the user to confirm.
   async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null) {
+    if (!(selectedElement?.section || selectedElement?.text || selectedElement?.classes || selectedElement?.isImage)) {
+      await this._fail(requestId, emit, 'Click the Select button and choose the element you want to edit, then describe the change.');
+      return;
+    }
+
     await this._updateStatus(requestId, 'analyzing');
-    emit('analyzing', 'Finding the right section…');
+    emit('analyzing', 'Preparing edit…');
 
     const absPath = path.join(project.local_path, pageBladeFile.blade_file);
     let originalContent = null;
@@ -278,8 +298,7 @@ class ChangeRequestController {
 
     const lines = originalContent.split('\n');
 
-    if (selectedElement?.section || selectedElement?.text || selectedElement?.classes || selectedElement?.isImage) {
-      // ── DIRECT EDIT: User selected an element → skip Phase 1 + confirmation ──
+    {
       logger.info('Direct edit mode', { section: selectedElement.section, tag: selectedElement.tag, isImage: selectedElement.isImage });
       await this._updateStatus(requestId, 'generating_code');
       emit('generating_code', `Editing: ${selectedElement.section || selectedElement.tag || 'selected element'}`);
@@ -317,26 +336,40 @@ class ChangeRequestController {
         return;
       }
 
-      // ── Unified AI edit (Claude-Code style): give AI the blade section + linked CSS,
-      //    and let it decide which file to edit for ANY kind of change. ────────
-      const CONTEXT_BEFORE = 40;
-      const CONTEXT_AFTER = 80;
-      const foundLine = clickLine >= 0 ? clickLine : 0;
-      let blockStart = Math.max(0, foundLine - CONTEXT_BEFORE);
-      let blockEnd = Math.min(lines.length, foundLine + CONTEXT_AFTER);
-      if (clickLine >= 0) {
-        for (let j = foundLine; j >= blockStart; j--) {
-          if (/<section|<article/i.test(lines[j])) { blockStart = j; break; }
+      // ── Unified AI edit (Claude-Code style): give AI the blade file + linked CSS
+      //    and let IT decide the intent (in-place edit, move, append, etc). No
+      //    keyword matching on our side — Claude reads the prompt and picks.
+
+      // If the file fits in a reasonable context window, send the whole thing so Claude
+      // can do cross-section work (moves, swaps, additions referencing other sections).
+      // Otherwise fall back to a window around the click point for large files.
+      const FULL_FILE_BYTE_LIMIT = 120 * 1024; // ~30K tokens, well under Claude's limit
+      let bladeSection;
+      let clickAnchor = null;
+      if (originalContent.length <= FULL_FILE_BYTE_LIMIT) {
+        bladeSection = originalContent;
+        if (clickLine >= 0 && clickLine < lines.length) clickAnchor = lines[clickLine];
+        logger.info('Sending full blade file', { file: pageBladeFile.blade_file, lines: lines.length, bytes: originalContent.length });
+      } else {
+        const CONTEXT_BEFORE = 40;
+        const CONTEXT_AFTER = 80;
+        const foundLine = clickLine >= 0 ? clickLine : 0;
+        let blockStart = Math.max(0, foundLine - CONTEXT_BEFORE);
+        let blockEnd = Math.min(lines.length, foundLine + CONTEXT_AFTER);
+        if (clickLine >= 0) {
+          for (let j = foundLine; j >= blockStart; j--) {
+            if (/<section|<article/i.test(lines[j])) { blockStart = j; break; }
+          }
+          for (let j = foundLine; j < blockEnd; j++) {
+            if (/<\/section>|<\/article>/i.test(lines[j])) { blockEnd = j + 1; break; }
+          }
         }
-        for (let j = foundLine; j < blockEnd; j++) {
-          if (/<\/section>|<\/article>/i.test(lines[j])) { blockEnd = j + 1; break; }
-        }
+        bladeSection = lines.slice(blockStart, blockEnd).join('\n');
+        logger.info('Blade candidate window (large file)', { foundLine, lines: `${blockStart}-${blockEnd}`, bytes: originalContent.length });
       }
-      const bladeSection = lines.slice(blockStart, blockEnd).join('\n');
-      logger.info('Blade candidate window', { foundLine, lines: `${blockStart}-${blockEnd}` });
 
       const candidates = [
-        { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade' }
+        { path: pageBladeFile.blade_file, content: bladeSection, type: 'blade', clickAnchor }
       ];
 
       // Is this a CMS-style template? (content rendered via @foreach($page->sections) + @includeIf)
@@ -431,15 +464,93 @@ class ChangeRequestController {
         return;
       }
 
-      // Append mode: AI wants to add new content with no existing block to replace
+      // Structural-move mode: AI returned 3 anchor lines; we do the cut/paste mechanically.
       let finalContent;
-      if (!generated.old_block || generated.old_block.trim() === '') {
+      let generatedOldBlock;
+      let generatedNewBlock;
+      if (generated.mode === 'move') {
+        const fileLines = targetOriginal.split('\n');
+        // Match both exact and whitespace-normalized so that indentation drift doesn't kill us
+        const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+        const findMatches = (needle) => {
+          const matches = [];
+          const n = norm(needle);
+          for (let i = 0; i < fileLines.length; i++) {
+            if (fileLines[i] === needle || norm(fileLines[i]) === n) matches.push(i);
+          }
+          return matches;
+        };
+        const srcStartMatches = findMatches(generated.source_start);
+        const srcEndMatches = findMatches(generated.source_end);
+        const insertMatches = findMatches(generated.insert_before);
+        if (!srcStartMatches.length || !srcEndMatches.length || !insertMatches.length) {
+          logger.warn('Move anchors missing', {
+            source_start_hits: srcStartMatches.length, source_start_preview: (generated.source_start || '').substring(0, 80),
+            source_end_hits: srcEndMatches.length, source_end_preview: (generated.source_end || '').substring(0, 80),
+            insert_before_hits: insertMatches.length, insert_before_preview: (generated.insert_before || '').substring(0, 80),
+          });
+          await this._fail(requestId, emit, `Move anchors not found verbatim in file (source_start=${srcStartMatches.length}, source_end=${srcEndMatches.length}, insert_before=${insertMatches.length}). Try rephrasing.`);
+          return;
+        }
+
+        // For each (srcStart, srcEnd) pair where end > start, record the span.
+        // Pair each srcStart with its NEAREST following srcEnd (tightest enclosing range —
+        // correct for nested/repeated closing tags like </section>).
+        const candidates = [];
+        for (const s of srcStartMatches) {
+          const e = srcEndMatches.find(ei => ei >= s);
+          if (e !== undefined) candidates.push({ start: s, end: e, span: e - s });
+        }
+        if (!candidates.length) {
+          await this._fail(requestId, emit, 'source_end line does not follow source_start in the file.');
+          return;
+        }
+        // Prefer the smallest span (innermost block). If Claude chose a generic closing tag
+        // as source_end, this still picks the matching one for the source_start it named.
+        candidates.sort((a, b) => a.span - b.span);
+        const { start: srcStart, end: srcEnd } = candidates[0];
+
+        // Pick the insert anchor that is OUTSIDE the source range and closest to it
+        // (on the side the user likely meant — we can't perfectly infer side, but nearest-outside
+        // is almost always the correct pick for a single-step move).
+        const outsideInserts = insertMatches.filter(i => i < srcStart || i > srcEnd);
+        if (!outsideInserts.length) {
+          await this._fail(requestId, emit, 'insert_before anchor is inside the block being moved.');
+          return;
+        }
+        outsideInserts.sort((a, b) => Math.min(Math.abs(a - srcStart), Math.abs(a - srcEnd)) - Math.min(Math.abs(b - srcStart), Math.abs(b - srcEnd)));
+        const insertIdx = outsideInserts[0];
+
+        const block = fileLines.slice(srcStart, srcEnd + 1);
+        // Remove the block, then insert before the target (accounting for index shift)
+        const without = [...fileLines.slice(0, srcStart), ...fileLines.slice(srcEnd + 1)];
+        const newInsertIdx = insertIdx > srcEnd ? insertIdx - block.length : insertIdx;
+        const reordered = [...without.slice(0, newInsertIdx), ...block, ...without.slice(newInsertIdx)];
+        finalContent = reordered.join('\n');
+
+        // Build a compact diff preview covering just the affected span
+        const spanStart = Math.min(srcStart, insertIdx);
+        const spanEnd = Math.max(srcEnd, insertIdx);
+        generatedOldBlock = fileLines.slice(spanStart, spanEnd + 1).join('\n');
+        const newSpanStart = Math.min(newInsertIdx, newInsertIdx + block.length);
+        const newSpanEnd = Math.max(newInsertIdx + block.length - 1, newInsertIdx - 1) + (insertIdx > srcEnd ? 0 : block.length);
+        // Safer: recompute new span bounds from spanStart..spanEnd translated through the move
+        const reorderedLines = reordered;
+        const newSpanEndAdjusted = Math.min(spanEnd, reorderedLines.length - 1);
+        generatedNewBlock = reorderedLines.slice(spanStart, newSpanEndAdjusted + 1).join('\n');
+        logger.info('Structural move applied', { file: generated.file_path, srcLines: `${srcStart + 1}-${srcEnd + 1}`, targetLine: insertIdx + 1, blockLines: block.length });
+        // suppress unused-var warning
+        void newSpanStart; void newSpanEnd;
+      } else if (!generated.old_block || generated.old_block.trim() === '') {
+        // Append mode: AI wants to add new content with no existing block to replace
         if (!generated.new_block || generated.new_block.trim() === '') {
           await this._fail(requestId, emit, 'AI returned empty edit — nothing to change');
           return;
         }
         const sep = targetOriginal.endsWith('\n') ? '' : '\n';
         finalContent = targetOriginal + sep + generated.new_block + (generated.new_block.endsWith('\n') ? '' : '\n');
+        generatedOldBlock = '';
+        generatedNewBlock = generated.new_block;
         logger.info('Append mode', { file: generated.file_path, added: generated.new_block.length });
       } else {
         finalContent = this._applyBlockReplace(targetOriginal, generated.old_block, generated.new_block);
@@ -452,9 +563,11 @@ class ChangeRequestController {
           await this._fail(requestId, emit, `Could not locate the text to replace in ${generated.file_path}. The AI's old_block didn't match the file verbatim — try again or rephrase.`);
           return;
         }
+        generatedOldBlock = generated.old_block;
+        generatedNewBlock = generated.new_block;
       }
 
-      const diffInfo = { old_block: generated.old_block, new_block: generated.new_block, reasoning: generated.reasoning };
+      const diffInfo = { old_block: generatedOldBlock, new_block: generatedNewBlock, reasoning: generated.reasoning };
       emitFile(generated.file_path, 'modify', 'generating');
       await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
         { bind: [uuidv4(), requestId, generated.file_path, targetOriginal, finalContent, JSON.stringify(diffInfo)] });
@@ -465,38 +578,6 @@ class ChangeRequestController {
       logger.info('Unified edit applied', { requestId, file: generated.file_path, reasoning: generated.reasoning });
       return;
     }
-
-    // ── No element selected: use Phase 1 confirmation flow ──────────────
-    const contentForIdentify = originalContent.length > 50000
-      ? originalContent.substring(0, 50000) + '\n<!-- truncated -->'
-      : originalContent;
-
-    const section = await aiService.identifySection(
-      changeRequest.prompt, structuredSections, contentForIdentify,
-      pageBladeFile.blade_file, imageData, conversation
-    );
-
-    if (!section || !section.line_start) {
-      await this._fail(requestId, emit, section?.error || 'Could not identify which section to edit');
-      return;
-    }
-
-    logger.info('Section identified', { target: section.target_section, lines: `${section.line_start}-${section.line_end}`, confidence: section.confidence });
-
-    const startIdx = Math.max(0, section.line_start - 3);
-    const endIdx = Math.min(lines.length, (section.line_end || section.line_start + 80) + 3);
-    const sectionPreview = lines.slice(section.line_start - 1, Math.min(section.line_start + 4, lines.length)).join('\n');
-
-    await sequelize.query(
-      `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
-       VALUES ($1, $2, $3, $4, '', 'modify', $5)`,
-      { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent,
-        JSON.stringify({ line_start: startIdx, line_end: endIdx, saved_image_url: savedImageUrl, target_section: section.target_section, reasoning: section.reasoning, confidence: section.confidence, preview: sectionPreview })
-      ]}
-    );
-
-    await this._updateStatus(requestId, 'confirm_section');
-    emit('confirm_section', JSON.stringify({ target_section: section.target_section, reasoning: section.reasoning, confidence: section.confidence, preview: sectionPreview, file: pageBladeFile.blade_file }));
   }
 
   // ── Locate selected element in source using every signal available ─────────
