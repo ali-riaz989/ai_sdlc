@@ -15,7 +15,7 @@ const fs = require('fs').promises;
 class ChangeRequestController {
   async create(req, res, next) {
     try {
-      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element, resolved_blade_file } = req.body;
+      const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element, resolved_blade_file, iframe_viewport } = req.body;
       const userId = req.user.id;
 
       const [projects] = await sequelize.query(
@@ -56,7 +56,7 @@ class ChangeRequestController {
       const _this = this;
       (async function() {
         try {
-          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation, selected_element, resolved_blade_file);
+          await _this._processChangeRequest(requestId, project, req.app.get('io'), imageData, current_page_url, page_context, conversation, selected_element, resolved_blade_file, iframe_viewport);
         } catch (error) {
           console.error('>>> PROCESS ERROR:', error.message, error.stack);
           logger.error('Processing failed', { error: error.message, stack: error.stack, requestId });
@@ -116,7 +116,7 @@ class ChangeRequestController {
   }
 
   // ── Main processor ─────────────────────────────────────────────────────────
-  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null, selectedElement = null, clientResolvedBlade = null) {
+  async _processChangeRequest(requestId, project, io, imageData = null, currentPageUrl = null, pageContext = null, conversation = null, selectedElement = null, clientResolvedBlade = null, iframeViewport = null) {
     const emit = (status, message) => {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}`, { status, message });
     };
@@ -165,7 +165,7 @@ class ChangeRequestController {
 
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
-        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement);
+        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement, iframeViewport);
       } else if (routeUnresolved) {
         // The user is on a specific page but we cannot map the URL to a blade file.
         // Scanning the whole project is unsafe — it will pick an unrelated file. Fail clearly.
@@ -244,7 +244,7 @@ class ChangeRequestController {
   // ── Direct-edit flow: user selects an element in the iframe, AI edits it ──
   // Select-first is the only supported path — if nothing is selected, we fail fast
   // rather than guessing a section and asking the user to confirm.
-  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null) {
+  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null, iframeViewport = null) {
     if (!(selectedElement?.section || selectedElement?.text || selectedElement?.classes || selectedElement?.isImage)) {
       await this._fail(requestId, emit, 'Click the Select button and choose the element you want to edit, then describe the change.');
       return;
@@ -306,20 +306,98 @@ class ChangeRequestController {
       // Image-upload intent: if the user uploaded an image, do the mechanical src swap (fast + deterministic)
       const hasUploadedImage = selectedElement.isImage === true || !!savedImageUrl;
 
-      // Locate where the user clicked in the source
-      const clickLine = this._locateElementInSource(lines, selectedElement);
-      logger.info('Located click in source', { clickLine, section: selectedElement.section, classes: selectedElement.classes, textPreview: (selectedElement.text || '').substring(0, 60) });
+      // Locate where the user clicked in the source.
+      // ── PRIMARY PATH: data-blade-src attribute injected at compile time ──
+      // This is deterministic — no text matching, no heuristics. The frontend reads
+      // the attribute from the clicked DOM element and ships it as `selectedElement.bladeSrc`
+      // in "<relative path>:<line>" form. If the element lives in an @include'd partial,
+      // we transparently switch pageBladeFile to the partial.
+      let clickLine = -1;
+      if (typeof selectedElement.bladeSrc === 'string' && selectedElement.bladeSrc.includes(':')) {
+        const lastColon = selectedElement.bladeSrc.lastIndexOf(':');
+        const srcFile = selectedElement.bladeSrc.substring(0, lastColon);
+        const srcLine = parseInt(selectedElement.bladeSrc.substring(lastColon + 1), 10);
+        if (srcFile && Number.isFinite(srcLine) && srcLine > 0) {
+          // If the click came from a different file than the resolved page blade
+          // (i.e. a partial), redirect the entire edit there.
+          if (srcFile !== pageBladeFile.blade_file) {
+            const partialAbs = path.join(project.local_path, srcFile);
+            try {
+              const partialContent = await fs.readFile(partialAbs, 'utf-8');
+              pageBladeFile = { blade_file: srcFile, abs_path: partialAbs };
+              originalContent = partialContent;
+              lines = partialContent.split('\n');
+              logger.info('Click resolved to a partial — switching target file', { partial: srcFile, line: srcLine });
+            } catch (e) {
+              logger.warn('Cannot read partial referenced by data-blade-src; falling back', { srcFile, error: e.message });
+            }
+          }
+          clickLine = Math.max(0, Math.min(srcLine - 1, lines.length - 1));
+          logger.info('Click line from data-blade-src', { file: pageBladeFile.blade_file, clickLine: clickLine + 1 });
+        }
+      }
+      // ── FALLBACK PATH: heuristic locator (older Blade renders without the
+      // attribute injection, edge cases like JS-injected DOM nodes, etc.) ──
+      if (clickLine < 0) {
+        clickLine = this._locateElementInSource(lines, selectedElement);
+        logger.info('Located click in source (fallback heuristic)', {
+          clickLine, section: selectedElement.section, classes: selectedElement.classes,
+          textPreview: (selectedElement.text || '').substring(0, 60),
+        });
+      }
+
+      // ── Image upload intent detection ────────────────────────────────
+      // The mechanical src-swap is fast and deterministic, but ONLY applies when
+      // the user's prompt is purely about replacing the clicked image. Three failure
+      // modes the shortcut cannot handle, so we must route them to the AI:
+      //   1. ADD intent — "Add another image", "duplicate this slide", "another card"
+      //   2. MIXED intent — image + text/title/date/description in one prompt
+      //      (e.g. "Replace this blog with this image, title will be 'Hello world',
+      //       date is …, description is …"). The mechanical path would silently
+      //      swap only the image and lose every other change.
+      // Default (bare upload, no prompt, or "replace this image" with no extras)
+      // still uses the fast path.
+      const promptText = (changeRequest.prompt || '').toLowerCase();
+      const wantsToAdd = /\b(add|insert|append|another|one more|extra|additional|duplicate|copy|clone|new (image|slide|card|item|entry))\b/.test(promptText);
+      // Words that signal the prompt is editing OTHER fields besides the image —
+      // titles, headings, dates, descriptions, captions, links. If any of these
+      // appear, the AI must handle the whole edit holistically.
+      const mentionsOtherFields = /\b(title|heading|name|date|description|desc(?:ription)?|caption|subtitle|text|copy|content|paragraph|button|label|link|url|href|alt|price|address|phone|email)\b/.test(promptText);
+      const wantsToReplace = /\b(replace|change|swap|update|set)\b/.test(promptText);
+      // Mechanical swap only when: no add intent AND no other fields mentioned AND
+      // either an explicit replace word OR the prompt is essentially empty.
+      const isReplaceIntent = !wantsToAdd && !mentionsOtherFields && (wantsToReplace || promptText.trim().length < 3);
 
       // ── Image upload: mechanical src swap — no AI needed ─────────────
-      if (hasUploadedImage && savedImageUrl) {
+      if (hasUploadedImage && savedImageUrl && isReplaceIntent) {
         const oldImgTag = this._findSelectedImgTag(originalContent, selectedElement, clickLine);
         if (oldImgTag) {
           logger.info('Targeted <img>', { preview: oldImgTag.substring(0, 160) });
           const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
           const newImgTag = oldImgTag.replace(/src\s*=\s*(["'])[\s\S]*?\1/, `src="${assetPath}"`);
-          if (newImgTag !== oldImgTag && originalContent.includes(oldImgTag)) {
+          // Find every occurrence of oldImgTag and replace ONLY the one nearest the
+          // click. Identical <img> tags repeat across header + footer logos and brand
+          // carousels — split/join would clobber every occurrence and ruin the page.
+          const occs = [];
+          let from = 0;
+          while (true) {
+            const i = originalContent.indexOf(oldImgTag, from);
+            if (i < 0) break;
+            occs.push(i);
+            from = i + Math.max(1, oldImgTag.length);
+          }
+          if (newImgTag !== oldImgTag && occs.length) {
+            let chosenIdx = occs[0];
+            if (clickLine >= 0 && occs.length > 1) {
+              const lineOfIdx = (i) => originalContent.slice(0, i).split('\n').length - 1;
+              let bestDist = Math.abs(lineOfIdx(chosenIdx) - clickLine);
+              for (let i = 1; i < occs.length; i++) {
+                const d = Math.abs(lineOfIdx(occs[i]) - clickLine);
+                if (d < bestDist) { chosenIdx = occs[i]; bestDist = d; }
+              }
+            }
             emitFile(pageBladeFile.blade_file, 'modify', 'generating');
-            const finalContent = originalContent.split(oldImgTag).join(newImgTag);
+            const finalContent = originalContent.substring(0, chosenIdx) + newImgTag + originalContent.substring(chosenIdx + oldImgTag.length);
             const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced selected image' };
             await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
               { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
@@ -459,6 +537,49 @@ class ChangeRequestController {
         logger.warn('CSS discovery failed', { error: cssErr.message });
       }
 
+      // Attach linked JS files — without these the AI is blind to slider/carousel
+      // init code, modal triggers, AJAX form handlers, etc. Skip vendor/minified
+      // bundles (they're huge and not editable). Cap each file at 14KB.
+      try {
+        const jsFiles = await this._findLinkedJsFiles(project.local_path, pageBladeFile);
+        for (const f of jsFiles) {
+          try {
+            let content = await fs.readFile(f.abs, 'utf-8');
+            if (content.length > 14000) content = content.substring(0, 14000) + '\n/* …truncated… */';
+            candidates.push({ path: f.rel, content, type: 'js' });
+          } catch {}
+        }
+      } catch (jsErr) {
+        logger.warn('JS discovery failed', { error: jsErr.message });
+      }
+
+      // Slider/carousel/modal-style prompts depend on knowing the project's existing
+      // convention (Slick? Swiper? Owl? Bootstrap carousel? GLightbox?). Grep blade +
+      // JS for matching keywords and surface a SHORT example of the existing pattern
+      // so the AI clones the right structure instead of inventing one.
+      try {
+        const promptLc = (changeRequest.prompt || '').toLowerCase();
+        const libHints = [
+          { kw: 'slick', signal: /slick/i },
+          { kw: 'swiper', signal: /swiper/i },
+          { kw: 'owl', signal: /owl-carousel|owl\.carousel/i },
+          { kw: 'carousel', signal: /class="[^"]*\bcarousel\b[^"]*"/i },
+          { kw: 'glightbox', signal: /glightbox/i },
+          { kw: 'fancybox', signal: /fancybox/i },
+        ];
+        const triggerKws = ['slider', 'slick', 'swiper', 'carousel', 'owl', 'gallery', 'lightbox', 'glightbox', 'fancybox', 'modal', 'tab', 'accordion'];
+        const prompted = triggerKws.some(k => promptLc.includes(k));
+        if (prompted) {
+          const example = await this._findLibraryUsageExample(project.local_path, libHints, pageBladeFile.blade_file);
+          if (example) {
+            candidates.push({ path: example.rel, content: example.snippet, type: 'example' });
+            logger.info('Library example attached', { rel: example.rel, lib: example.lib });
+          }
+        }
+      } catch (exErr) {
+        logger.warn('Library example discovery failed', { error: exErr.message });
+      }
+
       logger.info('Sending candidates to AI', { files: candidates.map(c => `${c.path} (${c.type})`) });
 
       // Stream tokens back to the frontend as Claude generates — the existing
@@ -467,14 +588,24 @@ class ChangeRequestController {
         if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:token`, { token: chunk });
       };
 
+      // When the user uploads an image + asks to add (not replace), make the
+      // intent explicit to the AI so the savedImageUrl hint doesn't bias it
+      // toward a `src` swap. The AI's rules already cover ADD via old_block +
+      // new_block (= old_block + new content); we just need to prime it.
+      let aiPrompt = changeRequest.prompt;
+      if (hasUploadedImage && savedImageUrl && wantsToAdd) {
+        aiPrompt += `\n\nINTENT: ADD a new image (do NOT replace the clicked image). Find the nearest repeating block at the click region (carousel slide, gallery card, brand tile, etc.), copy it as old_block, and emit old_block + a CLONED block using the uploaded image's asset path as new_block. Preserve the original image; insert alongside.`;
+      }
+
       const generated = await aiService.executeEditMulti({
-        prompt: changeRequest.prompt,
+        prompt: aiPrompt,
         selectedElement,
         candidates,
         conversation,
         imageData,
         savedImageUrl,
         onToken,
+        iframeViewport,
       });
 
       if (generated.mode === 'skip' || !generated.file_path) {
@@ -493,15 +624,41 @@ class ChangeRequestController {
 
       // Click-region validation: when the AI edits the same file the user clicked in,
       // the proposed old_block MUST overlap the click region. Without this guard, Claude
-      // sometimes picks a similar-looking element elsewhere in the file (e.g. an <h6> in
-      // a different section that has the same class) and silently edits the wrong thing.
+      // sometimes picks a similar-looking element elsewhere in the file (e.g. another tab
+      // with the same accordion structure) and silently edits the wrong thing.
+      // We try exact-position first; if old_block was paraphrased and only fuzzy-matches,
+      // we use the fuzzy match's line range so paraphrasing can't smuggle past the check.
       if (generated.mode === 'replace' && generated.file_path === pageBladeFile.blade_file && clickLine >= 0 && generated.old_block) {
-        const oldBlockIdx = targetOriginal.indexOf(generated.old_block);
-        if (oldBlockIdx >= 0) {
-          // Convert byte offset → line number
-          const oldBlockStartLine = targetOriginal.slice(0, oldBlockIdx).split('\n').length - 1;
-          const oldBlockEndLine = oldBlockStartLine + generated.old_block.split('\n').length - 1;
-          // Allow a 40-line slack on either side of the click — accommodates wrapping <section>/<div>
+        let oldBlockStartLine = -1, oldBlockEndLine = -1;
+        // When old_block appears multiple times (duplicate markup like header+footer
+        // logos), scan for ALL occurrences and pick the one nearest clickLine —
+        // otherwise the in-region check would always grade against the FIRST match
+        // in the file and incorrectly reject (or accept) the AI's edit.
+        const occs = [];
+        let from = 0;
+        while (true) {
+          const i = targetOriginal.indexOf(generated.old_block, from);
+          if (i < 0) break;
+          occs.push(i);
+          from = i + Math.max(1, generated.old_block.length);
+        }
+        if (occs.length) {
+          let exactIdx = occs[0];
+          if (occs.length > 1) {
+            let bestDist = Math.abs((targetOriginal.slice(0, exactIdx).split('\n').length - 1) - clickLine);
+            for (let i = 1; i < occs.length; i++) {
+              const ln = targetOriginal.slice(0, occs[i]).split('\n').length - 1;
+              const d = Math.abs(ln - clickLine);
+              if (d < bestDist) { exactIdx = occs[i]; bestDist = d; }
+            }
+          }
+          oldBlockStartLine = targetOriginal.slice(0, exactIdx).split('\n').length - 1;
+          oldBlockEndLine = oldBlockStartLine + generated.old_block.split('\n').length - 1;
+        } else {
+          const range = this._findFuzzyMatchRange(targetOriginal, generated.old_block, clickLine);
+          if (range) { oldBlockStartLine = range.startLine; oldBlockEndLine = range.endLine; }
+        }
+        if (oldBlockStartLine >= 0) {
           const SLACK = 40;
           const inRegion = oldBlockEndLine >= clickLine - SLACK && oldBlockStartLine <= clickLine + SLACK;
           if (!inRegion) {
@@ -605,7 +762,10 @@ class ChangeRequestController {
         generatedNewBlock = generated.new_block;
         logger.info('Append mode', { file: generated.file_path, added: generated.new_block.length });
       } else {
-        finalContent = this._applyBlockReplace(targetOriginal, generated.old_block, generated.new_block);
+        // Pass clickLine so location-aware replace picks the duplicate near the click,
+        // not the first one in the file (header logo vs footer logo case).
+        const replaceClickLine = (generated.file_path === pageBladeFile.blade_file) ? clickLine : -1;
+        finalContent = this._applyBlockReplace(targetOriginal, generated.old_block, generated.new_block, replaceClickLine);
         if (!finalContent) {
           logger.warn('Block replace failed', {
             file: generated.file_path,
@@ -782,18 +942,45 @@ class ChangeRequestController {
   // Case A: user clicked the <img> directly → match by src filename
   // Case B: user clicked a container → return the <img> closest to the click line
   _findSelectedImgTag(content, sel, clickLine = -1) {
-    // Case A: direct IMG click
+    // Helper: of the <img> matches found, pick the one whose source line is
+    // closest to clickLine. Without this, an image whose filename happens to
+    // appear in multiple <img> tags (e.g. logo reused in header + footer) would
+    // resolve to the FIRST match and edit the wrong element.
+    const pickNearestMatch = (matches) => {
+      if (!matches.length) return null;
+      if (clickLine < 0 || matches.length === 1) return matches[0].tag;
+      let best = matches[0], bestDist = Math.abs(matches[0].line - clickLine);
+      for (let i = 1; i < matches.length; i++) {
+        const d = Math.abs(matches[i].line - clickLine);
+        if (d < bestDist) { best = matches[i]; bestDist = d; }
+      }
+      return best.tag;
+    };
+
+    // Case A: direct IMG click — match by filename (or 2-segment path tail) and
+    // disambiguate by proximity to clickLine.
     if (sel?.isImage && sel?.src) {
       const filename = sel.src.split(/[?#]/)[0].split('/').pop();
       if (filename && filename.length > 2) {
+        const matches = [];
         for (const m of content.matchAll(/<img\b[^>]*>/gi)) {
-          if (m[0].includes(filename)) return m[0];
+          if (m[0].includes(filename)) {
+            matches.push({ tag: m[0], line: content.slice(0, m.index).split('\n').length - 1 });
+          }
         }
+        const picked = pickNearestMatch(matches);
+        if (picked) return picked;
+
         const pathTail = sel.src.split(/[?#]/)[0].split('/').slice(-2).join('/');
         if (pathTail && pathTail !== filename) {
+          const tailMatches = [];
           for (const m of content.matchAll(/<img\b[^>]*>/gi)) {
-            if (m[0].includes(pathTail)) return m[0];
+            if (m[0].includes(pathTail)) {
+              tailMatches.push({ tag: m[0], line: content.slice(0, m.index).split('\n').length - 1 });
+            }
           }
+          const pickedTail = pickNearestMatch(tailMatches);
+          if (pickedTail) return pickedTail;
         }
       }
     }
@@ -814,20 +1001,149 @@ class ChangeRequestController {
   }
 
   // ── Robust block replace with whitespace/quote normalisation ──────────────
-  _applyBlockReplace(originalContent, oldBlock, newBlock) {
+  // clickLine (0-indexed) tells us which line the user actually clicked on. When
+  // the same markup repeats (header + footer share an identical logo <img>), the
+  // AI's verbatim old_block matches both — without this hint we'd replace the
+  // FIRST one and clobber the wrong element. Pass clickLine so we replace the
+  // occurrence nearest the user's click.
+  _applyBlockReplace(originalContent, oldBlock, newBlock, clickLine = -1) {
     if (/^\d+\|\s/.test(oldBlock)) {
       oldBlock = oldBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
       newBlock = newBlock.split('\n').map(l => l.replace(/^\d+\|\s?/, '')).join('\n');
     }
-    const tryReplace = (c, o, n) => c.includes(o) ? c.split(o).join(n) : null;
     const norm = s => s.replace(/\r\n/g, '\n');
     const trimL = s => s.split('\n').map(l => l.trimEnd()).join('\n');
     const normQ = s => s.replace(/[\u2018\u2019\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"');
+    const lineOf = (content, idx) => content.slice(0, idx).split('\n').length - 1;
 
-    return tryReplace(originalContent, oldBlock, newBlock)
-      || tryReplace(norm(originalContent), norm(oldBlock), norm(newBlock))
-      || tryReplace(trimL(norm(originalContent)), trimL(norm(oldBlock)), trimL(norm(newBlock)))
-      || tryReplace(normQ(originalContent), normQ(oldBlock), normQ(newBlock));
+    // Find every byte-offset of `o` inside `c` (not just the first).
+    const allOccurrences = (c, o) => {
+      const out = [];
+      if (!o) return out;
+      let from = 0;
+      while (true) {
+        const i = c.indexOf(o, from);
+        if (i < 0) break;
+        out.push(i);
+        from = i + Math.max(1, o.length);
+      }
+      return out;
+    };
+    // Of the given offsets, return the one whose line is closest to clickLine.
+    // Falls back to the first occurrence when clickLine is unknown.
+    const pickNearest = (occs, c, ref) => {
+      if (!occs.length) return -1;
+      if (ref < 0 || occs.length === 1) return occs[0];
+      let best = occs[0], bestDist = Math.abs(lineOf(c, best) - ref);
+      for (let i = 1; i < occs.length; i++) {
+        const d = Math.abs(lineOf(c, occs[i]) - ref);
+        if (d < bestDist) { best = occs[i]; bestDist = d; }
+      }
+      return best;
+    };
+
+    // Levels 1-4 (exact, line-end norm, trailing-ws strip, smart-quote norm).
+    // For each variant where old_block matches, replace ONLY the occurrence nearest
+    // the click — never split/join (which would replace EVERY occurrence and clobber
+    // duplicate markup elsewhere in the file, e.g. the header logo when the user
+    // clicked the footer logo).
+    const variants = [
+      { o: oldBlock, n: newBlock, c: originalContent },
+      { o: norm(oldBlock), n: norm(newBlock), c: norm(originalContent) },
+      { o: trimL(norm(oldBlock)), n: trimL(norm(newBlock)), c: trimL(norm(originalContent)) },
+      { o: normQ(oldBlock), n: normQ(newBlock), c: normQ(originalContent) },
+    ];
+    for (const { o, n, c } of variants) {
+      const occs = allOccurrences(c, o);
+      if (!occs.length) continue;
+      const idx = pickNearest(occs, c, clickLine);
+      return c.substring(0, idx) + n + c.substring(idx + o.length);
+    }
+
+    // Level 5 — FUZZY: allow Claude's old_block to differ from the file in:
+    //   • leading whitespace per line (indent drift)
+    //   • blank-line count between non-blank lines (Claude often collapses gaps)
+    try {
+      const escape = (s) => s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const oldLinesRaw = norm(oldBlock).split('\n');
+      // Drop blank lines from both ends and middle; we anchor only by non-blank content.
+      const nonBlankLines = oldLinesRaw.filter(l => l.trim() !== '');
+      if (nonBlankLines.length === 0) return null;
+
+      // Each non-blank line must appear on its own line in the file with arbitrary
+      // leading whitespace. Between consecutive non-blank lines, allow ANY number of
+      // newline+whitespace characters (covers Claude collapsing N blank lines into 0).
+      const parts = nonBlankLines.map(l => '[ \\t]*' + escape(l.trimStart()));
+      const pattern = parts.join('(?:\\r?\\n[ \\t]*)+');
+      const re = new RegExp(pattern, 'g');
+      const normContent = norm(originalContent);
+      // Collect every fuzzy match, then pick the one whose line is nearest clickLine.
+      // Without this, repeating markup (header/footer logo with slight whitespace
+      // drift) silently lands on the first occurrence regardless of where the user clicked.
+      const matches = [];
+      let mm;
+      while ((mm = re.exec(normContent)) !== null) {
+        matches.push({ idx: mm.index, matched: mm[0] });
+        if (mm[0].length === 0) re.lastIndex++;
+      }
+      if (matches.length) {
+        let chosen = matches[0];
+        if (clickLine >= 0 && matches.length > 1) {
+          let bestDist = Math.abs(lineOf(normContent, chosen.idx) - clickLine);
+          for (let i = 1; i < matches.length; i++) {
+            const d = Math.abs(lineOf(normContent, matches[i].idx) - clickLine);
+            if (d < bestDist) { chosen = matches[i]; bestDist = d; }
+          }
+        }
+        const { idx, matched } = chosen;
+        // Re-indent newBlock so its first line aligns with the matched indent in the file.
+        const firstIndent = (matched.match(/^[ \t]*/) || [''])[0];
+        const newLines = norm(newBlock).split('\n');
+        const oldFirstIndent = (nonBlankLines[0].match(/^[ \t]*/) || [''])[0];
+        const reindented = newLines.map(line => {
+          if (line.trim() === '') return line;
+          const lineIndent = (line.match(/^[ \t]*/) || [''])[0];
+          const stripped = line.slice(lineIndent.length);
+          const relativeSpaces = lineIndent.length - oldFirstIndent.length;
+          return firstIndent + (relativeSpaces > 0 ? ' '.repeat(relativeSpaces) : '') + stripped;
+        }).join('\n');
+        return normContent.substring(0, idx) + reindented + normContent.substring(idx + matched.length);
+      }
+    } catch (e) {
+      logger.warn('Fuzzy replace error', { error: e.message });
+    }
+    return null;
+  }
+
+  // After a fuzzy match succeeds we don't have a literal byte-offset for old_block
+  // (it doesn't appear verbatim in the file). To still validate that the edit lands
+  // inside the click region, we run the same fuzzy-match regex against the original
+  // content and return the matched line range. Returns { startLine, endLine } in
+  // 0-indexed coords, or null if no match.
+  _findFuzzyMatchRange(originalContent, oldBlock, clickLine = -1) {
+    try {
+      const norm = s => s.replace(/\r\n/g, '\n');
+      const escape = (s) => s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const nonBlankLines = norm(oldBlock).split('\n').filter(l => l.trim() !== '');
+      if (!nonBlankLines.length) return null;
+      const parts = nonBlankLines.map(l => '[ \\t]*' + escape(l.trimStart()));
+      const re = new RegExp(parts.join('(?:\\r?\\n[ \\t]*)+'), 'g');
+      const normContent = norm(originalContent);
+      // Pick the fuzzy match whose start-line is closest to clickLine, so the
+      // in-region check matches the occurrence we actually intend to replace.
+      let chosen = null, bestDist = Infinity;
+      let m;
+      while ((m = re.exec(normContent)) !== null) {
+        const startLine = normContent.substring(0, m.index).split('\n').length - 1;
+        if (clickLine < 0) { chosen = { idx: m.index, startLine, full: m[0] }; break; }
+        const d = Math.abs(startLine - clickLine);
+        if (d < bestDist) { chosen = { idx: m.index, startLine, full: m[0] }; bestDist = d; }
+        if (m[0].length === 0) re.lastIndex++;
+      }
+      if (!chosen) return null;
+      const endLine = chosen.startLine + chosen.full.split('\n').length - 1;
+      return { startLine: chosen.startLine, endLine };
+    } catch { return null; }
   }
 
   // ── Find blade partials containing the selected element's text or classes ─────
@@ -993,6 +1309,135 @@ class ChangeRequestController {
       }
     }
     return resolved;
+  }
+
+  // ── Linked JS file discovery (mirrors _findLinkedCssFiles) ──────────────
+  // Walks the blade extend/include chain, collects every <script src=…> /
+  // asset('…js') / mix('…js') reference, resolves under public/ resources/
+  // and skips obvious vendor/minified bundles the AI can't usefully edit.
+  async _findLinkedJsFiles(projectPath, pageBladeFile) {
+    const viewsRoot = path.join(projectPath, 'resources', 'views');
+    const visited = new Set();
+    const bladeContents = [];
+
+    const resolveBladeName = async (dottedName) => {
+      const parts = dottedName.replace(/^\/+/, '').split(/[./]/).join('/');
+      const candidates = [
+        path.join(viewsRoot, parts + '.blade.php'),
+        path.join(viewsRoot, parts, 'index.blade.php'),
+      ];
+      for (const c of candidates) {
+        try { await fs.access(c); return c; } catch {}
+      }
+      return null;
+    };
+
+    const walk = async (absPath) => {
+      if (!absPath || visited.has(absPath)) return;
+      visited.add(absPath);
+      let content;
+      try { content = await fs.readFile(absPath, 'utf-8'); } catch { return; }
+      bladeContents.push(content);
+      const refPattern = /@(?:extends|include|includeIf|includeWhen|includeUnless|includeFirst|component|yield)\s*\(\s*['"]([^'"]+)['"]/g;
+      const seenRefs = new Set();
+      for (const m of content.matchAll(refPattern)) seenRefs.add(m[1]);
+      for (const ref of seenRefs) {
+        const child = await resolveBladeName(ref);
+        if (child) await walk(child);
+      }
+    };
+
+    await walk(path.join(projectPath, pageBladeFile.blade_file));
+
+    const combined = bladeContents.join('\n');
+    const seenJs = new Set();
+    const refs = [];
+    // Skip vendor/minified bundles — the AI can't edit slick.min.js or jquery, and
+    // they bloat the prompt. We still surface them via the "library example" path
+    // for pattern lookups, just not as editable candidates here.
+    const isVendor = (p) => /(\.min\.js$|\/(vendor|node_modules|lib|libs|libraries|plugins|jquery|bootstrap)\/)/i.test(p)
+      || /^\/?(vendor|node_modules|libs|libraries)\//i.test(p);
+    const pushRef = (raw) => {
+      let p = raw.replace(/^\/+/, '').replace(/\?.*$/, '').replace(/#.*$/, '');
+      if (!p.toLowerCase().endsWith('.js') || seenJs.has(p) || isVendor(p)) return;
+      seenJs.add(p); refs.push(p);
+    };
+    for (const m of combined.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+\.js[^"']*)["']/gi)) pushRef(m[1]);
+    for (const m of combined.matchAll(/asset\(\s*['"]([^'"]+\.js)['"]\s*\)/gi)) pushRef(m[1]);
+    for (const m of combined.matchAll(/mix\(\s*['"]([^'"]+\.js)['"]\s*\)/gi)) pushRef(m[1]);
+
+    const resolved = [];
+    for (const p of refs) {
+      const tries = [
+        path.join(projectPath, 'public', p),
+        path.join(projectPath, p),
+        path.join(projectPath, 'resources', p),
+        path.join(projectPath, 'resources', 'js', path.basename(p)),
+      ];
+      for (const abs of tries) {
+        try { await fs.access(abs); resolved.push({ rel: path.relative(projectPath, abs), abs }); break; } catch {}
+      }
+    }
+    return resolved;
+  }
+
+  // ── Find one short example of how this project already uses a UI library ──
+  // When the user asks to add a slider/carousel/lightbox/modal, the AI needs
+  // to clone the project's existing convention rather than invent a fresh
+  // structure. This greps blade + JS files for known library signatures and
+  // returns the FIRST short snippet around a hit.
+  async _findLibraryUsageExample(projectPath, libHints, excludeBlade) {
+    const viewsRoot = path.join(projectPath, 'resources', 'views');
+    const jsRoots = [
+      path.join(projectPath, 'public', 'js'),
+      path.join(projectPath, 'public', 'assets', 'js'),
+      path.join(projectPath, 'resources', 'js'),
+    ];
+    const collect = async (dir, ext) => {
+      const out = [];
+      const stack = [dir];
+      while (stack.length) {
+        const d = stack.pop();
+        let entries;
+        try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { continue; }
+        for (const e of entries) {
+          const full = path.join(d, e.name);
+          if (e.isDirectory()) {
+            // Skip vendor heavyweights
+            if (/^(node_modules|vendor|lib|libs|libraries|jquery|bootstrap)$/i.test(e.name)) continue;
+            stack.push(full);
+          } else if (e.isFile() && (Array.isArray(ext) ? ext.some(x => e.name.endsWith(x)) : e.name.endsWith(ext))) {
+            // Skip vendor/minified
+            if (/\.min\.js$/i.test(e.name)) continue;
+            out.push(full);
+          }
+        }
+      }
+      return out;
+    };
+    const blades = await collect(viewsRoot, '.blade.php');
+    const jsFiles = (await Promise.all(jsRoots.map(r => collect(r, '.js')))).flat();
+    const allFiles = [...blades, ...jsFiles];
+
+    for (const lib of libHints) {
+      for (const file of allFiles) {
+        const rel = path.relative(projectPath, file);
+        if (rel === excludeBlade) continue;
+        let content;
+        try { content = await fs.readFile(file, 'utf-8'); } catch { continue; }
+        const m = lib.signal.exec(content);
+        if (!m) continue;
+        const lines = content.split('\n');
+        const hitLine = content.slice(0, m.index).split('\n').length - 1;
+        // Capture a tight ~40-line window around the first hit so the AI sees both
+        // the markup wrapper AND any nearby init code without flooding the prompt.
+        const start = Math.max(0, hitLine - 12);
+        const end = Math.min(lines.length, hitLine + 28);
+        const snippet = `[Existing ${lib.kw} usage in ${rel} — clone this convention]\n\n` + lines.slice(start, end).join('\n');
+        return { rel, lib: lib.kw, snippet };
+      }
+    }
+    return null;
   }
 
   // ── Pick the CSS file most likely to own the selected element's classes ──

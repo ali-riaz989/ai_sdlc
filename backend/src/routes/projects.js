@@ -1,7 +1,10 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs').promises;
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const simpleGit = require('simple-git');
+const execFileP = promisify(execFile);
 const { sequelize } = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { validateProject } = require('../middleware/validation');
@@ -223,8 +226,37 @@ router.post('/:id/pages', authenticateToken, async (req, res, next) => {
       return res.status(409).json({ error: 'URL already exist, type a different url' });
     }
 
-    // Write blade file (uses layouts.static — the DB-free layout for scaffolded pages)
-    const bladeBody = sections.map(s => `    @include('sections.${s}')`).join('\n');
+    // Write blade file (uses layouts.static — the DB-free layout for scaffolded pages).
+    //
+    // Inline each section's RENDERED HTML (not @include, and not the raw .blade.php source).
+    // Reasoning: @include shares a single source of truth with every other page using the
+    // partial — editing the heading on /test/lgc would silently propagate to every page.
+    // Copying the raw blade source preserves @php blocks and {{ $var }} interpolations,
+    // which couples the new page to the section file's $section variables — the new page
+    // is no longer self-contained, and editing it can break renders.
+    // So: shell out to bin/render-section.php (Laravel renderer) to bake each section into
+    // plain HTML with all variables resolved, then paste THAT into the new page. The
+    // BladeSourceAttributeProvider's precompiler will inject correct data-blade-src
+    // attributes pointing at this new page's own line numbers when it compiles.
+    const renderScript = path.join(localPath, 'bin', 'render-section.php');
+    const bladeParts = [];
+    for (const s of sections) {
+      try {
+        const { stdout } = await execFileP('php', [renderScript, `sections.${s}`], {
+          cwd: localPath,
+          maxBuffer: 4 * 1024 * 1024,
+          timeout: 30_000,
+        });
+        const html = stdout.replace(/\s+$/, '');
+        if (!html) throw new Error('renderer returned empty output');
+        bladeParts.push(`{{-- BEGIN section: ${s} --}}\n${html}\n{{-- END section: ${s} --}}`);
+      } catch (e) {
+        const msg = (e.stderr && String(e.stderr).trim()) || e.message || 'unknown render error';
+        logger.warn('Section render failed', { section: s, error: msg });
+        return res.status(500).json({ error: `failed to render section "${s}": ${msg}` });
+      }
+    }
+    const bladeBody = bladeParts.join('\n\n');
     const bladeContent = `@extends('layouts.static')
 
 @section('content')

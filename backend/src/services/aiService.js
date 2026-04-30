@@ -197,8 +197,8 @@ OUTPUT SHAPE C — error / no-op:
 DECISION RULES (when to pick which file):
 - Styling/visual changes (color, spacing, size, layout): prefer the CSS file that defines the clicked element's class rule.
 - Text, content, structure, image, move, add, delete: edit the Blade template.
-- Behavior/interaction: edit a JS file.
-- Only pick from files provided in CANDIDATE FILES headers.
+- Behavior/interaction (sliders, carousels, modals, tabs, accordions, lightboxes, AJAX, form validation): the markup goes in the Blade template AND the init code goes in a JS file. When a request needs both — e.g. "make these images a slick slider with text" — pick whichever file is the larger leverage point: usually the Blade (wrap markup with the right wrapper class), then mention in reasoning that a follow-up turn should add/update the JS init if no init code exists yet.
+- Only pick from files whose [type:] is blade, css, or js. Files with [type: example] are REFERENCE ONLY — they show how the project already uses a library (Slick / Swiper / Owl / Bootstrap carousel / etc.). Read them to learn the convention, copy class names + wrapper structure + init pattern, but NEVER set file_path to an example path.
 
 SHAPE A RULES (old_block / new_block):
 - old_block is copied character-for-character from the chosen file (whitespace, quotes, Blade directives, CSS syntax — all verbatim).
@@ -207,6 +207,15 @@ SHAPE A RULES (old_block / new_block):
 - Do NOT invent code not present in the files.
 - ADDING NEW CONTENT: find a nearby existing block; put those lines in old_block EXACTLY; put those same lines PLUS your new content in new_block.
 - If truly appending to the very end: old_block = last 2–5 non-empty lines verbatim; new_block = those same lines followed by your new content.
+
+MULTIPLE EDITS IN ONE PROMPT (very important — do not split into multiple turns):
+- Users often pack several changes into one request: "Replace this blog with this image, title 'Hello World', date '01 May 2021', description '…'", or "Change the heading to X, the button text to Y, and remove the subtitle".
+- When the changes are CO-LOCATED (same card / section / block at the click region), expand old_block to cover the WHOLE enclosing block (the entire blog card, the entire CTA, the entire section <div>), and emit a new_block where every requested change is applied at once. ONE shape-A response, all edits inside.
+- Do not return only the first change and ignore the rest. Do not return an error asking the user to split the request.
+- Concrete example — user clicked a blog card and asked: "Replace this blog with this image, title 'Hello world', date '01 May 2021', description 'foo bar'":
+  - old_block = the verbatim opening-to-closing markup of THAT card (image + title + date + description + button — every line that belongs to the card).
+  - new_block = the same skeleton with: <img> src swapped to the uploaded asset path, title text replaced with "Hello world", date text replaced with "01 May 2021", description text replaced with "foo bar". All four changes, one block.
+- If the changes truly span DIFFERENT, non-overlapping sections (rare): still pick the user's primary intent and edit that block; mention in the reasoning field that a follow-up turn is needed for the secondary section. Do not split into multiple JSON outputs — the runtime accepts only one.
 
 SHAPE B RULES (move op):
 - source_start, source_end, insert_before are EACH a SINGLE line copied character-for-character from the file.
@@ -217,7 +226,32 @@ SHAPE B RULES (move op):
 - If the block is already in the requested position: {"error":"already in that position"}.
 - NEVER fake a move with a comment like "<!-- MOVED -->" — the backend verifies anchors and will reject.
 
-AMBIGUITY: If the request is unclear or you can't identify the target, return {"error":"<why>"}.`;
+DESIGN INTENT — translate conversational layout requests to the right utility classes:
+- This codebase uses Bootstrap 5. When the user says something layout-related, prefer Bootstrap utilities over raw CSS overrides.
+- "X per row" / "X in a row" / "show X columns": adjust the responsive col-* classes on the children. With Bootstrap's 12-col grid, X items per row → col-{breakpoint}-{12÷X} (e.g. 3-per-row → col-md-4 col-sm-6 col-12). Add classes for breakpoints AT OR BELOW the user's current viewport so they actually see the change.
+- "gap between" / "margin between" / "spacing between": prefer g-{1..5} on the .row (Bootstrap row gutter) or gap-{1..5} on flex containers. Bootstrap spacing scale: 1=4px, 2=8px, 3=16px, 4=24px, 5=48px. For an exact pixel value not on the scale, add inline CSS gap or margin only on the parent — never raw padding on each child (that shrinks the content, not the gap).
+- "responsive" / "mobile-friendly" / "stack on mobile": use breakpoint-prefixed col-* (col-sm-, col-md-, col-lg-) instead of raw media queries.
+- "wider" / "narrower" / "smaller cards": adjust col-* widths or container max-width — not heights or paddings.
+- Don't add !important unless the user explicitly asks; it usually means you picked the wrong selector.
+
+BULK CHANGES — "all" / "every" / "each" means multiple elements need updating:
+- When the user says "all testimonials", "every card", "make each X look like…", they're describing a change that should apply to N matching elements, not just the one they clicked.
+- Prefer ONE of these tactics in priority order:
+  1. SHARED-SUBSTRING REPLACE — if every target element has an IDENTICAL opening tag (e.g. the same single-line opener appears 10 times), set old_block to JUST that line (no parent/row context) and new_block to the updated version. The backend.s string-replace replaces every occurrence in the file in one shot.
+  2. CSS RULE — pick the matching CSS file from the candidates and add a scoped rule like   .testimonials-sec .col-lg-4 { flex: 0 0 33.33%; max-width: 33.33%; }   . Use this when target elements have DIFFERENT inline classes (no single string matches all of them).
+- Do NOT include the parent .row or surrounding section markup in old_block when a bulk change is intended — that anchors the match to one location and silently ignores the other instances.
+- Reasoning field should explicitly state the tactic chosen and why. Example: "User said all testimonials — found 10 identical opening divs in the file, replacing the shared substring. Other variants (offset-lg-2 etc.) will need a follow-up."
+
+DEFAULT TO ACTING ON THE CLICK REGION:
+- The CLICK REGION below the user request is GROUND TRUTH for WHICH part of the page the user is talking about. Treat it as authoritative.
+- If the user's prompt is plausibly describing a change that could apply to the markup at or surrounding the marked line, JUST DO IT. Don't refuse for lack of section names — the click region IS the section name.
+- Example: user clicked inside an FAQ accordion's General tab and prompted "add a new FAQ" → add a new accordion item to the General tab's @foreach block (or the first accordion-item near the click), don't ask which tab.
+- Example: user clicked a testimonial card and prompted "make this red" → edit the styling of the card containing the marked line, don't ask which testimonial.
+
+AMBIGUITY (only when truly unsolvable): If, after reading the click region, you still cannot proceed, return {"error":"<why>"}.
+- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You clicked inside the .testimonials-slider near 'Steve' — did you want me to (a) add a new testimonial card after Steve's, or (b) change Steve's text? Please clarify."
+- DO NOT return generic errors like "ambiguous", "cannot determine", or "please clarify which element". Always reference WHAT you saw at the click region.
+- Phrase the error as a question (ends with "?") whenever you're asking the user to disambiguate between two reasonable interpretations — the UI styles questions differently from hard errors.`;
   }
 
   // Shared with warmEditCache — both callers must produce IDENTICAL bytes for cache hits.
@@ -263,7 +297,7 @@ AMBIGUITY: If the request is unclear or you can't identify the target, return {"
   // onToken (optional): callback invoked with each text delta as Claude streams the response —
   //                     hook this to socket emission for live UI feedback.
   // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
-  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null }) {
+  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null, iframeViewport = null }) {
     logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
 
     let editInstruction = prompt;
@@ -281,6 +315,11 @@ AMBIGUITY: If the request is unclear or you can't identify the target, return {"
     const clickAnchor = clickCandidate?.clickAnchor;
     const clickLine = clickCandidate?.clickLine;
     const clickRegion = clickCandidate?.clickRegion;
+    // The frontend reads data-blade-src="<path>:<line>" from the clicked DOM element —
+    // an authoritative pointer to the source file the click came from.
+    const clickedFilePath = (selectedElement?.bladeSrc && selectedElement.bladeSrc.includes(':'))
+      ? selectedElement.bladeSrc.substring(0, selectedElement.bladeSrc.lastIndexOf(':'))
+      : null;
     const elInfo = selectedElement ? `
 SELECTED ELEMENT (what the user clicked):
 - tag: <${selectedElement.tag || '?'}>
@@ -289,7 +328,9 @@ SELECTED ELEMENT (what the user clicked):
 - inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
 - is image: ${selectedElement.isImage ? 'yes' : 'no'}${clickLine ? `
 - click landed at line ${clickLine} of the file (use the CLICK REGION below to identify the exact instance when the same markup repeats)` : ''}${clickAnchor ? `
-- click-landed on this exact line: ${JSON.stringify(clickAnchor.substring(0, 200))}` : ''}` : '';
+- click-landed on this exact line: ${JSON.stringify(clickAnchor.substring(0, 200))}` : ''}${clickedFilePath ? `
+- EDIT TARGET FILE: ${clickedFilePath} (this is the file the click came from — set file_path to this value unless the request is purely a CSS-rule change, in which case pick the matching CSS file from the candidates)` : ''}${iframeViewport?.width ? `
+- viewport at edit time: ${iframeViewport.width}×${iframeViewport.height || '?'}px (Bootstrap breakpoint: ${iframeViewport.breakpoint || '?'}). When the user describes a layout change ("3 per row", "responsive", "wider"), pick utility classes that engage AT OR BELOW this breakpoint — don't only target larger breakpoints the user can't see` : ''}` : '';
 
     // The click region is a numbered ~30-line window centred on the click point.
     // It's the unambiguous disambiguator when a page has multiple identical-looking
@@ -346,12 +387,19 @@ Return ONLY valid JSON.`;
 
       if (result?.error) return { mode: 'skip', reason: result.error };
 
-      // Infer file_path if Claude forgot to include it: look for a candidate whose content
-      // contains the old_block (or the move anchors) verbatim.
+      // Infer file_path if Claude forgot to include it: look for candidates whose content
+      // contains the old_block (or move anchors). When multiple candidates match, prefer
+      // the one the user clicked in (from data-blade-src).
       const inferFilePath = (needle) => {
         if (!needle) return null;
         const hits = candidates.filter(c => c.content && c.content.includes(needle));
+        if (hits.length === 0) return null;
         if (hits.length === 1) return hits[0].path;
+        // Tie-break: the user clicked in this specific file — prefer it over any other match
+        if (clickedFilePath) {
+          const preferred = hits.find(h => h.path === clickedFilePath);
+          if (preferred) return preferred.path;
+        }
         return null;
       };
 

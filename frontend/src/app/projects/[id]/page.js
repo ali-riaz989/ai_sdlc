@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
@@ -78,15 +78,12 @@ export default function ProjectPreview() {
   function clearHighlight() {
     setHighlightRect(null);
     try {
-      const el = iframeRef.current?._highlightedEl;
-      const styles = iframeRef.current?._highlightStyles;
-      if (el && styles) {
-        for (const key of Object.keys(styles)) {
-          el.style[key] = '';
-        }
-        iframeRef.current._highlightedEl = null;
-        iframeRef.current._highlightStyles = null;
-      }
+      const doc = iframeRef.current?.contentDocument;
+      const ovId = iframeRef.current?._selectionOverlayId || '__lgc_select_overlay__';
+      const ov = doc?.getElementById(ovId);
+      if (ov) ov.remove();
+      iframeRef.current._highlightedEl = null;
+      iframeRef.current._selectionOverlayId = null;
     } catch {}
   }
 
@@ -101,6 +98,59 @@ export default function ProjectPreview() {
   // can read the latest file list when snapshotting into chat history.
   const filesRef = useRef([]);
   useEffect(() => { filesRef.current = files; }, [files]);
+
+  // Rotating "thinking" status word, à la Claude Code. Cycles every ~2.4s while a
+  // request is in flight; a small Claude-mark logo dances next to it.
+  const STATUS_WORDS = useMemo(() => [
+    'Thinking', 'Generating', 'Noodling', 'Cooking', 'Sussing', 'Pondering',
+    'Booping', 'Mulling', 'Musing', 'Moseying', 'Deciphering', 'Churning',
+    'Accomplishing', 'Incubating', 'Envisioning', 'Imagining', 'Determining',
+    'Clauding', 'Brewing', 'Whirring', 'Meandering', 'Wrangling', 'Calculating',
+    'Spinning', 'Synthesizing', 'Percolating', 'Contemplating', 'Creating',
+    'Deliberating', 'Tinkering', 'Plotting', 'Reasoning', 'Hatching',
+  ], []);
+  const [statusWord, setStatusWord] = useState(STATUS_WORDS[0]);
+  // "In flight" covers the whole edit lifecycle, not just the brief HTTP submit window.
+  // While the backend is processing (pending → analyzing → generating_code → pending_review),
+  // the dancing-Claude indicator keeps rotating through fun verbs.
+  const isInFlight = submitting || (result && !['review', 'failed', 'rejected'].includes(result.status));
+  useEffect(() => {
+    if (!isInFlight) return;
+    let lastIdx = -1;
+    let timer;
+    // Random interval per cycle — feels less mechanical than a metronome and gives
+    // the impression of variable work being done (some thoughts come fast, some
+    // take longer). Range: 0.8s – 3.2s.
+    const tick = () => {
+      let i = Math.floor(Math.random() * STATUS_WORDS.length);
+      if (i === lastIdx) i = (i + 1) % STATUS_WORDS.length;
+      lastIdx = i;
+      setStatusWord(STATUS_WORDS[i]);
+      const nextDelay = 800 + Math.floor(Math.random() * 2400);
+      timer = setTimeout(tick, nextDelay);
+    };
+    tick();
+    return () => clearTimeout(timer);
+  }, [isInFlight, STATUS_WORDS]);
+
+  // Per-message expand/collapse state for file_change diff bubbles + per-request
+  // revert tracking so the button knows whether it was already used.
+  const [expandedDiffs, setExpandedDiffs] = useState(() => new Set());
+  const [revertedRequests, setRevertedRequests] = useState(() => new Set());
+  function toggleDiffExpanded(msgId) {
+    setExpandedDiffs(prev => { const next = new Set(prev); next.has(msgId) ? next.delete(msgId) : next.add(msgId); return next; });
+  }
+  async function revertChangeRequest(reqId) {
+    if (!reqId || revertedRequests.has(reqId)) return;
+    try {
+      await apiClient.restoreChangeRequest(reqId);
+      setRevertedRequests(prev => { const next = new Set(prev); next.add(reqId); return next; });
+      reloadIframe();
+      addChat('ai', `Reverted change ${reqId.substring(0, 8)} — files restored to their pre-edit state.`, 'success');
+    } catch (err) {
+      addChat('ai', `Couldn't revert: ${err.response?.data?.error || err.message}`, 'error');
+    }
+  }
 
   // Dedup failure messages: socket and polling can both fire 'failed' for the same request.
   const handledFailuresRef = useRef(new Set());
@@ -235,37 +285,91 @@ export default function ProjectPreview() {
       try { return iframeRef.current?.contentDocument; } catch { return null; }
     };
 
+    // ── Overlay-based highlight ─────────────────────────────────────────────
+    // Drawing rings on the element itself collides with host CSS and parent
+    // overflow:hidden. Instead, paint a separate div positioned OVER the element.
+    //
+    // Implementation choices:
+    //  - position: fixed + viewport coords from getBoundingClientRect — bulletproof
+    //    against `transform` on any ancestor (which would break position:absolute).
+    //  - Appended to documentElement, not body — dodges any body-level overflow:hidden
+    //    or unusual sizing the host page set up.
+    //  - z-index 2147483647 (max int) so host CSS can't paint over it.
+    //  - One reused node; we track which element it's currently following in `pinnedEl`,
+    //    and a scroll/resize listener keeps it glued to that element while it moves.
+    const OVERLAY_ID = '__lgc_select_overlay__';
+    let pinnedEl = null;          // the element the overlay is currently tracking
+
+    const ensureOverlay = (color) => {
+      const doc = getDoc();
+      if (!doc || !doc.documentElement) return null;
+      let ov = doc.getElementById(OVERLAY_ID);
+      if (!ov) {
+        ov = doc.createElement('div');
+        ov.id = OVERLAY_ID;
+        ov.style.cssText =
+          'position:fixed;pointer-events:none;box-sizing:border-box;' +
+          'z-index:2147483647;display:block;background:transparent;' +
+          'transition:top 0.1s linear,left 0.1s linear,width 0.1s linear,height 0.1s linear;';
+        doc.documentElement.appendChild(ov);
+      }
+      ov.style.border = `3px solid ${color}`;
+      ov.style.display = 'block';
+      return ov;
+    };
+
+    const positionOverlay = (ov, el) => {
+      if (!ov || !el || !el.getBoundingClientRect) return;
+      const rect = el.getBoundingClientRect();
+      // position:fixed → viewport coords directly, no scroll math
+      ov.style.top = rect.top + 'px';
+      ov.style.left = rect.left + 'px';
+      ov.style.width = rect.width + 'px';
+      ov.style.height = rect.height + 'px';
+      try {
+        const cs = el.ownerDocument.defaultView.getComputedStyle(el);
+        ov.style.borderRadius = cs.borderRadius || '0';
+      } catch { ov.style.borderRadius = '0'; }
+    };
+
+    const removeOverlay = () => {
+      const doc = getDoc();
+      if (!doc) return;
+      const ov = doc.getElementById(OVERLAY_ID);
+      if (ov) ov.remove();
+      pinnedEl = null;
+    };
+
+    // Keep the overlay glued to the pinned element as the iframe scrolls/resizes
+    const reposition = () => {
+      if (!pinnedEl) return;
+      const doc = getDoc();
+      const ov = doc?.getElementById(OVERLAY_ID);
+      if (!ov) return;
+      // If the element is gone or detached, drop the overlay
+      if (!doc.contains(pinnedEl)) { removeOverlay(); return; }
+      positionOverlay(ov, pinnedEl);
+    };
+
     const onMouseOver = (e) => {
       const el = e.target;
-      if (el === hoveredEl) return;
-      // Remove previous hover
-      if (hoveredEl) {
-        hoveredEl.style.outline = '';
-        hoveredEl.style.outlineOffset = '';
-        hoveredEl.style.cursor = '';
-      }
-      // Don't highlight tiny inline elements — find a meaningful parent
+      // Walk up from tiny inline tags to a meaningful parent
       let target = el;
       const smallTags = new Set(['SPAN', 'A', 'STRONG', 'EM', 'B', 'I', 'BR', 'IMG']);
       while (target && smallTags.has(target.tagName) && target.parentElement) {
         target = target.parentElement;
       }
-      target.style.outline = '3px dotted #dc2626';
-      target.style.outlineOffset = '3px';
-      target.style.boxShadow = '0 0 0 6px rgba(220, 38, 38, 0.25)';
+      if (target === hoveredEl) return;
       target.style.cursor = 'pointer';
       hoveredEl = target;
+      pinnedEl = target;
+      const ov = ensureOverlay('#16a34a');  // green ring on hover
+      positionOverlay(ov, target);
     };
 
-    const onMouseOut = (e) => {
-      if (hoveredEl) {
-        hoveredEl.style.outline = '';
-        hoveredEl.style.outlineOffset = '';
-        hoveredEl.style.boxShadow = '';
-        hoveredEl.style.cursor = '';
-        hoveredEl = null;
-      }
-    };
+    // Note: deliberately no mouseout hide — bubbling mouseout between child nodes
+    // would flicker the overlay. The next mouseover repositions; on selectMode exit
+    // (cleanup return) we tear down the overlay entirely.
 
     const onClick = (e) => {
       e.preventDefault();
@@ -382,6 +486,20 @@ export default function ProjectPreview() {
         }
       } catch { /* cross-origin etc. */ }
 
+      // Read the data-blade-src="<file>:<line>" attribute injected by the LGC project's
+      // Blade compiler. This is the AUTHORITATIVE source location — no text matching needed.
+      // Walk up if the clicked node itself doesn't carry one (rare; covers JS-injected nodes).
+      let bladeSrc = null;
+      {
+        let cursor = el;
+        const docRoot = el.ownerDocument?.documentElement;
+        while (cursor && cursor !== docRoot) {
+          const v = cursor.getAttribute && cursor.getAttribute('data-blade-src');
+          if (v) { bladeSrc = v; break; }
+          cursor = cursor.parentElement;
+        }
+      }
+
       // Get element info
       const info = {
         tag: el.tagName.toLowerCase(),
@@ -392,6 +510,7 @@ export default function ProjectPreview() {
         src: el.tagName === 'IMG' ? el.src?.substring(0, 200) : null,
         occurrenceIndex, // 0-based: when N peers share the same tag+text, this is which one was clicked
         occurrenceCount,
+        bladeSrc,        // "<relative path>:<line>" — set by Blade compiler attribute injection
       };
 
       setSelectedElement(info);
@@ -405,54 +524,101 @@ export default function ProjectPreview() {
         : info.text
         ? `"${info.text.substring(0, 50)}${info.text.length > 50 ? '...' : ''}" in "${info.section}"`
         : `a ${info.tag} element in "${info.section}"`;
+      // Detect clicks that land in a shared LAYOUT file (header / footer / sidebar / etc.)
+      // Editing those affects every page that extends the layout — warn explicitly.
+      const isInLayout = bladeSrc && /\/(layouts|partials)\//.test(bladeSrc);
+      const layoutFile = isInLayout ? bladeSrc.split(':')[0] : null;
       addChat('ai', `Selected: ${elDesc}. What would you like to do? (change text, update style, replace image, etc.)`, 'text');
+      if (isInLayout) {
+        addChat(
+          'ai',
+          `Heads up — this element is in the shared layout "${layoutFile}". Any edit will affect EVERY page that uses this layout, not just the current one. If you only want to change this page, click on a page-specific element (the page's main content area) instead.`,
+          'question'
+        );
+      }
 
-      // Highlight the selected element — bold red to stand out
-      const selectedStyles = {
-        outline: '4px dotted #dc2626',
-        outlineOffset: '4px',
-        boxShadow: '0 0 0 8px rgba(220, 38, 38, 0.3), 0 0 24px rgba(220, 38, 38, 0.4)',
-        background: 'rgba(220, 38, 38, 0.08)'
-      };
-      Object.assign(el.style, selectedStyles);
+      // Selected state: swap the existing hover overlay from green to red and pin its
+      // position over the SELECTED element (which may differ from hoveredEl after the
+      // image-drill-down). Update pinnedEl so the scroll/resize listener tracks the
+      // selected element, not the previously hovered wrapper.
+      pinnedEl = el;
+      const ov = ensureOverlay('#dc2626');
+      positionOverlay(ov, el);
       iframeRef.current._highlightedEl = el;
-      iframeRef.current._highlightStyles = selectedStyles;
+      iframeRef.current._selectionOverlayId = OVERLAY_ID;
 
-      // Clean hover listeners
+      // Clean hover listeners (selection complete — no more hover tracking needed).
+      // Scroll/resize listeners stay attached until the useEffect cleanup; they'll keep
+      // the red overlay pinned to the selected element if the iframe scrolls.
       const doc = getDoc();
       if (doc) {
         doc.removeEventListener('mouseover', onMouseOver);
-        doc.removeEventListener('mouseout', onMouseOut);
         doc.removeEventListener('click', onClick, true);
       }
     };
 
     const doc = getDoc();
+    const win = doc?.defaultView;
     if (doc) {
       doc.addEventListener('mouseover', onMouseOver);
-      doc.addEventListener('mouseout', onMouseOut);
       doc.addEventListener('click', onClick, true);
-
+      win?.addEventListener('scroll', reposition, true);
+      win?.addEventListener('resize', reposition);
       // Change cursor for the whole iframe
       doc.body.style.cursor = 'crosshair';
     }
 
     return () => {
       const doc = getDoc();
+      const win = doc?.defaultView;
       if (doc) {
         doc.removeEventListener('mouseover', onMouseOver);
-        doc.removeEventListener('mouseout', onMouseOut);
         doc.removeEventListener('click', onClick, true);
         doc.body.style.cursor = '';
       }
-      if (hoveredEl) {
-        hoveredEl.style.outline = '';
-        hoveredEl.style.outlineOffset = '';
-        hoveredEl.style.boxShadow = '';
-        hoveredEl.style.cursor = '';
-      }
+      win?.removeEventListener('scroll', reposition, true);
+      win?.removeEventListener('resize', reposition);
+      if (hoveredEl) hoveredEl.style.removeProperty('cursor');
+      // If selection happened, the click handler stored _highlightedEl and pinned the
+      // red overlay — leave that overlay in place so the red ring stays visible.
+      // Otherwise (user toggled select-mode off without picking anything), tear it down.
+      if (!iframeRef.current?._highlightedEl) removeOverlay();
     };
   }, [selectMode]);
+
+  // Keep the red "selected" overlay glued to the chosen element while it exists.
+  // Runs independently of selectMode — the moment a selection is committed (click
+  // handler sets selectedElement + _highlightedEl), this effect attaches scroll
+  // and resize listeners on the iframe window so the overlay tracks the element
+  // as the user scrolls. Tears down when the selection clears.
+  useEffect(() => {
+    if (!selectedElement || !iframeRef.current) return;
+    const doc = (() => { try { return iframeRef.current?.contentDocument; } catch { return null; } })();
+    const win = doc?.defaultView;
+    if (!doc || !win) return;
+
+    const OVERLAY_ID = '__lgc_select_overlay__';
+    const reposition = () => {
+      const el = iframeRef.current?._highlightedEl;
+      const ov = doc.getElementById(OVERLAY_ID);
+      if (!el || !ov) return;
+      // Element was detached from DOM (e.g. iframe re-rendered) — drop the overlay.
+      if (!doc.contains(el)) { ov.remove(); return; }
+      const rect = el.getBoundingClientRect();
+      ov.style.top = rect.top + 'px';
+      ov.style.left = rect.left + 'px';
+      ov.style.width = rect.width + 'px';
+      ov.style.height = rect.height + 'px';
+    };
+    // Initial reposition in case the iframe scrolled before this effect ran.
+    reposition();
+    win.addEventListener('scroll', reposition, true);
+    win.addEventListener('resize', reposition);
+    return () => {
+      win.removeEventListener('scroll', reposition, true);
+      win.removeEventListener('resize', reposition);
+    };
+  }, [selectedElement]);
 
   // Poll iframe URL — catches navigation on same-origin, onLoad handles cross-origin
   useEffect(() => {
@@ -525,39 +691,9 @@ export default function ProjectPreview() {
     iframeRef.current.src = base + '?_t=' + Date.now();
   }
 
-  async function applyChange() {
-    if (!result?.id) return;
-    addChat('user', 'Accept changes');
-    try {
-      await apiClient.applyChangeRequest(result.id);
-      setPendingDiff(null);
-      setStreamingTokens('');
-      setResult(prev => ({ ...prev, status: 'review', message: 'Changes accepted' }));
-      setLastAppliedId(result.id);
-      setActivePrompt(null);
-      addChat('ai', 'Changes accepted! You can continue editing or push to your branch.', 'success');
-    } catch (err) {
-      setResult(prev => ({ ...prev, status: 'failed', message: err.response?.data?.error || 'Apply failed' }));
-      addChat('ai', 'Failed to apply: ' + (err.response?.data?.error || 'Unknown error'), 'error');
-    }
-  }
-
-  async function rejectChange() {
-    if (!result?.id) return;
-    addChat('user', 'Reject changes');
-    try {
-      await apiClient.rejectChangeRequest(result.id);
-      setPendingDiff(null);
-      setStreamingTokens('');
-      setActivePrompt(null);
-      setResult({ status: 'rejected', message: 'Reverted to original' });
-      reloadIframe();
-      addChat('ai', 'Reverted to original. Tell me what to change instead.', 'text');
-      setTimeout(() => setResult(null), 3000);
-    } catch (err) {
-      alert(err.response?.data?.error || 'Reject failed');
-    }
-  }
+  // applyChange / rejectChange were the manual Accept/Reject handlers — removed
+  // because edits now auto-accept on pending_review and undo happens via the
+  // per-message Revert button (see revertChangeRequest above).
 
   async function handleRestore() {
     if (!lastAppliedId) return;
@@ -689,16 +825,10 @@ export default function ProjectPreview() {
     addChat('user', submittedPrompt);
 
     try {
-      // ── Auto-accept any pending review before submitting new prompt ────
-      // If the user was happy enough to keep iterating, treat the previous
-      // preview as accepted rather than throwing it away.
-      if (result?.id && result?.status === 'pending_review') {
-        try {
-          await apiClient.applyChangeRequest(result.id);
-          setLastAppliedId(result.id);
-          setPendingDiff(null);
-        } catch {}
-      }
+      // Edits now auto-accept the moment they reach pending_review (see socket /
+      // poll handlers). No need to nudge a stuck preview into review here — by
+      // the time the next prompt arrives, the previous one is already at 'review'
+      // OR has its file_change bubble in chat with a Revert button.
 
       // ── Intercept undo/revert prompts — use DB restore / git reset instead of AI ────
       const trimmed = submittedPrompt.trim();
@@ -767,6 +897,25 @@ export default function ProjectPreview() {
       // Pass full chat history to AI for complete context
       const conversationContext = chatMessages.map(m => ({ role: m.role, text: m.text }));
 
+      // Capture iframe viewport so Claude can pick the right Bootstrap breakpoint when
+      // the user says "3 per row" / "responsive" / etc. Cross-origin guard kept narrow.
+      let iframeViewport = null;
+      try {
+        const cw = iframeRef.current?.contentWindow;
+        const w = cw?.innerWidth;
+        const h = cw?.innerHeight;
+        if (typeof w === 'number' && typeof h === 'number') {
+          // Map width to a Bootstrap-5 breakpoint label so the hint is concrete in the prompt
+          let bp = 'xs';
+          if (w >= 1400) bp = 'xxl';
+          else if (w >= 1200) bp = 'xl';
+          else if (w >= 992) bp = 'lg';
+          else if (w >= 768) bp = 'md';
+          else if (w >= 576) bp = 'sm';
+          iframeViewport = { width: w, height: h, breakpoint: bp };
+        }
+      } catch { /* cross-origin — leave null */ }
+
       const res = await apiClient.createChangeRequest({
         project_id: id,
         title: submittedPrompt.substring(0, 100),
@@ -777,6 +926,7 @@ export default function ProjectPreview() {
         conversation: conversationContext,
         selected_element: selectedElement || null,
         resolved_blade_file: bladeByUrl[livePageUrl] || null,
+        iframe_viewport: iframeViewport,
         ...(submittedImage && {
           image_base64: submittedImage.base64,
           image_media_type: submittedImage.mediaType
@@ -806,16 +956,22 @@ export default function ProjectPreview() {
         if (update.status === 'pending_review') {
           let parsed = null;
           try { parsed = JSON.parse(update.message); } catch {}
-          if (parsed) setPendingDiff(parsed);
-          // Snapshot the in-flight file list + diffs into chat history so the bubble
-          // sticks in the thread even after accept/reject or a follow-up prompt.
+          // Snapshot the file list + diffs into chat history. Each bubble has its
+          // own Revert button, which is now the only way to undo a change.
           const snapshot = filesRef.current.map(f => ({ ...f, status: f.status === 'generating' ? 'done' : f.status }));
           if (snapshot.length) {
-            addChat('ai', '', 'file_change', { files: snapshot, diffs: parsed?.diff || [] });
+            addChat('ai', '', 'file_change', { files: snapshot, diffs: parsed?.diff || [], requestId: cr.id });
             setFiles([]);
           }
           reloadIframe(); // show the live preview immediately
           setStreamingTokens('');
+          // Auto-accept: skip the manual Accept/Reject step entirely. The change
+          // moves straight to 'review'. If the user wants to undo, they click
+          // Revert on the file_change bubble.
+          setPendingDiff(null);
+          apiClient.applyChangeRequest(cr.id).then(() => {
+            setLastAppliedId(cr.id);
+          }).catch(() => { /* still good — bubble's Revert remains usable */ });
         }
         if (update.status === 'rejected' || update.status === 'failed') {
           setPendingDiff(null);
@@ -852,15 +1008,19 @@ export default function ProjectPreview() {
           clearInterval(pollInterval);
           if (s === 'pending_review') {
             setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Preview ready' }));
-            setPendingDiff({ diff: [] });
             // Fallback snapshot via polling path, in case the socket update didn't fire
             const snap = filesRef.current.map(f => ({ ...f, status: f.status === 'generating' ? 'done' : f.status }));
             if (snap.length) {
-              addChat('ai', '', 'file_change', { files: snap, diffs: [] });
+              addChat('ai', '', 'file_change', { files: snap, diffs: [], requestId: cr.id });
               setFiles([]);
             }
             reloadIframe();
             setStreamingTokens('');
+            // Auto-accept (mirror of the socket path)
+            setPendingDiff(null);
+            apiClient.applyChangeRequest(cr.id).then(() => {
+              setLastAppliedId(cr.id);
+            }).catch(() => {});
           } else if (s === 'review') {
             setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Done' }));
             reloadIframe();
@@ -917,79 +1077,95 @@ export default function ProjectPreview() {
 
       <div className="flex flex-1 overflow-hidden">
 
-        <aside className="w-[420px] flex-shrink-0 flex flex-col border-r-2 border-stone-300" style={{ background: 'linear-gradient(180deg, #f0ece7 0%, #e8e4df 100%)' }}>
+        <aside className="w-[420px] flex-shrink-0 flex flex-col bg-white border-r border-gray-200">
 
           {/* Sidebar header — scoped to the chat column only */}
-          <header className="bg-white border-b border-stone-200 px-3 py-2 flex-shrink-0 space-y-1.5">
+          <header className="bg-white border-b border-gray-200 px-3 py-2 flex-shrink-0 space-y-1">
             <div className="flex items-center justify-between gap-2 min-w-0">
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <button onClick={() => router.push('/')} title="Back" className="text-gray-400 hover:text-gray-700 text-base leading-none flex-shrink-0">←</button>
-                <span className="font-semibold text-gray-900 truncate">{project.display_name}</span>
-                <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium flex-shrink-0">Live</span>
+                <span className="font-medium text-gray-900 truncate text-[13px]">{project.display_name}</span>
+                <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 border border-emerald-100">Live</span>
               </div>
-              <div className="flex items-center gap-1 flex-shrink-0">
+              <div className="flex items-center gap-0.5 flex-shrink-0">
                 <button onClick={openNewPage} title="Create a new page from sections"
-                  className="text-[11px] px-2 py-1 bg-emerald-50 text-emerald-700 rounded hover:bg-emerald-100 font-semibold">+ Page</button>
+                  className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">+ Page</button>
                 <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
                   title="Refresh preview"
-                  className="text-[11px] px-2 py-1 bg-gray-100 rounded hover:bg-gray-200 text-gray-600">↻</button>
+                  className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↻</button>
                 <button onClick={() => { clearHighlight(); setSelectMode(v => !v); }}
-                  className={`text-[11px] px-2 py-1 rounded transition-colors ${selectMode ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                  title={selectMode ? 'Cancel select' : 'Select an element'}
+                  className={`text-[11px] px-2 py-1 rounded-md transition-colors ${selectMode ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100'}`}>
                   {selectMode ? '✓ Selecting' : '⊹ Select'}
                 </button>
                 {result?.status === 'review' && lastAppliedId && (
-                  <button onClick={handleRestore} title="Undo last change" className="text-[11px] px-2 py-1 bg-orange-100 text-orange-700 rounded hover:bg-orange-200">↩</button>
+                  <button onClick={handleRestore} title="Undo last change" className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↩</button>
                 )}
               </div>
             </div>
-            {project.project_url && (
-              <a href={project.project_url} target="_blank" rel="noopener noreferrer"
-                className="block text-[10px] text-blue-600 hover:underline font-mono truncate" title={project.project_url}>
-                {project.project_url}
-              </a>
-            )}
+            {/* Project URL display removed per request — title + Live badge are enough. */}
           </header>
 
 
-          <div className={`flex-1 px-4 py-4 space-y-2 ${chatMessages.length > 0 || submitting || files.length > 0 ? 'overflow-y-auto' : 'overflow-hidden'}`} style={{ scrollbarWidth: 'thin' }}>
+          <div className={`flex-1 px-4 py-5 space-y-5 bg-white ${chatMessages.length > 0 || submitting || files.length > 0 ? 'overflow-y-auto' : 'overflow-hidden'}`} style={{ scrollbarWidth: 'thin' }}>
             {chatMessages.length === 0 && !submitting && (
               <div className="h-full flex items-center justify-center text-center">
-                <div className="text-stone-500 text-xs max-w-[240px] leading-relaxed">
-                  Click <span className="font-semibold text-stone-700">Select</span> on the top bar, pick an element in the preview, then describe the change below.
+                <div className="text-gray-500 text-xs max-w-[240px] leading-relaxed">
+                  Click <span className="font-medium text-gray-700">Select</span> on the top bar, pick an element in the preview, then describe the change below.
                 </div>
               </div>
             )}
             {chatMessages.map(msg => {
               if (msg.type === 'file_change' && msg.data) {
+                const isExpanded = expandedDiffs.has(msg.id);
+                const reqId = msg.data.requestId;
+                const isReverted = reqId && revertedRequests.has(reqId);
+                const hasAnyDiff = (msg.data.diffs || []).some(d => d.old_block || d.new_block);
+                if (isReverted) {
+                  // Compact "Restored" card — match Google AI Studio's restored-snapshot look,
+                  // with darker borders + text so it reads as a definite state change.
+                  return (
+                    <div key={msg.id} className="rounded-xl border border-gray-400 bg-gray-50 px-3 py-2 text-xs text-gray-800">
+                      <div className="flex items-center gap-1.5 font-semibold text-gray-900">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                        Restored
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-gray-700 font-mono">{msg.data.files.map(f => f.file).join(', ')}</div>
+                    </div>
+                  );
+                }
                 return (
-                  <div key={msg.id} className="flex items-start gap-2">
-                    <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold mt-0.5" style={{ background: '#2d6a4f' }}>AI</div>
-                    <div className="flex-1 min-w-0 bg-white text-stone-800 rounded-2xl rounded-tl-sm px-3 py-2 space-y-2 shadow-sm border border-stone-200">
-                      <div className="text-[10px] font-semibold uppercase tracking-wider text-stone-500">Files changed</div>
+                  <div key={msg.id} className="rounded-xl border border-gray-400 bg-white">
+                    <div className="px-3 py-2 border-b border-gray-200 flex items-center gap-1.5">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-500"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                      <span className="text-[12px] font-medium text-gray-800 flex-1">Edited {msg.data.files.length} file{msg.data.files.length === 1 ? '' : 's'}</span>
+                      {hasAnyDiff && (
+                        <button type="button" onClick={() => toggleDiffExpanded(msg.id)}
+                          className="text-[11px] text-gray-500 hover:text-gray-800 px-1.5 py-0.5 rounded hover:bg-gray-100 transition-colors">
+                          {isExpanded ? 'Hide diff' : 'Show diff'}
+                        </button>
+                      )}
+                    </div>
+                    <div className="px-3 py-2 space-y-1.5">
                       {msg.data.files.map(f => {
                         const diff = (msg.data.diffs || []).find(d => d.file_path === f.file);
                         return (
                           <div key={f.file} className="space-y-1.5">
                             <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-[12px] font-mono text-gray-800 truncate flex-1" title={f.file}>{f.file}</span>
                               {f.status === 'failed'
-                                ? <div className="w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
-                                : <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 flex-shrink-0" />}
-                              <span className="text-[11px] font-mono text-stone-700 truncate flex-1" title={f.file}>{f.file}</span>
-                              <span className={`text-[9px] px-1.5 py-0.5 rounded uppercase tracking-wider font-semibold flex-shrink-0 ${
-                                f.change_type === 'create' ? 'bg-emerald-100 text-emerald-700 border border-emerald-200' :
-                                f.change_type === 'delete' ? 'bg-red-100 text-red-700 border border-red-200' :
-                                'bg-blue-100 text-blue-700 border border-blue-200'
-                              }`}>{f.change_type}</span>
+                                ? <span className="text-red-500 flex-shrink-0" title="Failed">✗</span>
+                                : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-emerald-600 flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>}
                             </div>
-                            {diff && (diff.old_block || diff.new_block) && (
-                              <div className="rounded-lg overflow-hidden border border-stone-200 bg-stone-50 text-[10.5px] font-mono leading-relaxed">
+                            {isExpanded && diff && (diff.old_block || diff.new_block) && (
+                              <div className="rounded-md overflow-hidden border border-gray-300 bg-gray-50 text-[10.5px] font-mono leading-relaxed">
                                 {diff.old_block && (
-                                  <pre className="px-2 py-1 bg-red-50 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">
+                                  <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">
 {diff.old_block.split('\n').slice(0, 8).map(l => '- ' + l).join('\n')}{diff.old_block.split('\n').length > 8 ? '\n…' : ''}
                                   </pre>
                                 )}
                                 {diff.new_block && (
-                                  <pre className="px-2 py-1 bg-emerald-50 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">
+                                  <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">
 {diff.new_block.split('\n').slice(0, 8).map(l => '+ ' + l).join('\n')}{diff.new_block.split('\n').length > 8 ? '\n…' : ''}
                                   </pre>
                                 )}
@@ -999,96 +1175,90 @@ export default function ProjectPreview() {
                         );
                       })}
                     </div>
+                    {reqId && (
+                      <div className="px-3 py-2 border-t border-gray-200 flex items-center justify-between">
+                        <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
+                          Checkpoint
+                        </div>
+                        <button type="button" onClick={() => revertChangeRequest(reqId)}
+                          title="Restore files to before this change"
+                          className="flex items-center gap-1 text-[11px] text-gray-700 hover:text-gray-900 px-2 py-1 rounded-md border border-gray-400 hover:bg-gray-50 transition-colors">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                          Restore
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
               }
               return (
-                <div key={msg.id} className={`flex items-start gap-2 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                  {msg.role === 'ai' && (
-                    <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold mt-0.5" style={{ background: '#2d6a4f' }}>AI</div>
-                  )}
-                  <div className={`max-w-[80%] text-sm px-3 py-2 rounded-2xl ${
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                  <div className={`max-w-[88%] text-[13px] leading-relaxed ${
                     msg.role === 'user'
-                      ? 'rounded-br-sm text-white shadow-sm'
+                      ? 'rounded-2xl rounded-br-sm bg-gray-200 text-gray-900 px-3.5 py-2'
                       : msg.type === 'error'
-                      ? 'bg-red-50 text-red-700 border border-red-200'
+                      ? 'rounded-xl bg-red-50 text-red-800 border border-red-300 px-3 py-2 font-medium'
                       : msg.type === 'question'
-                      ? 'bg-blue-50 text-blue-900 border border-blue-200'
+                      ? 'rounded-xl bg-blue-50 text-blue-900 border border-blue-300 px-3 py-2 font-medium'
                       : msg.type === 'success'
-                      ? 'bg-green-50 text-green-700 border border-green-200'
+                      ? 'rounded-xl bg-gray-50 text-gray-900 border border-gray-400 px-3 py-2 font-medium'
                       : msg.type === 'confirm'
-                      ? 'bg-amber-50 text-amber-800 border border-amber-200'
-                      : 'bg-white text-black border border-stone-200'
-                  }`} style={msg.role === 'user' ? { background: 'linear-gradient(135deg, #2d6a4f, #40916c)' } : {}}>
+                      ? 'rounded-xl bg-amber-50 text-amber-900 border border-amber-300 px-3 py-2 font-medium'
+                      : 'text-gray-900 whitespace-pre-wrap'
+                  }`}>
                     {msg.text}
                   </div>
                 </div>
               );
             })}
             {files.length > 0 && (
-              <div className="flex items-start gap-2">
-                <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold mt-0.5" style={{ background: '#2d6a4f' }}>AI</div>
-                <div className="flex-1 min-w-0 bg-white text-stone-800 rounded-2xl rounded-tl-sm px-3 py-2 space-y-2 shadow-sm border border-stone-200">
-                  <div className="text-[10px] font-semibold uppercase tracking-wider text-stone-500">Files changed</div>
-                  {files.map(f => {
-                    const diff = pendingDiff?.diff?.find(d => d.file_path === f.file);
-                    return (
-                      <div key={f.file} className="space-y-1.5">
-                        <div className="flex items-center gap-2 min-w-0">
-                          {f.status === 'generating'
-                            ? <div className="w-2.5 h-2.5 border border-amber-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
-                            : f.status === 'failed'
-                            ? <div className="w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
-                            : <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 flex-shrink-0" />}
-                          <span className="text-[11px] font-mono text-stone-700 truncate flex-1" title={f.file}>{f.file}</span>
-                          <span className={`text-[9px] px-1.5 py-0.5 rounded uppercase tracking-wider font-semibold flex-shrink-0 ${
-                            f.change_type === 'create' ? 'bg-emerald-100 text-emerald-700 border border-emerald-200' :
-                            f.change_type === 'delete' ? 'bg-red-100 text-red-700 border border-red-200' :
-                            'bg-blue-100 text-blue-700 border border-blue-200'
-                          }`}>{f.change_type}</span>
-                        </div>
-                        {diff && (diff.old_block || diff.new_block) && (
-                          <div className="rounded-lg overflow-hidden border border-stone-200 bg-stone-50 text-[10.5px] font-mono leading-relaxed">
-                            {diff.old_block && (
-                              <pre className="px-2 py-1 bg-red-50 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">
-{diff.old_block.split('\n').slice(0, 8).map(l => '- ' + l).join('\n')}{diff.old_block.split('\n').length > 8 ? '\n…' : ''}
-                              </pre>
-                            )}
-                            {diff.new_block && (
-                              <pre className="px-2 py-1 bg-emerald-50 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">
-{diff.new_block.split('\n').slice(0, 8).map(l => '+ ' + l).join('\n')}{diff.new_block.split('\n').length > 8 ? '\n…' : ''}
-                              </pre>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+              <div className="rounded-xl border border-gray-200 bg-white">
+                <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-1.5">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-500"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                  <span className="text-[12px] font-medium text-gray-800 flex-1">Editing {files.length} file{files.length === 1 ? '' : 's'}</span>
+                </div>
+                <div className="px-3 py-2 space-y-1">
+                  {files.map(f => (
+                    <div key={f.file} className="flex items-center gap-2 min-w-0">
+                      <span className="text-[12px] font-mono text-gray-800 truncate flex-1" title={f.file}>{f.file}</span>
+                      {f.status === 'generating'
+                        ? <div className="w-3 h-3 border border-gray-400 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+                        : f.status === 'failed'
+                        ? <span className="text-red-500 flex-shrink-0">✗</span>
+                        : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-emerald-600 flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
-            {submitting && (
-              <div className="flex items-start gap-2">
-                <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-white text-[10px] font-bold" style={{ background: '#2d6a4f' }}>AI</div>
-                <div className="flex items-center gap-1.5 px-3 py-2 bg-white border border-stone-200 rounded-2xl">
-                  <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <div className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                </div>
+            {isInFlight && (
+              <div className="flex items-center gap-2 text-gray-700 text-[13px]">
+                {/* Claude-mark "dancing" while in flight. The 4-pointed star outline echoes
+                    Anthropic's brand mark; rotation+pulse keyframes live in globals.css. */}
+                <span className="animate-claude-dance" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-orange-500">
+                    <path d="M12 1.5 L13.6 9.4 L21.5 11 L13.6 12.6 L12 20.5 L10.4 12.6 L2.5 11 L10.4 9.4 Z"/>
+                  </svg>
+                </span>
+                {/* key forces re-mount on word change so the fade-in keyframe fires every cycle */}
+                <span key={statusWord} className="animate-word-fade text-gray-700">{statusWord}…</span>
               </div>
             )}
             <div ref={chatEndRef} />
           </div>
 
-          <div className="border-t border-stone-300 px-3 pt-3 pb-3 space-y-2.5 relative" style={{ background: 'linear-gradient(135deg, #e8e4df 0%, #f0ece7 40%, #e8e4df 100%)' }}>
+          <div className="border-t border-gray-200 px-3 pt-3 pb-3 space-y-2.5 relative bg-white">
 
-            {result && (
-              <div className="flex items-center gap-2 text-xs bg-white border border-stone-200 rounded-xl px-3 py-1.5">
-                {!['review', 'failed', 'rejected', 'pending_review'].includes(result.status) && (
-                  <div className="w-2.5 h-2.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
-                )}
+            {/* In-flight statuses (Queued / Processing… / Editing… / Generating code) are
+                represented by the dancing-Claude indicator INSIDE the chat thread —
+                no separate pill above the input. Only failures/rejections need a pill
+                here; the success "Ready for review" / "Preview ready" state is implicit
+                (the file_change bubble in the thread already announces the change). */}
+            {result && ['failed', 'rejected'].includes(result.status) && (
+              <div className="flex items-center gap-2 text-xs bg-white border border-gray-200 rounded-xl px-3 py-1.5">
                 <span className={`${STATUS_COLORS[result.status] || 'text-gray-500'} flex-shrink-0 font-medium`}>{STATUS_LABELS[result.status] || result.status}</span>
-                {result.message && result.status !== 'review' && <span className="text-gray-400 truncate">{result.message}</span>}
+                {result.message && <span className="text-gray-400 truncate">{result.message}</span>}
               </div>
             )}
 
@@ -1098,32 +1268,27 @@ export default function ProjectPreview() {
               </div>
             )}
 
-            {pendingDiff && (
-              <div className="bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 flex items-center gap-2">
-                <span className="text-xs text-blue-700 flex-1">Preview applied. Accept or reject.</span>
-                <button onClick={rejectChange} className="px-2.5 py-1 text-[11px] font-medium bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50">Reject</button>
-                <button onClick={applyChange} className="px-2.5 py-1 text-[11px] font-medium bg-green-600 text-white rounded-lg hover:bg-green-700">Accept</button>
-              </div>
-            )}
+            {/* Edits auto-accept now — manual Accept/Reject removed. Use the per-bubble Revert
+                button on the file_change message to undo a specific change. */}
 
             {historyOpen && (
               <>
                 <div className="fixed inset-0" style={{ zIndex: 25 }} onClick={() => setHistoryOpen(false)} />
-                <div className="absolute bottom-full mb-2 left-3 right-3 bg-white border border-gray-200 rounded-xl shadow-2xl animate-slideUp" style={{ zIndex: 30 }}>
-                  <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100 bg-gray-50 rounded-t-xl">
-                    <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Prompt History</span>
+                <div className="absolute bottom-full mb-2 left-3 right-3 bg-white border border-gray-200 rounded-xl shadow-lg" style={{ zIndex: 30 }}>
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
+                    <span className="text-[11px] font-medium text-gray-600">Prompt history</span>
                     <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(false); }}
-                      className="w-5 h-5 flex items-center justify-center rounded-full text-gray-400 hover:bg-gray-200 hover:text-gray-700 text-xs">×</button>
+                      className="w-5 h-5 flex items-center justify-center rounded-full text-gray-400 hover:bg-gray-100 hover:text-gray-700 text-xs">×</button>
                   </div>
                   <div className="overflow-y-auto" style={{ maxHeight: '280px' }}>
                     {history.length === 0 ? (
                       <p className="text-center text-gray-400 text-xs py-6">No changes yet</p>
                     ) : (
-                      <ul className="divide-y divide-gray-50">
+                      <ul className="divide-y divide-gray-100">
                         {history.map(cr => (
-                          <li key={cr.id} className="px-3 py-2.5 hover:bg-blue-50 cursor-pointer transition-colors"
+                          <li key={cr.id} className="px-3 py-2.5 hover:bg-gray-50 cursor-pointer transition-colors"
                             onClick={() => { setPrompt(cr.prompt); setHistoryOpen(false); }}>
-                            <p className="text-xs text-gray-700 leading-snug line-clamp-2">{cr.prompt}</p>
+                            <p className="text-xs text-gray-800 leading-snug line-clamp-2">{cr.prompt}</p>
                             <span className="text-[10px] text-gray-400 mt-0.5 block">
                               {formatDistanceToNow(new Date(cr.created_at), { addSuffix: true })}
                             </span>
@@ -1139,88 +1304,86 @@ export default function ProjectPreview() {
             {(imageLoading || image) && (
               <div className="flex items-center gap-2">
                 {imageLoading && (
-                  <div className="h-12 w-16 rounded-xl border-2 border-stone-300 bg-stone-100 flex items-center justify-center shadow">
-                    <div className="w-4 h-4 border-2 border-stone-400 border-t-transparent rounded-full animate-spin" />
+                  <div className="h-12 w-16 rounded-lg border border-gray-200 bg-gray-50 flex items-center justify-center">
+                    <div className="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
                   </div>
                 )}
                 {image && !imageLoading && (
                   <div className="relative">
-                    <img src={image.preview} alt="Screenshot" className="h-12 rounded-xl border-2 border-stone-300 object-cover shadow" />
+                    <img src={image.preview} alt="Screenshot" className="h-12 rounded-lg border border-gray-200 object-cover" />
                     <button type="button" onClick={() => setImage(null)}
-                      className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-stone-700 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-500 shadow">×</button>
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-gray-700 text-white rounded-full text-xs flex items-center justify-center hover:bg-red-500">×</button>
                   </div>
                 )}
               </div>
             )}
 
-            <form onSubmit={handleSubmit}>
-              <input type="text" value={prompt}
-                onChange={e => setPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }}
-                onPaste={handlePaste}
-                placeholder="Describe your design change..."
-                disabled={submitting}
-                className="w-full px-4 py-3 bg-white border-2 border-stone-300 rounded-2xl text-sm text-black shadow-inner focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 disabled:opacity-50 transition-all placeholder:text-stone-400"
-              />
-            </form>
-
-            <div className="flex items-center gap-2">
-              <div className="flex items-center gap-px rounded-xl border-2 border-stone-300 flex-shrink-0 p-0.5" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }}>
+            {/* Input — Google AI Studio style: clean white card with the textarea on top
+                and a single icon row below (history, attach, current-page chip, send). */}
+            {/* Prompt box — always rendered with the prominent "selected" treatment so
+                it reads as the primary action target even before focus. Neutral gray, not jet-black. */}
+            <div className="rounded-2xl border-2 border-gray-300 bg-white shadow-sm focus-within:border-gray-500 focus-within:shadow-md transition-all">
+              <form onSubmit={handleSubmit}>
+                <textarea value={prompt}
+                  onChange={e => setPrompt(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+                      e.preventDefault();
+                      handleSubmit(e);
+                    }
+                  }}
+                  onPaste={handlePaste}
+                  placeholder="Make changes, add new features, ask for anything"
+                  disabled={submitting}
+                  rows={2}
+                  className="w-full px-3.5 pt-3 pb-1 bg-transparent text-[13px] text-gray-900 placeholder:text-gray-400 focus:outline-none disabled:opacity-50 resize-none min-h-[44px] max-h-[200px] leading-snug"
+                />
+              </form>
+              <div className="flex items-center gap-1 px-2 pb-2">
                 <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
                   title="Prompt history"
-                  className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors ${historyOpen ? 'bg-emerald-100 text-emerald-700' : 'text-stone-600 hover:bg-white/60'}`}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  className={`w-8 h-8 flex items-center justify-center rounded-full transition-colors ${historyOpen ? 'bg-gray-100 text-gray-800' : 'text-gray-500 hover:bg-gray-100'}`}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                   </svg>
-                  {history.length > 0 && <span className="bg-stone-400 text-white text-[10px] px-1 rounded-full font-bold">{history.length}</span>}
                 </button>
-                <div className="w-px h-4 bg-stone-300" />
                 <input ref={fileInputRef} type="file" accept="image/*" className="hidden"
                   onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
                 <button type="button" onClick={() => fileInputRef.current?.click()}
-                  title="Upload screenshot"
-                  className="px-2 py-1.5 rounded-lg text-xs text-stone-600 hover:bg-white/60 transition-colors">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                  title="Attach screenshot"
+                  className="w-8 h-8 flex items-center justify-center rounded-full text-gray-500 hover:bg-gray-100 transition-colors">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                   </svg>
                 </button>
+                {/* Current-page chip removed — the URL was visual noise inside the input. */}
+                <div className="flex-1" />
+                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
+                  title="Send"
+                  className={`w-8 h-8 flex items-center justify-center rounded-full transition-all ${submitting || imageLoading || prompt.trim().length < 3 ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-gray-900 text-white hover:bg-gray-700'}`}>
+                  {submitting
+                    ? <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>}
+                </button>
               </div>
-
-              {currentPageUrl && (
-                <div className="flex-1 min-w-0 flex items-center gap-1.5 rounded-xl border-2 border-stone-300 px-2 py-1.5 overflow-hidden" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }} title={currentPageUrl}>
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-stone-500 flex-shrink-0">
-                    <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-                  </svg>
-                  <span className="text-[10px] text-stone-600 truncate font-medium">{currentPageUrl.replace(project.project_url, '') || '/'}</span>
-                </div>
-              )}
-
-              <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
-                className="h-9 px-4 text-white text-xs font-semibold rounded-xl disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg flex items-center gap-1.5 ml-auto flex-shrink-0"
-                style={{ background: submitting ? '#5a8a7a' : 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-                {submitting ? '...' : 'Send'}
-              </button>
             </div>
 
-            <div className="flex items-center justify-between pt-2 border-t border-stone-300/50">
-              <div className="flex items-center gap-1.5">
+            {/* Bottom controls — minimal, no borders */}
+            <div className="flex items-center justify-between pt-1.5">
+              <div className="flex items-center gap-2">
                 {chatMessages.length > 0 && (
-                  <button onClick={clearChat} className="text-[10px] px-2 py-1 text-stone-500 hover:text-stone-700 transition-colors">New chat</button>
-                )}
-                {result?.status === 'review' && lastAppliedId && (
-                  <button onClick={handleRestore} className="text-[10px] px-2 py-1 text-amber-700 bg-amber-50 border border-amber-200 rounded-md hover:bg-amber-100 transition-colors font-medium">Undo last</button>
+                  <button onClick={clearChat} className="text-[11px] text-gray-500 hover:text-gray-800 transition-colors">New chat</button>
                 )}
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 <button type="button" onClick={handleReset} disabled={resetting}
-                  className="text-[10px] px-2 py-1 border-2 border-stone-300 text-stone-600 rounded-lg hover:bg-white hover:border-red-300 hover:text-red-600 transition-colors disabled:opacity-50 font-medium" style={{ background: 'linear-gradient(180deg, #f5f0eb, #ebe5de)' }}>
-                  {resetting ? '...' : 'Reset'}
+                  className="text-[11px] text-gray-500 hover:text-red-600 transition-colors disabled:opacity-50">
+                  {resetting ? 'Resetting…' : 'Reset all'}
                 </button>
+                <span className="text-gray-300">·</span>
                 <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
-                  className="text-[10px] px-2 py-1 text-white rounded-lg transition-all font-semibold shadow-sm hover:shadow-md"
-                  style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
-                  Push
+                  className="text-[11px] font-medium text-gray-700 hover:text-gray-900 transition-colors">
+                  Push to {project.repo_branch}
                 </button>
               </div>
             </div>
