@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS projects (
     db_port INTEGER DEFAULT 3306,
     db_name VARCHAR(100),
     db_user VARCHAR(100),
+    db_password VARCHAR(200),
+    db_type VARCHAR(20),
+    project_url VARCHAR(500),
+    setup_error TEXT,
     status VARCHAR(50) DEFAULT 'active',
     last_synced_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
@@ -42,6 +46,7 @@ CREATE TABLE IF NOT EXISTS change_requests (
     category VARCHAR(50) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
     priority VARCHAR(20) DEFAULT 'medium',
+    error_message TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -106,7 +111,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     user_id INTEGER,
     action VARCHAR(100) NOT NULL,
     entity_type VARCHAR(50),
-    entity_id UUID,
+    entity_id TEXT,
     old_value JSONB,
     new_value JSONB,
     ip_address INET,

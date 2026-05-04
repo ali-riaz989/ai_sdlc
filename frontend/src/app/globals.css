@@ -32,3 +32,27 @@ body {
 .animate-slideUp {
   animation: slideUp 0.2s ease-out;
 }
+
+/* "Dancing" Claude-mark animation for the in-flight status indicator —
+   gentle rotation + pulse so it feels alive without being noisy. */
+@keyframes claudeDance {
+  0%, 100% { transform: rotate(0deg) scale(1); }
+  20%      { transform: rotate(18deg) scale(1.1); }
+  40%      { transform: rotate(0deg)   scale(1.18); }
+  60%      { transform: rotate(-18deg) scale(1.1); }
+  80%      { transform: rotate(0deg)   scale(1.06); }
+}
+.animate-claude-dance {
+  animation: claudeDance 1.4s ease-in-out infinite;
+  transform-origin: center;
+  display: inline-block;
+}
+
+/* Crossfade word swap — a simple opacity pulse on key change */
+@keyframes wordFade {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-word-fade {
+  animation: wordFade 0.35s ease-out;
+}

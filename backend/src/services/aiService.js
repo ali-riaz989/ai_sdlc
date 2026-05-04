@@ -3,8 +3,15 @@ const logger = require('../utils/logger');
 
 class AIService {
   constructor() {
-    this.client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    this.client = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      timeout: 60000,    // hard cap per request (ms) — prevents the SDK from sitting forever on a half-open socket
+      maxRetries: 3,     // retry transient network/5xx failures with exponential backoff
+    });
     this.model = 'claude-sonnet-4-5';
+    // Surgical find-and-replace edits don't need Sonnet's depth — Haiku 4.5 returns
+    // ~3-5x faster on the same task with no quality regression for these patterns.
+    this.editModel = 'claude-haiku-4-5';
   }
 
   // ─── Step 1: Fast classifier (<2 s) ────────────────────────────────────────
@@ -58,76 +65,61 @@ class AIService {
     }
   }
 
-  // ─── Identify which section the user wants to edit ─────────────────────────
-  // Returns { section_heading, line_start, line_end, preview, confidence }
-  async identifySection(prompt, fileContent, filePath, imageData = null) {
-    logger.info('Identifying section', { prompt: prompt.substring(0, 80) });
 
-    const numberedContent = fileContent.split('\n').map((line, i) => `${i + 1}| ${line}`).join('\n');
+  // ─── Execute edit — old_block/new_block like Claude Code ────────────────
+  // AI receives the RAW SOURCE CODE of the section and returns exact text replacement
+  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null, language = 'blade', conversation = null) {
+    logger.info('Executing edit', { file: filePath, language, hasConversation: !!(conversation?.length) });
 
-    const textBlock = {
-      type: 'text',
-      text: `The user wants to make this change: "${prompt}"
-
-File: ${filePath}
-${numberedContent}
-
-Which section of this file is the user referring to? Return ONLY valid JSON:
-{
-  "section_heading": "the heading or name of the section",
-  "line_start": 100,
-  "line_end": 150,
-  "preview": "first 2-3 lines of the section content (raw, no line numbers)",
-  "confidence": "high" or "medium" or "low",
-  "explanation": "brief explanation of why this section matches"
-}`
-    };
-
-    const userContent = imageData
-      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
-      : [textBlock];
-
-    try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 500,
-        system: 'You identify which section of an HTML/Blade file a user is referring to. Return ONLY valid JSON.',
-        messages: [{ role: 'user', content: userContent }]
-      });
-      return this._extractJSON(response.content[0].text);
-    } catch (error) {
-      logger.error('Section identification failed', { error: error.message });
-      return null;
-    }
-  }
-
-  // ─── Generate edit for a confirmed section ─────────────────────────────────
-  // Takes the identified section lines and makes the edit
-  async generateSectionEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null) {
-    logger.info('Generating section edit', { file: filePath });
-
-    let fullPrompt = prompt;
+    let editInstruction = prompt;
     if (savedImageUrl) {
       const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
-      fullPrompt += `\n\nIMPORTANT: The user uploaded an image saved at: ${savedImageUrl}\nYou MUST set the img src to exactly: ${assetPath}\nDo NOT use any Cloudinary or external URL.`;
+      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
     }
+
+    // Thread full chat history so the AI can interpret corrections and follow-ups
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references like "change it to", "make that bigger"):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
+
+    const languageDesc = language === 'css'
+      ? { name: 'CSS', sourceDesc: 'RAW CSS source (selectors, declarations, media queries)', extras: '- Preserve selector syntax exactly (. # : pseudo-classes, nesting)\n- Keep units, !important, vendor prefixes intact' }
+      : { name: 'Laravel Blade', sourceDesc: 'RAW SOURCE CODE (Blade PHP) — NOT rendered HTML. This includes @include, @foreach, {{ }}, and other Blade directives', extras: '- Do NOT convert Blade syntax to plain HTML' };
+
+    const systemPrompt = `You are a code editor like Claude Code or Cursor. You edit ${languageDesc.name} source files.
+
+You receive a section of ${languageDesc.sourceDesc}.
+
+Your job: find the exact lines to change and return a precise find-and-replace.
+
+THINKING PROCESS:
+1. UNDERSTAND what the user wants to change
+2. FIND the exact lines in the source code that need changing
+3. COPY those lines EXACTLY as they appear (character-for-character, including whitespace and syntax)
+4. WRITE the replacement with ONLY the requested change
+
+OUTPUT: Return ONLY valid JSON:
+{"old_block":"exact verbatim lines from the source code","new_block":"the replacement lines","reasoning":"what was changed"}
+
+CRITICAL RULES:
+- old_block must be COPIED character-for-character from the provided source — including spaces, tabs, newlines, syntax
+- Include 1-2 surrounding lines in old_block so it matches uniquely
+- new_block changes ONLY what the user asked — everything else stays identical
+- Do NOT invent code that isn't in the source
+${languageDesc.extras}
+- If the text contains special characters like smart quotes, copy them exactly
+- If ambiguous: {"error":"Need more specific instruction"}`;
 
     const textBlock = {
       type: 'text',
-      text: `User request: "${fullPrompt}"
+      text: `USER REQUEST: "${editInstruction}"${conversationNote}
 
-Here is the section to edit:
-\`\`\`blade
+SOURCE CODE of the section (this is raw ${languageDesc.name}):
 ${sectionContent}
-\`\`\`
 
-Return ONLY valid JSON with the exact block to replace:
-{"old_block":"verbatim text from the section above","new_block":"replacement text"}
-
-Rules:
-- old_block must be character-for-character identical to text in the section
-- Include 2-3 surrounding lines for uniqueness
-- new_block changes ONLY what the user asked`
+Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
     };
 
     const userContent = imageData
@@ -138,17 +130,307 @@ Rules:
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 4096,
-        system: 'You are an AI code editor. Make precise surgical edits. Return ONLY valid JSON: {"old_block":"...","new_block":"..."}',
+        system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
       });
-      const result = this._extractJSON(response.content[0].text);
-      if (result?.old_block !== undefined && result?.new_block !== undefined) {
-        return { mode: 'replace', old_block: result.old_block, new_block: result.new_block };
+      let result;
+      try {
+        result = this._extractJSON(response.content[0].text);
+      } catch (jsonErr) {
+        logger.warn('AI returned invalid JSON in executeEdit', { response: response.content[0].text.substring(0, 500) });
+        return { mode: 'skip' };
       }
+
+      if (result?.error) {
+        logger.warn('AI reported ambiguity', { error: result.error });
+        return { mode: 'skip', reason: result.error };
+      }
+
+      if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        logger.info('Edit ready', { reasoning: result.reasoning, old_preview: result.old_block.substring(0, 80) });
+        return { mode: 'replace', old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
+      }
+
+      logger.warn('AI returned unexpected shape', { keys: Object.keys(result || {}) });
       return { mode: 'skip' };
     } catch (error) {
-      logger.error('Section edit failed', { error: error.message });
-      throw error;
+      logger.error('Edit execution failed', { error: error.message });
+      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
+        ? 'Rate limit reached — wait a moment and try again'
+        : error.message?.includes('Connection')
+        ? 'API connection error — try again in a moment'
+        : 'AI service error: ' + (error.message || 'unknown');
+      return { mode: 'skip', reason };
+    }
+  }
+
+  // ── Static system prompt for the edit path. Hoisted so warmEditCache can use the
+  //    exact same bytes — cache hits depend on byte-identical prefixes.
+  get _editSystemPrompt() {
+    return `You are a code editor, like Claude Code or Cursor, operating on a website codebase.
+
+You receive:
+- Metadata about the element the user clicked in the browser
+- The user's request (and prior chat history)
+- One or more CANDIDATE FILES (Blade PHP, CSS, JS, etc.). For blade files you usually receive the FULL file so you can work across sections if the request requires it.
+
+FIRST: figure out what the user is actually asking for. Examples of intents:
+- "change text / color / style / size" → in-place edit of the element or its CSS rule
+- "move / shift / relocate / reorder / swap / place X above-or-below Y" → structural MOVE of a block of markup within the blade file
+- "add a new section / append X / create Y" → additive edit (new content)
+- "replace this image" → image src swap in the blade
+- "delete / remove X" → removal edit
+
+The user will NOT always spell the intent out literally. Infer it from the phrasing and from the SELECTED ELEMENT context. Do NOT keyword-match — understand the request.
+
+Then pick ONE of these two output shapes, whichever fits the request. Return ONLY valid JSON.
+
+OUTPUT SHAPE A — in-place find-and-replace (default for edits, additions, image swaps, deletions):
+{"file_path":"<exact path from a FILE header>","old_block":"<exact verbatim lines from that file>","new_block":"<replacement lines>","reasoning":"<short>"}
+
+OUTPUT SHAPE B — structural move (use ONLY when the user wants to relocate a block of markup):
+{"file_path":"<exact path from a FILE header>","move":{"source_start":"<verbatim first line of the block to MOVE>","source_end":"<verbatim last line of the block to MOVE>","insert_before":"<verbatim first line of where the block should land>"},"reasoning":"<short>"}
+
+OUTPUT SHAPE C — error / no-op:
+{"error":"<why>"}
+
+DECISION RULES (when to pick which file):
+- Styling/visual changes (color, spacing, size, layout): prefer the CSS file that defines the clicked element's class rule.
+- Text, content, structure, image, move, add, delete: edit the Blade template.
+- Behavior/interaction (sliders, carousels, modals, tabs, accordions, lightboxes, AJAX, form validation): the markup goes in the Blade template AND the init code goes in a JS file. When a request needs both — e.g. "make these images a slick slider with text" — pick whichever file is the larger leverage point: usually the Blade (wrap markup with the right wrapper class), then mention in reasoning that a follow-up turn should add/update the JS init if no init code exists yet.
+- Only pick from files whose [type:] is blade, css, or js. Files with [type: example] are REFERENCE ONLY — they show how the project already uses a library (Slick / Swiper / Owl / Bootstrap carousel / etc.). Read them to learn the convention, copy class names + wrapper structure + init pattern, but NEVER set file_path to an example path.
+
+SHAPE A RULES (old_block / new_block):
+- old_block is copied character-for-character from the chosen file (whitespace, quotes, Blade directives, CSS syntax — all verbatim).
+- Include 1-2 surrounding lines so the match is unique.
+- new_block changes ONLY what the user asked for.
+- Do NOT invent code not present in the files.
+- ADDING NEW CONTENT: find a nearby existing block; put those lines in old_block EXACTLY; put those same lines PLUS your new content in new_block.
+- If truly appending to the very end: old_block = last 2–5 non-empty lines verbatim; new_block = those same lines followed by your new content.
+
+MULTIPLE EDITS IN ONE PROMPT (very important — do not split into multiple turns):
+- Users often pack several changes into one request: "Replace this blog with this image, title 'Hello World', date '01 May 2021', description '…'", or "Change the heading to X, the button text to Y, and remove the subtitle".
+- When the changes are CO-LOCATED (same card / section / block at the click region), expand old_block to cover the WHOLE enclosing block (the entire blog card, the entire CTA, the entire section <div>), and emit a new_block where every requested change is applied at once. ONE shape-A response, all edits inside.
+- Do not return only the first change and ignore the rest. Do not return an error asking the user to split the request.
+- Concrete example — user clicked a blog card and asked: "Replace this blog with this image, title 'Hello world', date '01 May 2021', description 'foo bar'":
+  - old_block = the verbatim opening-to-closing markup of THAT card (image + title + date + description + button — every line that belongs to the card).
+  - new_block = the same skeleton with: <img> src swapped to the uploaded asset path, title text replaced with "Hello world", date text replaced with "01 May 2021", description text replaced with "foo bar". All four changes, one block.
+- If the changes truly span DIFFERENT, non-overlapping sections (rare): still pick the user's primary intent and edit that block; mention in the reasoning field that a follow-up turn is needed for the secondary section. Do not split into multiple JSON outputs — the runtime accepts only one.
+
+SHAPE B RULES (move op):
+- source_start, source_end, insert_before are EACH a SINGLE line copied character-for-character from the file.
+- Each must be unique enough to identify the position — prefer opening <section class="..."> tags, HTML comment markers, or other lines that appear exactly once. Avoid generic lines like "</div>".
+- source_start and source_end bracket the block to relocate (inclusive on both ends).
+- insert_before is the first line of the destination; the moved block is placed IMMEDIATELY BEFORE that line.
+- "move X below Y" / "after Y" → set insert_before to the line AFTER Y's closing tag (usually the next section's opening tag).
+- If the block is already in the requested position: {"error":"already in that position"}.
+- NEVER fake a move with a comment like "<!-- MOVED -->" — the backend verifies anchors and will reject.
+
+DESIGN INTENT — translate conversational layout requests to the right utility classes:
+- This codebase uses Bootstrap 5. When the user says something layout-related, prefer Bootstrap utilities over raw CSS overrides.
+- "X per row" / "X in a row" / "show X columns": adjust the responsive col-* classes on the children. With Bootstrap's 12-col grid, X items per row → col-{breakpoint}-{12÷X} (e.g. 3-per-row → col-md-4 col-sm-6 col-12). Add classes for breakpoints AT OR BELOW the user's current viewport so they actually see the change.
+- "gap between" / "margin between" / "spacing between": prefer g-{1..5} on the .row (Bootstrap row gutter) or gap-{1..5} on flex containers. Bootstrap spacing scale: 1=4px, 2=8px, 3=16px, 4=24px, 5=48px. For an exact pixel value not on the scale, add inline CSS gap or margin only on the parent — never raw padding on each child (that shrinks the content, not the gap).
+- "responsive" / "mobile-friendly" / "stack on mobile": use breakpoint-prefixed col-* (col-sm-, col-md-, col-lg-) instead of raw media queries.
+- "wider" / "narrower" / "smaller cards": adjust col-* widths or container max-width — not heights or paddings.
+- Don't add !important unless the user explicitly asks; it usually means you picked the wrong selector.
+
+BULK CHANGES — "all" / "every" / "each" means multiple elements need updating:
+- When the user says "all testimonials", "every card", "make each X look like…", they're describing a change that should apply to N matching elements, not just the one they clicked.
+- Prefer ONE of these tactics in priority order:
+  1. SHARED-SUBSTRING REPLACE — if every target element has an IDENTICAL opening tag (e.g. the same single-line opener appears 10 times), set old_block to JUST that line (no parent/row context) and new_block to the updated version. The backend.s string-replace replaces every occurrence in the file in one shot.
+  2. CSS RULE — pick the matching CSS file from the candidates and add a scoped rule like   .testimonials-sec .col-lg-4 { flex: 0 0 33.33%; max-width: 33.33%; }   . Use this when target elements have DIFFERENT inline classes (no single string matches all of them).
+- Do NOT include the parent .row or surrounding section markup in old_block when a bulk change is intended — that anchors the match to one location and silently ignores the other instances.
+- Reasoning field should explicitly state the tactic chosen and why. Example: "User said all testimonials — found 10 identical opening divs in the file, replacing the shared substring. Other variants (offset-lg-2 etc.) will need a follow-up."
+
+DEFAULT TO ACTING ON THE CLICK REGION:
+- The CLICK REGION below the user request is GROUND TRUTH for WHICH part of the page the user is talking about. Treat it as authoritative.
+- If the user's prompt is plausibly describing a change that could apply to the markup at or surrounding the marked line, JUST DO IT. Don't refuse for lack of section names — the click region IS the section name.
+- Example: user clicked inside an FAQ accordion's General tab and prompted "add a new FAQ" → add a new accordion item to the General tab's @foreach block (or the first accordion-item near the click), don't ask which tab.
+- Example: user clicked a testimonial card and prompted "make this red" → edit the styling of the card containing the marked line, don't ask which testimonial.
+
+AMBIGUITY (only when truly unsolvable): If, after reading the click region, you still cannot proceed, return {"error":"<why>"}.
+- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You clicked inside the .testimonials-slider near 'Steve' — did you want me to (a) add a new testimonial card after Steve's, or (b) change Steve's text? Please clarify."
+- DO NOT return generic errors like "ambiguous", "cannot determine", or "please clarify which element". Always reference WHAT you saw at the click region.
+- Phrase the error as a question (ends with "?") whenever you're asking the user to disambiguate between two reasonable interpretations — the UI styles questions differently from hard errors.`;
+  }
+
+  // Shared with warmEditCache — both callers must produce IDENTICAL bytes for cache hits.
+  _buildFilesBlock(candidates) {
+    return candidates.map(c =>
+      `\n===== FILE: ${c.path}  [type: ${c.type}] =====\n${c.content}\n===== END FILE: ${c.path} =====\n`
+    ).join('\n');
+  }
+
+  // ── Pre-warm the prompt cache for an upcoming edit. Called when the iframe lands on a
+  //    new URL — by the time the user types a prompt, Anthropic has the system+files
+  //    prefix cached, so the visible edit is the warm path (~2s) instead of cold (~4s).
+  //    Fire-and-forget; failures are non-fatal.
+  async warmEditCache({ candidates }) {
+    if (!candidates?.length) return;
+    const filesContext = `CANDIDATE FILES:${this._buildFilesBlock(candidates)}`;
+    try {
+      const t0 = Date.now();
+      const response = await this.client.messages.create({
+        model: this.editModel,
+        max_tokens: 8,    // tiny output — we only care about populating the cache
+        system: [{ type: 'text', text: this._editSystemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: filesContext, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: 'ack' },
+        ]}]
+      });
+      const u = response.usage || {};
+      logger.info('Cache warmed', {
+        ms: Date.now() - t0,
+        files: candidates.map(c => c.path).join(','),
+        input: u.input_tokens,
+        cache_read: u.cache_read_input_tokens || 0,
+        cache_create: u.cache_creation_input_tokens || 0,
+      });
+    } catch (e) {
+      logger.warn('Cache warm failed', { error: e.message });
+    }
+  }
+
+  // ─── Claude-Code-style edit: AI picks which file to edit from multiple candidates ───
+  // candidates: [{ path, content, type }]  (e.g. blade, css, js)
+  // onToken (optional): callback invoked with each text delta as Claude streams the response —
+  //                     hook this to socket emission for live UI feedback.
+  // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
+  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null, iframeViewport = null }) {
+    logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
+
+    let editInstruction = prompt;
+    if (savedImageUrl) {
+      const assetPath = `{{ asset('${savedImageUrl.substring(1)}') }}`;
+      editInstruction += `\n\nThe user uploaded an image saved at: ${savedImageUrl}\nFor image src use exactly: ${assetPath}`;
+    }
+    let conversationNote = '';
+    if (conversation?.length) {
+      conversationNote = '\n\nPREVIOUS CONVERSATION (earlier → later; use to resolve references):\n' +
+        conversation.map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`).join('\n') + '\n';
+    }
+
+    const clickCandidate = candidates.find(c => c.clickAnchor || c.clickRegion);
+    const clickAnchor = clickCandidate?.clickAnchor;
+    const clickLine = clickCandidate?.clickLine;
+    const clickRegion = clickCandidate?.clickRegion;
+    // The frontend reads data-blade-src="<path>:<line>" from the clicked DOM element —
+    // an authoritative pointer to the source file the click came from.
+    const clickedFilePath = (selectedElement?.bladeSrc && selectedElement.bladeSrc.includes(':'))
+      ? selectedElement.bladeSrc.substring(0, selectedElement.bladeSrc.lastIndexOf(':'))
+      : null;
+    const elInfo = selectedElement ? `
+SELECTED ELEMENT (what the user clicked):
+- tag: <${selectedElement.tag || '?'}>
+- classes: "${selectedElement.classes || ''}"
+- heading/section: "${selectedElement.section || ''}"
+- inner text (preview): "${(selectedElement.text || '').substring(0, 100)}"
+- is image: ${selectedElement.isImage ? 'yes' : 'no'}${clickLine ? `
+- click landed at line ${clickLine} of the file (use the CLICK REGION below to identify the exact instance when the same markup repeats)` : ''}${clickAnchor ? `
+- click-landed on this exact line: ${JSON.stringify(clickAnchor.substring(0, 200))}` : ''}${clickedFilePath ? `
+- EDIT TARGET FILE: ${clickedFilePath} (this is the file the click came from — set file_path to this value unless the request is purely a CSS-rule change, in which case pick the matching CSS file from the candidates)` : ''}${iframeViewport?.width ? `
+- viewport at edit time: ${iframeViewport.width}×${iframeViewport.height || '?'}px (Bootstrap breakpoint: ${iframeViewport.breakpoint || '?'}). When the user describes a layout change ("3 per row", "responsive", "wider"), pick utility classes that engage AT OR BELOW this breakpoint — don't only target larger breakpoints the user can't see` : ''}` : '';
+
+    // The click region is a numbered ~30-line window centred on the click point.
+    // It's the unambiguous disambiguator when a page has multiple identical-looking
+    // blocks (e.g. several testimonial cards). Tell Claude explicitly to use this
+    // window to find WHICH instance to edit, then copy the verbatim text from
+    // CANDIDATE FILES (which has no line numbers) into old_block.
+    const clickRegionBlock = clickRegion ? `
+CLICK REGION (line numbers shown for reference; the ▶ marker is the line under the user's click):
+\`\`\`
+${clickRegion}
+\`\`\`
+The user's intent is targeted at the markup AT or IMMEDIATELY ENCLOSING the marked line. When multiple similar blocks exist in the file, this region overrides any other heuristic — only edit the block that contains or surrounds line ${clickLine || '?'}. Copy old_block VERBATIM from the CANDIDATE FILES section (no line numbers there).
+` : '';
+
+    // Build the cacheable prefix (system + filesContext) using the SAME bytes as warmEditCache
+    // — this is what makes pre-warming actually pay off.
+    const filesContext = `CANDIDATE FILES:${this._buildFilesBlock(candidates)}`;
+    const variableContent = `USER REQUEST: "${editInstruction}"${conversationNote}
+${elInfo}
+${clickRegionBlock}
+Return ONLY valid JSON.`;
+
+    const textBlocks = [
+      { type: 'text', text: filesContext, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: variableContent },
+    ];
+    const userContent = imageData
+      ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, ...textBlocks]
+      : textBlocks;
+
+    try {
+      const t0 = Date.now();
+      // Stream the response so the frontend's streaming-tokens UI fills in live as Claude
+      // generates. Total wall-clock time is the same; perceived latency is much better.
+      const stream = this.client.messages.stream({
+        model: this.editModel,           // Haiku 4.5 — fast path for surgical edits
+        max_tokens: 2048,                // tighter cap; Shape A/B responses fit easily under 1K
+        system: [{ type: 'text', text: this._editSystemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: userContent }]
+      });
+      if (typeof onToken === 'function') stream.on('text', (delta) => onToken(delta));
+      const finalMessage = await stream.finalMessage();
+      const u = finalMessage.usage || {};
+      logger.info('Edit token usage', {
+        ms: Date.now() - t0, model: this.editModel,
+        input: u.input_tokens, cache_read: u.cache_read_input_tokens || 0,
+        cache_create: u.cache_creation_input_tokens || 0, output: u.output_tokens,
+      });
+      // Synthesise a response-shaped object so the rest of the function reads identically.
+      const response = finalMessage;
+      let result;
+      try { result = this._extractJSON(response.content[0].text); }
+      catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
+
+      if (result?.error) return { mode: 'skip', reason: result.error };
+
+      // Infer file_path if Claude forgot to include it: look for candidates whose content
+      // contains the old_block (or move anchors). When multiple candidates match, prefer
+      // the one the user clicked in (from data-blade-src).
+      const inferFilePath = (needle) => {
+        if (!needle) return null;
+        const hits = candidates.filter(c => c.content && c.content.includes(needle));
+        if (hits.length === 0) return null;
+        if (hits.length === 1) return hits[0].path;
+        // Tie-break: the user clicked in this specific file — prefer it over any other match
+        if (clickedFilePath) {
+          const preferred = hits.find(h => h.path === clickedFilePath);
+          if (preferred) return preferred.path;
+        }
+        return null;
+      };
+
+      if (result?.move?.source_start && result?.move?.source_end && result?.move?.insert_before) {
+        const filePath = result.file_path || inferFilePath(result.move.source_start) || inferFilePath(result.move.insert_before);
+        if (!filePath) {
+          logger.warn('Move anchors not unique to any candidate', { source_start: result.move.source_start?.substring(0, 60) });
+          return { mode: 'skip', reason: 'Could not determine which file to move within' };
+        }
+        logger.info('Structural move ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        return { mode: 'move', file_path: filePath, ...result.move, reasoning: result.reasoning };
+      }
+      if (result?.old_block !== undefined && result?.new_block !== undefined) {
+        const filePath = result.file_path || inferFilePath(result.old_block);
+        if (!filePath) {
+          logger.warn('old_block not unique to any candidate — Claude must specify file_path', { old_preview: (result.old_block || '').substring(0, 80) });
+          return { mode: 'skip', reason: 'AI edit did not specify which file, and the target text appears in multiple files' };
+        }
+        logger.info('Multi-file edit ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        return { mode: 'replace', file_path: filePath, old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
+      }
+      logger.warn('AI returned unexpected shape in executeEditMulti', { keys: Object.keys(result || {}) });
+      return { mode: 'skip' };
+    } catch (error) {
+      logger.error('Multi-file edit failed', { error: error.message });
+      const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
+        ? 'Rate limit reached — wait a moment and try again'
+        : error.message?.includes('Connection')
+        ? 'API connection error — try again in a moment'
+        : 'AI service error: ' + (error.message || 'unknown');
+      return { mode: 'skip', reason };
     }
   }
 
@@ -472,10 +754,36 @@ Respond ONLY with valid JSON. If a screenshot is provided, use it to understand 
   }
 
   _extractJSON(text) {
-    const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    // Strip markdown fences and any text before/after JSON
+    let cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+    // Find the outermost JSON object
     const match = cleaned.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('No JSON found in AI response');
-    return JSON.parse(match[0]);
+
+    let jsonStr = match[0];
+
+    // Try parsing directly first
+    try { return JSON.parse(jsonStr); } catch {}
+
+    // Fix common issues: literal newlines inside string values
+    // Replace actual newlines inside JSON strings with \\n
+    jsonStr = jsonStr.replace(/:\s*"((?:[^"\\]|\\.)*)"/g, (match) => {
+      return match.replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+    });
+    try { return JSON.parse(jsonStr); } catch {}
+
+    // Last resort: try to extract old_block and new_block with regex
+    const oldMatch = jsonStr.match(/"old_block"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
+    const newMatch = jsonStr.match(/"new_block"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
+    if (oldMatch && newMatch) {
+      return {
+        old_block: oldMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\'),
+        new_block: newMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      };
+    }
+
+    throw new Error('Could not parse JSON from AI response');
   }
 
   _extractCode(text) {

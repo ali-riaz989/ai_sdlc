@@ -155,13 +155,62 @@ class RouteResolver {
     const urlMatch = /^\s*['"]([^'"]+)['"]/.exec(args);
     if (!urlMatch) return null;
     const routeUrl = urlMatch[1];
-    const fullPath = this._joinPrefix(currentPrefix, routeUrl);
+    let fullPath = this._joinPrefix(currentPrefix, routeUrl);
 
     // Extract handler
     const afterUrl = args.slice(urlMatch[0].length).replace(/^\s*,\s*/, '');
     const view = await this._extractViewFromHandler(afterUrl, projectPath);
 
-    return { type: 'route', path: fullPath, view, end: argsEnd };
+    // Look for chained ->where('param', 'regex') after the declaration, up to the next ';'
+    // Fold constraints into the path pattern as {param:regex} so matching can respect them.
+    const stmtEnd = this._findStatementEnd(content, argsEnd);
+    const chained = content.slice(argsEnd, stmtEnd);
+    const constraints = this._extractWhereConstraints(chained);
+    if (Object.keys(constraints).length) {
+      fullPath = fullPath.replace(/\{(\w+)(\??)\}/g, (m, name, opt) => {
+        const c = constraints[name];
+        return c ? `{${name}:${c}${opt}}` : m;
+      });
+    }
+
+    return { type: 'route', path: fullPath, view, end: stmtEnd };
+  }
+
+  // Walk forward from `from` until we hit a top-level ';' (ignoring strings and nested parens)
+  _findStatementEnd(content, from) {
+    let depth = 0;
+    let inStr = null;
+    for (let i = from; i < content.length; i++) {
+      const ch = content[i];
+      if (inStr) {
+        if (ch === '\\') { i++; continue; }
+        if (ch === inStr) inStr = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inStr = ch; continue; }
+      if (ch === '(' || ch === '{' || ch === '[') depth++;
+      else if (ch === ')' || ch === '}' || ch === ']') depth--;
+      else if (ch === ';' && depth === 0) return i;
+    }
+    return content.length;
+  }
+
+  // Parse all ->where(...) calls (single and array forms) in the chain
+  _extractWhereConstraints(chain) {
+    const out = {};
+    // ->where('name', 'regex')
+    const single = /->where\s*\(\s*['"]([A-Za-z_][\w]*)['"]\s*,\s*['"]([^'"]+)['"]/g;
+    let m;
+    while ((m = single.exec(chain)) !== null) out[m[1]] = m[2];
+    // ->where(['name' => 'regex', ...]) — array form
+    const arr = /->where\s*\(\s*\[([^\]]+)\]/g;
+    while ((m = arr.exec(chain)) !== null) {
+      const body = m[1];
+      const pair = /['"]([A-Za-z_][\w]*)['"]\s*=>\s*['"]([^'"]+)['"]/g;
+      let pm;
+      while ((pm = pair.exec(body)) !== null) out[pm[1]] = pm[2];
+    }
+    return out;
   }
 
   async _extractViewFromHandler(handler, projectPath) {
@@ -271,7 +320,9 @@ class RouteResolver {
 
   _normPath(pageUrl) {
     if (!pageUrl) return '/';
-    const p = pageUrl.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '').replace(/\/$/, '');
+    let p = pageUrl.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '').replace(/\/$/, '');
+    // Strip /preview prefix from Next.js rewrite proxy
+    if (p.startsWith('/preview')) p = p.replace(/^\/preview/, '') || '/';
     return p || '/';
   }
 
@@ -282,7 +333,22 @@ class RouteResolver {
   }
 
   _matchPattern(pattern, url) {
-    const re = new RegExp('^' + pattern.replace(/\{[^}]+\??\}/g, '[^/]+').replace(/\//g, '\\/') + '$');
+    // Placeholders:  {name}           → [^/]+
+    //                {name:regex}     → regex  (regex comes from Laravel ->where() constraint)
+    //                {name?} /{name:regex?}   → optional param
+    const placeholderRe = /\{(\w+)(?::([^}?]+))?(\??)\}/g;
+    let body = '';
+    let lastIdx = 0;
+    let m;
+    while ((m = placeholderRe.exec(pattern)) !== null) {
+      body += pattern.slice(lastIdx, m.index).replace(/[.+^$()|[\]\\/]/g, '\\$&');
+      const paramRe = m[2] ? m[2] : '[^/]+';
+      const optional = m[3] === '?';
+      body += optional ? `(?:${paramRe})?` : `(${paramRe})`;
+      lastIdx = placeholderRe.lastIndex;
+    }
+    body += pattern.slice(lastIdx).replace(/[.+^$()|[\]\\/]/g, '\\$&');
+    const re = new RegExp('^' + body + '$');
     return re.test(url);
   }
 
