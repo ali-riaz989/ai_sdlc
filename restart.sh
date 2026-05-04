@@ -22,19 +22,33 @@ mkdir -p "$LOGS_DIR"
 echo "=== AI SDLC Platform Restart ==="
 
 # Kill existing processes on ports 3000 and 3001
-echo "[1/3] Stopping existing processes..."
+echo "[1/4] Stopping existing processes..."
 fuser -k -9 3000/tcp 2>/dev/null
 fuser -k -9 3001/tcp 2>/dev/null
 sleep 2
 
+# Rebuild frontend so `next start` serves the latest code. Without this, a stale
+# .next/ build from before the last git pull keeps getting served — restarting
+# the process alone won't pick up new source. Skip with `bash restart.sh --no-build`.
+if [ "$1" != "--no-build" ]; then
+  echo "[2/4] Building frontend..."
+  cd "$BASE_DIR/frontend"
+  rm -rf .next
+  $NODE node_modules/.bin/next build > "$LOGS_DIR/frontend-build.log" 2>&1
+  if [ $? -ne 0 ]; then
+    echo "  Build FAILED — see $LOGS_DIR/frontend-build.log"
+    exit 1
+  fi
+fi
+
 # Start backend
-echo "[2/3] Starting backend on :3001..."
+echo "[3/4] Starting backend on :3001..."
 cd "$BASE_DIR/backend"
 nohup $NODE src/server.js > "$LOGS_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 
 # Start frontend
-echo "[3/3] Starting frontend on :3000..."
+echo "[4/4] Starting frontend on :3000..."
 cd "$BASE_DIR/frontend"
 nohup $NODE node_modules/.bin/next start -p 3000 > "$LOGS_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
