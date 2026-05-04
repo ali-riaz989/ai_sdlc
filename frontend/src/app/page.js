@@ -4,7 +4,6 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
-import PromptInterface from '@/components/features/prompt/PromptInterface';
 import RecentRequests from '@/components/features/dashboard/RecentRequests';
 import AddProjectModal from '@/components/features/projects/AddProjectModal';
 
@@ -171,15 +170,8 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Change request form + recent */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="lg:col-span-2">
-                <PromptInterface projects={projects.filter(p => p.project_url)} />
-              </div>
-              <div>
-                <RecentRequests />
-              </div>
-            </div>
+            {/* Recent change requests — full-width listing under the projects grid */}
+            <RecentRequests />
           </div>
         )}
       </main>

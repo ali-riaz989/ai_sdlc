@@ -714,7 +714,7 @@ export default function ProjectPreview() {
       await apiClient.pushProject(id, commitMsg);
       setPushModalOpen(false);
       setCommitMsg('');
-      setResult({ status: 'review', message: `Pushed to ${project.repo_branch}` });
+      setResult({ status: 'review', message: `Pushed to ${project.push_branch || project.repo_branch}` });
       setTimeout(() => setResult(null), 4000);
     } catch (err) {
       alert(err.response?.data?.error || 'Push failed');
@@ -1383,7 +1383,7 @@ export default function ProjectPreview() {
                 <span className="text-gray-300">·</span>
                 <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
                   className="text-[11px] font-medium text-gray-700 hover:text-gray-900 transition-colors">
-                  Push to {project.repo_branch}
+                  Push to {project.push_branch || project.repo_branch}
                 </button>
               </div>
             </div>
@@ -1612,7 +1612,7 @@ export default function ProjectPreview() {
         <>
           <div className="fixed inset-0 bg-black/40" style={{ zIndex: 50 }} onClick={() => setPushModalOpen(false)} />
           <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm" style={{ zIndex: 51 }}>
-            <h3 className="text-sm font-semibold text-gray-900 mb-3">Push to <span className="font-mono text-blue-600">{project.repo_branch}</span></h3>
+            <h3 className="text-sm font-semibold text-gray-900 mb-3">Push to <span className="font-mono text-blue-600">{project.push_branch || project.repo_branch}</span></h3>
             <input value={commitMsg} onChange={e => setCommitMsg(e.target.value)}
               placeholder="Commit message..." autoFocus
               onKeyDown={e => { if (e.key === 'Enter') handlePush(); }}

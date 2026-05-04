@@ -65,7 +65,10 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     if (projects.length === 0) {
       return res.status(404).json({ error: 'Project not found' });
     }
-    res.json(projects[0]);
+    // Surface the branch the "Push to dev" button targets so the UI label stays
+    // in sync with the server-side push handler. Single source of truth =
+    // PUSH_BRANCH constant declared further down in this file.
+    res.json({ ...projects[0], push_branch: PUSH_BRANCH });
   } catch (error) {
     next(error);
   }
