@@ -58,6 +58,18 @@ export const apiClient = {
   // Git operations
   pushProject: (id, commitMessage, gitToken) => api.post(`/api/projects/${id}/push`, { commit_message: commitMessage, git_token: gitToken }),
   resetProject: (id) => api.post(`/api/projects/${id}/reset`),
+
+  // Chat persistence
+  saveChatMessage: (projectId, msg) => api.post(`/api/projects/${projectId}/chat-messages`, msg),
+  loadChatMessages: (projectId, params = {}) => api.get(`/api/projects/${projectId}/chat-messages`, { params }),
+
+  // Users (admin only)
+  listUsers: () => api.get('/api/users'),
+  createUser: (data) => api.post('/api/users', data),
+  updateUser: (id, data) => api.patch(`/api/users/${id}`, data),
+  deleteUser: (id) => api.delete(`/api/users/${id}`),
+  listUserChangeRequests: (id, params = {}) => api.get(`/api/users/${id}/change-requests`, { params }),
+  impersonateUser: (id) => api.post(`/api/users/${id}/impersonate`),
 };
 
 export default api;

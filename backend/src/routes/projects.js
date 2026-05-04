@@ -1030,4 +1030,64 @@ router.post('/:id/reset', authenticateToken, requireRole('admin'), async (req, r
   }
 });
 
+// ── Chat persistence ──────────────────────────────────────────────────────
+// One persistent thread per (user, project). Newest at the bottom; client
+// loads the last N on mount and paginates upward via `?before=<id>`.
+
+// POST /api/projects/:id/chat-messages
+// Body: { role: 'user'|'ai', text, type?, data?, change_request_id? }
+router.post('/:id/chat-messages', authenticateToken, async (req, res, next) => {
+  try {
+    const { role, text, type, data, change_request_id } = req.body || {};
+    if (role !== 'user' && role !== 'ai') return res.status(400).json({ error: 'role must be user or ai' });
+    const [rows] = await sequelize.query(
+      `INSERT INTO chat_messages (user_id, project_id, role, text, type, data, change_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, user_id, project_id, role, text, type, data, change_request_id, created_at`,
+      { bind: [req.user.id, req.params.id, role, text || null, type || 'text', data ? JSON.stringify(data) : null, change_request_id || null] }
+    );
+    res.json(rows[0]);
+  } catch (error) { next(error); }
+});
+
+// GET /api/projects/:id/chat-messages?before=<id>&limit=100
+// Returns the newest `limit` messages older than `before` (or absolute newest
+// when `before` is omitted), ordered ASC for direct rendering.
+//
+// Each user has their OWN per-project thread — never shared. Admins do NOT
+// see editors' messages here, because acting as another user requires
+// impersonation (which swaps the JWT to that user's identity, so the same
+// filter naturally returns the impersonated user's thread).
+router.get('/:id/chat-messages', authenticateToken, async (req, res, next) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const before = req.query.before ? parseInt(req.query.before, 10) : null;
+
+    const params = [req.params.id, req.user.id];
+    const where = ['project_id = $1', 'user_id = $2'];
+    if (Number.isFinite(before) && before > 0) {
+      params.push(before);
+      where.push(`id < $${params.length}`);
+    }
+    params.push(limit);
+
+    // Pull newest-first by id (created_at can collide on bulk inserts), then
+    // reverse to oldest-first for client rendering. `has_more` = whether the
+    // next page exists, so the client knows when to stop loading older.
+    const [rows] = await sequelize.query(
+      `SELECT id, user_id, project_id, role, text, type, data, change_request_id, created_at
+         FROM chat_messages
+        WHERE ${where.join(' AND ')}
+        ORDER BY id DESC
+        LIMIT $${params.length}`,
+      { bind: params }
+    );
+    res.json({
+      messages: rows.slice().reverse(),
+      has_more: rows.length === limit,
+      oldest_id: rows.length ? rows[rows.length - 1].id : null,
+    });
+  } catch (error) { next(error); }
+});
+
 module.exports = router;

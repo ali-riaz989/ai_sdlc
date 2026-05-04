@@ -59,7 +59,9 @@ export default function Home() {
         <div className="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between">
           <h1 className="text-lg font-semibold text-gray-900">AI SDLC Platform</h1>
           <div className="flex items-center gap-4">
-            <a href="/projects" className="text-sm text-gray-600 hover:text-gray-900">Projects</a>
+            {user.role === 'admin' && (
+              <a href="/users" className="text-sm text-gray-600 hover:text-gray-900">Users</a>
+            )}
             <span className="text-sm text-gray-500">{user.name}</span>
             <button
               onClick={logout}

@@ -64,13 +64,17 @@ export default function ProjectPreview() {
   const [pushing, setPushing] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [activePrompt, setActivePrompt] = useState(null);
-  const [chatMessages, setChatMessages] = useState([]); // session chat — destroyed on tab close
+  const [chatMessages, setChatMessages] = useState([]); // hydrated from chat_messages table on mount, written-through on each addChat
+  const [oldestChatId, setOldestChatId] = useState(null);  // cursor for "load older" pagination
+  const [hasMoreChat, setHasMoreChat] = useState(false);   // disable scroll-up loader once exhausted
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [highlightRect, setHighlightRect] = useState(null);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedElement, setSelectedElement] = useState(null); // { tag, text, section, classes }
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
+  const chatScrollRef = useRef(null);
 
   const [imageLoading, setImageLoading] = useState(false);
 
@@ -88,11 +92,67 @@ export default function ProjectPreview() {
   }
 
   // Chat helpers
-  function addChat(role, text, type = 'text', data = null) {
-    setChatMessages(prev => [...prev, { role, text, type, data, id: Date.now() + Math.random() }]);
+  // Optimistic write: append to local state immediately (instant UX), then persist
+  // to DB in the background. The DB row's id replaces the temp client id once we
+  // get the response so future edits/deletes can target the real row.
+  function addChat(role, text, type = 'text', data = null, change_request_id = null) {
+    const tempId = 'tmp-' + Date.now() + '-' + Math.random();
+    setChatMessages(prev => [...prev, { role, text, type, data, id: tempId, change_request_id }]);
     setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+
+    // Fire-and-forget persistence — the chat experience must keep working even
+    // when the network is flaky. On success, swap the temp id for the DB id.
+    if (id) {
+      apiClient.saveChatMessage(id, { role, text, type, data, change_request_id })
+        .then(res => {
+          const dbId = res.data?.id;
+          if (!dbId) return;
+          setChatMessages(prev => prev.map(m => m.id === tempId ? { ...m, id: dbId } : m));
+        })
+        .catch(err => {
+          // Don't surface to user — chat still works; we just lose persistence
+          // for this one message. Log so we notice patterns in DevTools.
+          console.warn('chat persist failed', err?.response?.status, err?.message);
+        });
+    }
   }
   function clearChat() { setChatMessages([]); }
+
+  // Scroll-up loader: when the user scrolls within ~80px of the top, fetch the
+  // next 100 older messages. Preserve the visual scroll anchor by recording the
+  // existing scrollHeight before prepend and re-applying the diff afterward, so
+  // the user's view doesn't jump while older messages slide in above.
+  async function handleChatScroll(e) {
+    if (loadingOlder || !hasMoreChat || !oldestChatId) return;
+    const el = e.currentTarget;
+    if (el.scrollTop > 80) return;
+    setLoadingOlder(true);
+    const prevHeight = el.scrollHeight;
+    try {
+      const res = await apiClient.loadChatMessages(id, { before: oldestChatId, limit: 100 });
+      const older = (res.data?.messages || []).map(m => ({
+        id: m.id, role: m.role, text: m.text || '', type: m.type || 'text',
+        data: m.data || null, change_request_id: m.change_request_id || null,
+      }));
+      if (older.length) {
+        setChatMessages(prev => [...older, ...prev]);
+        setOldestChatId(res.data?.oldest_id ?? oldestChatId);
+        setHasMoreChat(!!res.data?.has_more);
+        // Restore scroll position so the view stays anchored on the same message
+        requestAnimationFrame(() => {
+          if (chatScrollRef.current) {
+            chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight - prevHeight;
+          }
+        });
+      } else {
+        setHasMoreChat(false);
+      }
+    } catch (err) {
+      console.warn('load older failed', err?.message);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
 
   // Mirror `files` into a ref so socket/poll handlers (which capture stale state via closure)
   // can read the latest file list when snapshotting into chat history.
@@ -657,6 +717,29 @@ export default function ProjectPreview() {
         }
       })
       .catch(() => {});
+
+    // Hydrate the chat thread from the DB. Newest 100 messages on first load —
+    // older pages fetched on scroll-up via the cursor in `oldestId`. Messages
+    // that pre-date this feature simply aren't in the DB and won't appear.
+    apiClient.loadChatMessages(id, { limit: 100 })
+      .then(res => {
+        const msgs = (res.data?.messages || []).map(m => ({
+          id: m.id,
+          role: m.role,
+          text: m.text || '',
+          type: m.type || 'text',
+          data: m.data || null,
+          change_request_id: m.change_request_id || null,
+        }));
+        setChatMessages(msgs);
+        setOldestChatId(res.data?.oldest_id ?? null);
+        setHasMoreChat(!!res.data?.has_more);
+        // Scroll to the bottom once the messages render
+        setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'auto' }), 50);
+      })
+      .catch(err => {
+        console.warn('chat hydrate failed', err?.message);
+      });
   }, [id, user]);
 
   // Load change history for this project
@@ -1107,7 +1190,15 @@ export default function ProjectPreview() {
           </header>
 
 
-          <div className={`flex-1 px-4 py-5 space-y-5 bg-white ${chatMessages.length > 0 || submitting || files.length > 0 ? 'overflow-y-auto' : 'overflow-hidden'}`} style={{ scrollbarWidth: 'thin' }}>
+          <div
+            ref={chatScrollRef}
+            onScroll={handleChatScroll}
+            className={`flex-1 px-4 py-5 space-y-5 bg-white ${chatMessages.length > 0 || submitting || files.length > 0 ? 'overflow-y-auto' : 'overflow-hidden'}`} style={{ scrollbarWidth: 'thin' }}>
+            {hasMoreChat && (
+              <div className="text-center text-[11px] text-gray-400 py-1">
+                {loadingOlder ? 'Loading older messages…' : '↑ scroll up for more'}
+              </div>
+            )}
             {chatMessages.length === 0 && !submitting && (
               <div className="h-full flex items-center justify-center text-center">
                 <div className="text-gray-500 text-xs max-w-[240px] leading-relaxed">

@@ -132,3 +132,22 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 GRANT ALL ON SCHEMA public TO ai_sdlc_user;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO ai_sdlc_user;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ai_sdlc_user;
+
+-- ── Chat persistence (per user, per project) ────────────────────────────────
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id                 BIGSERIAL PRIMARY KEY,
+  user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id         UUID REFERENCES projects(id) ON DELETE CASCADE,
+  role               VARCHAR(16) NOT NULL,
+  text               TEXT,
+  type               VARCHAR(32) DEFAULT 'text',
+  data               JSONB,
+  change_request_id  UUID REFERENCES change_requests(id) ON DELETE SET NULL,
+  created_at         TIMESTAMP DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_user_project ON chat_messages(user_id, project_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_project       ON chat_messages(project_id, created_at DESC, id DESC);
+
+-- Strict role enum: admin | editor
+ALTER TABLE users ALTER COLUMN role SET DEFAULT 'editor';
+UPDATE users SET role = 'editor' WHERE role NOT IN ('admin', 'editor');

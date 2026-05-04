@@ -176,6 +176,10 @@ router.post('/:id/restore', authenticateToken, async (req, res, next) => {
     );
     if (!requests.length) return res.status(404).json({ error: 'Not found' });
     const cr = requests[0];
+    // Ownership guard: editors can only restore their own changes; admins restore anything.
+    if (req.user.role !== 'admin' && cr.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You can only restore your own changes' });
+    }
     if (cr.status !== 'review') return res.status(400).json({ error: 'Can only restore applied changes' });
 
     const [files] = await sequelize.query(
