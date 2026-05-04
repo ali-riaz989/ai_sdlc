@@ -980,22 +980,42 @@ router.post('/:id/push', authenticateToken, async (req, res, next) => {
       }
     }
 
+    // Literal user-requested flow:
+    //   git add .
+    //   git commit -m "<message>"
+    //   git pull origin <branch>
+    //   git push origin <branch>
+    //
+    // Two safe-guards on top of the bare commands:
+    //   1. The commit may be empty if the working tree was clean (e.g. a retry
+    //      after a network blip). Postgres "nothing to commit" → swallow.
+    //   2. The pull will fail on the first push because `origin/<branch>` doesn't
+    //      exist yet (couldn't find remote ref). On that specific error, fall
+    //      through to the push, which auto-publishes the branch with -u.
     await git.add('.');
-    // Allow commit to no-op if there's nothing to commit (e.g. retry after a network blip)
-    try { await git.commit(commit_message || 'AI SDLC: push changes'); } catch (e) {
+    try {
+      await git.commit(commit_message || 'AI SDLC: push changes');
+    } catch (e) {
       if (!/nothing to commit/i.test(e.message || '')) throw e;
     }
 
-    // Rebase against remote ai_scope only if it already exists — first push
-    // is allowed to skip this since there's nothing to rebase against.
-    await git.fetch('origin');
-    const remoteBranches = (await git.branch(['-r'])).all;
-    const remoteRef = `origin/${PUSH_BRANCH}`;
-    if (remoteBranches.includes(remoteRef)) {
-      await git.pull('origin', PUSH_BRANCH, { '--rebase': 'true' });
-      await git.push('origin', PUSH_BRANCH);
-    } else {
+    let firstPush = false;
+    try {
+      await git.pull('origin', PUSH_BRANCH);
+    } catch (e) {
+      const msg = (e.message || '').toLowerCase();
+      if (msg.includes("couldn't find remote ref") || msg.includes('does not appear to be a git repository') || msg.includes('no such ref')) {
+        firstPush = true;
+      } else {
+        throw e;
+      }
+    }
+
+    if (firstPush) {
+      // Branch is brand new on the remote — publish it with upstream tracking.
       await git.push(['-u', 'origin', PUSH_BRANCH]);
+    } else {
+      await git.push('origin', PUSH_BRANCH);
     }
 
     logger.info('Project pushed', { projectId: project.id, branch: PUSH_BRANCH });
