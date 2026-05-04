@@ -934,6 +934,12 @@ router.delete('/:id', authenticateToken, requireRole('admin'), async (req, res, 
 });
 
 // POST /api/projects/:id/push - Git add, commit, pull, push
+// Always pushes to the dedicated `ai_scope` branch — never to the project's main
+// branch — so AI-generated edits land in a review/staging branch the user
+// promotes to dev/main on their own. If `ai_scope` doesn't exist locally yet, we
+// create it from the current HEAD; if it doesn't exist on the remote yet, we
+// skip the rebase-pull and push with -u to publish it.
+const PUSH_BRANCH = 'ai_scope';
 router.post('/:id/push', authenticateToken, requireRole('admin'), async (req, res, next) => {
   try {
     const [projects] = await sequelize.query('SELECT * FROM projects WHERE id = $1', { bind: [req.params.id] });
@@ -948,13 +954,45 @@ router.post('/:id/push', authenticateToken, requireRole('admin'), async (req, re
       await git.remote(['set-url', 'origin', remoteUrl]);
     }
 
-    await git.add('.');
-    await git.commit(commit_message || 'AI SDLC: push changes');
-    await git.pull('origin', project.repo_branch, { '--rebase': 'true' });
-    await git.push('origin', project.repo_branch);
+    // Make sure we're on `ai_scope` locally — checkout if it exists, branch from
+    // current HEAD if it doesn't. Stash uncommitted changes first so checkout
+    // doesn't fail.
+    const branches = await git.branchLocal();
+    if (branches.current !== PUSH_BRANCH) {
+      // Save in-progress edits, switch branches, restore.
+      const status = await git.status();
+      const dirty = status.files.length > 0;
+      if (dirty) await git.stash(['push', '-u', '-m', 'ai-sdlc-autoswitch']);
+      if (branches.all.includes(PUSH_BRANCH)) {
+        await git.checkout(PUSH_BRANCH);
+      } else {
+        await git.checkoutLocalBranch(PUSH_BRANCH);
+      }
+      if (dirty) {
+        try { await git.stash(['pop']); } catch { /* nothing to pop / merge handled below */ }
+      }
+    }
 
-    logger.info('Project pushed', { projectId: project.id, branch: project.repo_branch });
-    res.json({ message: `Pushed to ${project.repo_branch}` });
+    await git.add('.');
+    // Allow commit to no-op if there's nothing to commit (e.g. retry after a network blip)
+    try { await git.commit(commit_message || 'AI SDLC: push changes'); } catch (e) {
+      if (!/nothing to commit/i.test(e.message || '')) throw e;
+    }
+
+    // Rebase against remote ai_scope only if it already exists — first push
+    // is allowed to skip this since there's nothing to rebase against.
+    await git.fetch('origin');
+    const remoteBranches = (await git.branch(['-r'])).all;
+    const remoteRef = `origin/${PUSH_BRANCH}`;
+    if (remoteBranches.includes(remoteRef)) {
+      await git.pull('origin', PUSH_BRANCH, { '--rebase': 'true' });
+      await git.push('origin', PUSH_BRANCH);
+    } else {
+      await git.push(['-u', 'origin', PUSH_BRANCH]);
+    }
+
+    logger.info('Project pushed', { projectId: project.id, branch: PUSH_BRANCH });
+    res.json({ message: `Pushed to ${PUSH_BRANCH}` });
   } catch (error) {
     logger.error('Push failed', { error: error.message });
     next(error);

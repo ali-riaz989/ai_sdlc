@@ -1616,7 +1616,7 @@ export default function ProjectPreview() {
             <input value={commitMsg} onChange={e => setCommitMsg(e.target.value)}
               placeholder="Commit message..." autoFocus
               onKeyDown={e => { if (e.key === 'Enter') handlePush(); }}
-              className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-green-500 focus:border-transparent mb-3" />
+              className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-900 placeholder:text-gray-400 bg-white focus:ring-2 focus:ring-green-500 focus:border-transparent mb-3" />
             <div className="flex gap-2">
               <button onClick={() => setPushModalOpen(false)}
                 className="flex-1 py-2 border border-gray-200 rounded-xl text-sm text-gray-500 hover:bg-gray-50">Cancel</button>
