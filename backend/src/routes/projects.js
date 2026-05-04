@@ -943,7 +943,11 @@ router.delete('/:id', authenticateToken, requireRole('admin'), async (req, res, 
 // create it from the current HEAD; if it doesn't exist on the remote yet, we
 // skip the rebase-pull and push with -u to publish it.
 const PUSH_BRANCH = 'ai_scope';
-router.post('/:id/push', authenticateToken, requireRole('admin'), async (req, res, next) => {
+// Open to any authenticated user (editor + admin). The push always lands on
+// the dedicated `ai_scope` branch — never main — so editors can ship their AI
+// edits for review without admin intervention. The branch itself IS the
+// review gate; admin promotes ai_scope → dev/main on their own when ready.
+router.post('/:id/push', authenticateToken, async (req, res, next) => {
   try {
     const [projects] = await sequelize.query('SELECT * FROM projects WHERE id = $1', { bind: [req.params.id] });
     if (!projects.length) return res.status(404).json({ error: 'Project not found' });
