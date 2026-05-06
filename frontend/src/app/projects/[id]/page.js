@@ -383,6 +383,16 @@ export default function ProjectPreview() {
   // ── Click-to-select mode: hover highlight + click to identify element ──
   useEffect(() => {
     if (!selectMode || !iframeRef.current) return;
+
+    // Defensive: even if the Edit toggle's mutex didn't catch in time (e.g.,
+    // user clicked Select while a stale browser bundle was running), make
+    // ABSOLUTELY sure the iframe's live-edit contenteditable + outlines are
+    // off whenever Select is active. The two modes can never share clicks.
+    try {
+      const win = iframeRef.current?.contentWindow;
+      if (win) win.postMessage({ source: 'ai-sdlc-parent', type: 'disable-edit' }, '*');
+    } catch {}
+
     let hoveredEl = null;
 
     const getDoc = () => {
