@@ -9,7 +9,7 @@ const geistSans = Geist({
 });
 
 export const metadata = {
-  title: "AI SDLC Platform",
+  title: "THE PARKLANE CANVAS",
   description: "AI-driven software development lifecycle platform",
 };
 

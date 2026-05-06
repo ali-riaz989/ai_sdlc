@@ -29,7 +29,7 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
       <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-gray-200 p-8">
-        <h1 className="text-2xl font-bold text-gray-900 mb-1">AI SDLC Platform</h1>
+        <h1 className="text-2xl font-bold text-gray-900 mb-1">THE PARKLANE CANVAS</h1>
         <p className="text-sm text-gray-500 mb-6">Sign in to your account</p>
 
         {error && (
