@@ -1546,10 +1546,21 @@ export default function ProjectPreview() {
                         <div className="text-gray-800 truncate">to <span className="font-mono">{truncate(value, 60)}</span></div>
                       </div>
                     ) : (
-                      <div className="space-y-0.5 text-[11px]">
-                        <div className="text-gray-600 line-through truncate">{truncate(previous, 80) || <em>(empty)</em>}</div>
-                        <div className="text-gray-900 truncate">{truncate(value, 80)}</div>
-                      </div>
+                      // Text overrides now save innerHTML to preserve inline
+                      // children (icons inside buttons, <strong>, etc.). Strip
+                      // tags + collapse whitespace for the bubble preview so
+                      // diffs read cleanly without raw markup leaking through.
+                      (() => {
+                        const stripHtml = (s) => String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                        const prevTxt = stripHtml(previous);
+                        const valTxt = stripHtml(value);
+                        return (
+                          <div className="space-y-0.5 text-[11px]">
+                            <div className="text-gray-600 line-through truncate">{truncate(prevTxt, 80) || <em>(empty)</em>}</div>
+                            <div className="text-gray-900 truncate">{truncate(valTxt, 80)}</div>
+                          </div>
+                        );
+                      })()
                     )}
                     {!isReverted && oid && (
                       <div className="flex justify-end mt-1.5">

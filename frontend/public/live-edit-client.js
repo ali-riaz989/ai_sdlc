@@ -93,8 +93,11 @@
       const el = findBySelector(o.selector);
       if (!el) continue;
       if (o.field === 'text') {
-        // textContent drops inline children — acceptable simplification for v1.
-        el.textContent = o.new_value;
+        // Use innerHTML so child elements survive the round-trip — a button
+        // like "Book Lesson <img class='arrow'>" or a card with an inline
+        // image keeps its icon. textContent would silently delete every
+        // child while applying the new text.
+        el.innerHTML = o.new_value;
       } else if (o.field === 'src' && el.tagName === 'IMG') {
         el.src = o.new_value;
       } else if (o.field === 'alt' && el.tagName === 'IMG') {
@@ -173,7 +176,12 @@
       if (!isTextBearing(el)) return;
       if (el.dataset.liveEditWired) return;
       el.dataset.liveEditWired = '1';
-      el.dataset.liveEditOriginal = el.textContent;
+      // Capture the FULL HTML, not just textContent. When the user edits the
+      // visible text, the surrounding inline structure (icons, <strong>, <a>,
+      // line breaks) is preserved on save. Using textContent would lose all
+      // of that — the next render would replace e.g. "Book Lesson →" with
+      // just "Book Lesson", deleting the arrow.
+      el.dataset.liveEditOriginal = el.innerHTML;
       el.contentEditable = 'true';
       el.style.outline = '1px dashed rgba(34,197,94,0.45)';
       el.style.outlineOffset = '2px';
@@ -241,7 +249,9 @@
 
   function onTextBlur(e) {
     const el = e.currentTarget;
-    const newVal = el.textContent;
+    // innerHTML keeps child structure (icons, inline tags, images) intact.
+    // Compare to the snapshot we took when wiring; emit only on change.
+    const newVal = el.innerHTML;
     const prev = el.dataset.liveEditOriginal || '';
     if (newVal === prev) return;
     send('text-changed', { selector: selectorOf(el), field: 'text', previous: prev, value: newVal });
