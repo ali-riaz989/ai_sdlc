@@ -194,6 +194,18 @@ OUTPUT SHAPE B — structural move (use ONLY when the user wants to relocate a b
 OUTPUT SHAPE C — error / no-op:
 {"error":"<why>"}
 
+OUTPUT SHAPE D — file deletion (use ONLY when the user asks to REMOVE/DELETE an
+entire page or blog file):
+{"file_path":"<exact path from a FILE header>","delete":true,"reasoning":"<short>"}
+- For "remove page X" / "delete this blog" / "drop /some/url page" → emit SHAPE D
+  pointing at the page's blade file (e.g. resources/views/frontend/static_pages/X.blade.php
+  or resources/views/frontend/blogs/X.blade.php).
+- The runtime will ALSO automatically strip the matching Route::get('<url>', …)
+  line from routes/web.php after you delete the blade file — you do NOT need to
+  edit web.php yourself for page removals; one SHAPE D response handles both.
+- Do NOT use SHAPE D for partial removals like "remove this paragraph" — those
+  are SHAPE A with old_block + empty new_block.
+
 DECISION RULES (when to pick which file):
 - Styling/visual changes (color, spacing, size, layout): prefer the CSS file that defines the clicked element's class rule.
 - Text, content, structure, image, move, add, delete: edit the Blade template.
@@ -248,8 +260,14 @@ DEFAULT TO ACTING ON THE CLICK REGION:
 - Example: user clicked inside an FAQ accordion's General tab and prompted "add a new FAQ" → add a new accordion item to the General tab's @foreach block (or the first accordion-item near the click), don't ask which tab.
 - Example: user clicked a testimonial card and prompted "make this red" → edit the styling of the card containing the marked line, don't ask which testimonial.
 
+VOICE — applies to EVERY error, question, and reasoning message you produce:
+- Always address the user in the SECOND PERSON.
+- When referring to what they typed, ALWAYS use "You said to …" (e.g. "You said to change the heading", "You said to remove this page").
+- NEVER use third-person phrasings like "The user request", "The user clicked", "the user wants". These are FORBIDDEN.
+- "You clicked …" is fine when describing what they selected on the page.
+
 AMBIGUITY (only when truly unsolvable): If, after reading the click region, you still cannot proceed, return {"error":"<why>"}.
-- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You clicked inside the .testimonials-slider near 'Steve' — did you want me to (a) add a new testimonial card after Steve's, or (b) change Steve's text? Please clarify."
+- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You said to change this image, but you clicked the .testimonials-slider near 'Steve' which has no image. Did you mean to (a) replace Steve's portrait above, or (b) change the testimonial text instead?"
 - DO NOT return generic errors like "ambiguous", "cannot determine", or "please clarify which element". Always reference WHAT you saw at the click region.
 - Phrase the error as a question (ends with "?") whenever you're asking the user to disambiguate between two reasonable interpretations — the UI styles questions differently from hard errors.`;
   }
@@ -386,6 +404,14 @@ Return ONLY valid JSON.`;
       catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
 
       if (result?.error) return { mode: 'skip', reason: result.error };
+
+      // SHAPE D: file deletion. Claude emits { file_path, delete: true }.
+      // Caller is expected to also strip any matching Route::get from web.php
+      // for static_pages/blogs (deterministic post-processing in the controller).
+      if (result?.delete === true && result?.file_path) {
+        logger.info('File deletion requested', { file: result.file_path, reasoning: result.reasoning });
+        return { mode: 'delete', file_path: result.file_path, reasoning: result.reasoning };
+      }
 
       // Infer file_path if Claude forgot to include it: look for candidates whose content
       // contains the old_block (or move anchors). When multiple candidates match, prefer

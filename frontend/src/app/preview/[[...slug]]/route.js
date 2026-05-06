@@ -66,7 +66,8 @@ async function handle(request, { params }) {
   history.replaceState = function(){ _replace.apply(this, arguments); setTimeout(report, 0); };
   window.addEventListener('popstate', report);
   window.addEventListener('hashchange', report);
-})();</script>`;
+})();</script>
+<script src="/live-edit-client.js?v=${Date.now()}" defer></script>`;
 
     if (/<head(\s[^>]*)?>/i.test(html)) html = html.replace(/<head(\s[^>]*)?>/i, m => m + beacon);
     else html = beacon + html;

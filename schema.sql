@@ -151,3 +151,19 @@ CREATE INDEX IF NOT EXISTS idx_chat_project       ON chat_messages(project_id, c
 -- Strict role enum: admin | editor
 ALTER TABLE users ALTER COLUMN role SET DEFAULT 'editor';
 UPDATE users SET role = 'editor' WHERE role NOT IN ('admin', 'editor');
+
+-- ── Live edit (project-wide text/image overrides with step-by-step revert) ──
+CREATE TABLE IF NOT EXISTS text_overrides (
+  id              BIGSERIAL PRIMARY KEY,
+  project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  url             VARCHAR(512) NOT NULL,
+  selector        TEXT NOT NULL,
+  field           VARCHAR(32) NOT NULL DEFAULT 'text',
+  previous_value  TEXT,
+  new_value       TEXT NOT NULL,
+  user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reverted        BOOLEAN NOT NULL DEFAULT false,
+  created_at      TIMESTAMP DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_text_overrides_apply ON text_overrides(project_id, url, reverted, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_text_overrides_user  ON text_overrides(user_id, project_id, created_at DESC);

@@ -44,6 +44,7 @@ export const apiClient = {
   listSections: (id) => api.get(`/api/projects/${id}/sections`),
   ensureSectionPreviews: (id) => api.post(`/api/projects/${id}/ensure-section-previews`),
   createPage: (id, data) => api.post(`/api/projects/${id}/pages`, data, { timeout: 30000 }),
+  createBlog: (id, data) => api.post(`/api/projects/${id}/blogs`, data, { timeout: 30000 }),
   deleteProject: (id) => api.delete(`/api/projects/${id}`),
 
   // Change Requests
@@ -62,6 +63,12 @@ export const apiClient = {
   // Chat persistence
   saveChatMessage: (projectId, msg) => api.post(`/api/projects/${projectId}/chat-messages`, msg),
   loadChatMessages: (projectId, params = {}) => api.get(`/api/projects/${projectId}/chat-messages`, { params }),
+
+  // Live edit (text/image overrides)
+  loadOverrides: (projectId, url) => api.get(`/api/projects/${projectId}/text-overrides`, { params: { url } }),
+  saveOverride: (projectId, data) => api.post(`/api/projects/${projectId}/text-overrides`, data),
+  revertOverride: (projectId, overrideId) => api.post(`/api/projects/${projectId}/text-overrides/${overrideId}/revert`),
+  uploadProjectImage: (projectId, base64, media_type) => api.post(`/api/projects/${projectId}/upload-image`, { base64, media_type }),
 
   // Users (admin only)
   listUsers: () => api.get('/api/users'),

@@ -55,8 +55,27 @@ export default function ProjectPreview() {
   // New-page modal state
   const [newPageOpen, setNewPageOpen] = useState(false);
   const [newPageUrl, setNewPageUrl] = useState('');
+  const [newPageMetaTitle, setNewPageMetaTitle] = useState('');
+  const [newPageMetaDescription, setNewPageMetaDescription] = useState('');
   const [newPageError, setNewPageError] = useState('');
   const [newPageCreating, setNewPageCreating] = useState(false);
+  // "+ New" dropdown opens a small menu with two choices: Page (existing flow)
+  // or Blog (new flow that scaffolds a single blog detail page from a template).
+  const [newMenuOpen, setNewMenuOpen] = useState(false);
+  const [goToOpen, setGoToOpen] = useState(false);
+  const [goToUrl, setGoToUrl] = useState('');
+  const [goToError, setGoToError] = useState('');
+  // Live-edit (inline contenteditable) is a parallel track to the AI editor.
+  // Toggle on → iframe lights up text/images for direct edit + auto-save.
+  // Edits stream into chat as `live_edit` bubbles with per-step Revert.
+  const [liveEditMode, setLiveEditMode] = useState(false);
+  const [blogOpen, setBlogOpen] = useState(false);
+  const [blogTitle, setBlogTitle] = useState('');
+  const [blogSlug, setBlogSlug] = useState('');
+  const [blogMetaTitle, setBlogMetaTitle] = useState('');
+  const [blogMetaDescription, setBlogMetaDescription] = useState('');
+  const [blogError, setBlogError] = useState('');
+  const [blogCreating, setBlogCreating] = useState(false);
   const [availableSections, setAvailableSections] = useState([]); // [{ name, displayName }]
   const [chosenSections, setChosenSections] = useState([]); // [name, name, ...] in order
   const [dragIndex, setDragIndex] = useState(null); // index of chosen item currently being dragged
@@ -70,7 +89,10 @@ export default function ProjectPreview() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [highlightRect, setHighlightRect] = useState(null);
   const [selectMode, setSelectMode] = useState(false);
-  const [selectedElement, setSelectedElement] = useState(null); // { tag, text, section, classes }
+  // Selection survives page reload via localStorage (scoped per project id), so
+  // a user editing the same section across many prompts doesn't have to
+  // re-click Select after refreshing or switching tabs.
+  const [selectedElement, setSelectedElement] = useState(null); // { tag, text, section, classes, bladeSrc, ... }
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -95,10 +117,15 @@ export default function ProjectPreview() {
   // Optimistic write: append to local state immediately (instant UX), then persist
   // to DB in the background. The DB row's id replaces the temp client id once we
   // get the response so future edits/deletes can target the real row.
-  function addChat(role, text, type = 'text', data = null, change_request_id = null) {
+  function addChat(role, text, type = 'text', data = null, change_request_id = null, skipPersist = false) {
     const tempId = 'tmp-' + Date.now() + '-' + Math.random();
     setChatMessages(prev => [...prev, { role, text, type, data, id: tempId, change_request_id }]);
     setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+
+    // Some message types (live_edit) are persisted server-side as a side-effect
+    // of the underlying API call (POST /text-overrides). Skip the duplicate
+    // write here so the same edit doesn't appear twice after reload.
+    if (skipPersist) return;
 
     // Fire-and-forget persistence — the chat experience must keep working even
     // when the network is flaky. On success, swap the temp id for the DB id.
@@ -197,6 +224,9 @@ export default function ProjectPreview() {
   // revert tracking so the button knows whether it was already used.
   const [expandedDiffs, setExpandedDiffs] = useState(() => new Set());
   const [revertedRequests, setRevertedRequests] = useState(() => new Set());
+  // Mirrors text_overrides.reverted on the client for instant UI feedback;
+  // the server is still source of truth on next page load.
+  const [revertedOverrides, setRevertedOverrides] = useState(() => new Set());
   function toggleDiffExpanded(msgId) {
     setExpandedDiffs(prev => { const next = new Set(prev); next.has(msgId) ? next.delete(msgId) : next.add(msgId); return next; });
   }
@@ -209,6 +239,20 @@ export default function ProjectPreview() {
       addChat('ai', `Reverted change ${reqId.substring(0, 8)} — files restored to their pre-edit state.`, 'success');
     } catch (err) {
       addChat('ai', `Couldn't revert: ${err.response?.data?.error || err.message}`, 'error');
+    }
+  }
+
+  // Revert a single live-edit step. The server flips reverted=true on this row;
+  // the next-newest non-reverted override for the same (selector, field)
+  // becomes active. Reload the iframe so the freshly-active state paints.
+  async function handleRevertOverride(overrideId) {
+    if (!overrideId || revertedOverrides.has(overrideId)) return;
+    try {
+      await apiClient.revertOverride(id, overrideId);
+      setRevertedOverrides(prev => { const next = new Set(prev); next.add(overrideId); return next; });
+      reloadIframe();
+    } catch (err) {
+      addChat('ai', `Couldn't revert edit: ${err.response?.data?.error || err.message}`, 'error');
     }
   }
 
@@ -646,6 +690,149 @@ export default function ProjectPreview() {
     };
   }, [selectMode]);
 
+  // ── Persist selectedElement per-project ─────────────────────────────────
+  // Hydrate on mount: if the user previously selected something on this project,
+  // restore that metadata so the prompt box's "Section: X" indicator works
+  // immediately and prompts get attributed to the same section.
+  // The DOM element itself can't be restored (the iframe rerenders) — only the
+  // metadata. The red overlay reappears the next time the user re-clicks Select
+  // or uses image-drill-down which re-resolves the live DOM node.
+  useEffect(() => {
+    if (!id || typeof window === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(`selectedElement:${id}`);
+      if (raw) setSelectedElement(JSON.parse(raw));
+    } catch { /* corrupt entry — ignore */ }
+  }, [id]);
+
+  // Mirror selectedElement back to localStorage on every change. Stored
+  // per-project so different projects have independent selection state.
+  useEffect(() => {
+    if (!id || typeof window === 'undefined') return;
+    try {
+      if (selectedElement) {
+        localStorage.setItem(`selectedElement:${id}`, JSON.stringify(selectedElement));
+      } else {
+        localStorage.removeItem(`selectedElement:${id}`);
+      }
+    } catch { /* quota / privacy mode — silently skip */ }
+  }, [id, selectedElement]);
+
+  // ── Live-edit postMessage bridge ────────────────────────────────────────
+  // Owns the conversation with the live-edit-client.js script running inside
+  // the iframe. Reuses `currentPageUrl` so we re-fetch overrides whenever the
+  // user navigates to a new page.
+  useEffect(() => {
+    if (!id) return;
+    const iframeWin = () => { try { return iframeRef.current?.contentWindow; } catch { return null; } };
+
+    // Strip the /preview proxy prefix to get the project-relative URL the
+    // backend keys overrides by.
+    const stripPreview = (u) => {
+      if (!u) return '/';
+      const noOrigin = u.replace(/^https?:\/\/[^/]+/, '');
+      const noQuery = noOrigin.split('?')[0].split('#')[0];
+      return noQuery.replace(/^\/preview/, '') || '/';
+    };
+
+    async function fetchAndApply() {
+      const path = stripPreview(currentPageUrl);
+      try {
+        const res = await apiClient.loadOverrides(id, path);
+        const overrides = (res.data?.overrides || []).map(o => ({
+          selector: o.selector, field: o.field, new_value: o.new_value,
+        }));
+        const win = iframeWin();
+        if (!win) return;
+        if (liveEditMode) {
+          // Apply overrides + turn ON contenteditable + outlines
+          win.postMessage({ source: 'ai-sdlc-parent', type: 'enable-edit', overrides }, '*');
+        } else {
+          // Apply overrides AND explicitly turn OFF edit mode. The disable
+          // first ensures the iframe tears down contenteditable + outlines
+          // when the user toggles from On → Off; the apply is for the
+          // initial load case where edit was never on.
+          win.postMessage({ source: 'ai-sdlc-parent', type: 'disable-edit' }, '*');
+          win.postMessage({ source: 'ai-sdlc-parent', type: 'apply-overrides', overrides }, '*');
+        }
+      } catch (err) { console.warn('loadOverrides failed', err?.message); }
+    }
+
+    async function handleTextChanged(msg) {
+      try {
+        const path = stripPreview(currentPageUrl);
+        const res = await apiClient.saveOverride(id, {
+          url: path,
+          selector: msg.selector,
+          field: msg.field,
+          previous_value: msg.previous,
+          new_value: msg.value,
+        });
+        // Mirror as a chat bubble — write-through, so other sessions see it
+        // when they reload. The DB row is already created by the endpoint.
+        addChat('ai', `Edited ${msg.field}: "${truncate(msg.previous, 50)}" → "${truncate(msg.value, 50)}"`,
+          'live_edit',
+          { override_id: res.data?.id, url: path, selector: msg.selector, field: msg.field, previous_value: msg.previous, new_value: msg.value },
+          null, true /* skipPersist — backend POST /text-overrides already wrote this row */);
+      } catch (err) {
+        addChat('ai', `Failed to save edit: ${err?.response?.data?.error || err?.message || 'unknown error'}`, 'error');
+      }
+    }
+
+    async function handleImageReplace(msg) {
+      try {
+        const path = stripPreview(currentPageUrl);
+        // Strip the data:...;base64, prefix the iframe sent us
+        const cleanB64 = (msg.dataUrl || '').replace(/^data:[^,]+,/, '');
+        const upload = await apiClient.uploadProjectImage(id, cleanB64, msg.mediaType);
+        const newUrl = upload.data?.url; // /images/foo.jpg
+        if (!newUrl) throw new Error('upload returned no url');
+        // Persist override with field=src
+        const res = await apiClient.saveOverride(id, {
+          url: path,
+          selector: msg.selector,
+          field: 'src',
+          previous_value: msg.previous_src,
+          new_value: newUrl,
+        });
+        // Tell the iframe to swap the live <img> src — fast UX, no reload.
+        const win = iframeWin();
+        if (win) win.postMessage({ source: 'ai-sdlc-parent', type: 'apply-image', selector: msg.selector, url: newUrl }, '*');
+        addChat('ai', `Replaced image on ${path}`, 'live_edit',
+          { override_id: res.data?.id, url: path, selector: msg.selector, field: 'src', previous_value: msg.previous_src, new_value: newUrl },
+          null, true /* skipPersist — backend POST /text-overrides already wrote this row */);
+      } catch (err) {
+        addChat('ai', `Image upload failed: ${err?.response?.data?.error || err?.message}`, 'error');
+      }
+    }
+
+    function onMessage(e) {
+      const msg = e.data;
+      if (!msg || msg.source !== 'live-edit') return;
+      if (msg.type === 'ready') {
+        // Iframe loaded — push current overrides + edit-mode state
+        fetchAndApply();
+      } else if (msg.type === 'text-changed') {
+        handleTextChanged(msg);
+      } else if (msg.type === 'image-replace-request') {
+        handleImageReplace(msg);
+      }
+    }
+    window.addEventListener('message', onMessage);
+
+    // When edit-mode toggles, push the new state to whatever iframe is loaded
+    // right now (without waiting for a `ready` ping).
+    fetchAndApply();
+
+    return () => window.removeEventListener('message', onMessage);
+  }, [id, liveEditMode, currentPageUrl]);
+
+  // Tiny helper to truncate long strings for chat preview
+  function truncate(s, n) {
+    s = String(s || '');
+    return s.length > n ? s.slice(0, n) + '…' : s;
+  }
+
   // Keep the red "selected" overlay glued to the chosen element while it exists.
   // Runs independently of selectMode — the moment a selection is committed (click
   // handler sets selectedElement + _highlightedEl), this effect attaches scroll
@@ -875,14 +1062,23 @@ export default function ProjectPreview() {
   async function submitNewPage() {
     setNewPageError('');
     if (!newPageUrl.trim()) { setNewPageError('Enter a URL like /play/coaching'); return; }
+    if (!newPageMetaTitle.trim()) { setNewPageError('Meta title is required'); return; }
+    if (!newPageMetaDescription.trim()) { setNewPageError('Meta description is required'); return; }
     if (chosenSections.length === 0) { setNewPageError('Pick at least one section'); return; }
     setNewPageCreating(true);
     try {
-      const res = await apiClient.createPage(id, { url: newPageUrl.trim(), sections: chosenSections });
+      const res = await apiClient.createPage(id, {
+        url: newPageUrl.trim(),
+        sections: chosenSections,
+        meta_title: newPageMetaTitle.trim(),
+        meta_description: newPageMetaDescription.trim(),
+      });
       const createdUrl = res.data?.url;
       setNewPageOpen(false);
       setChosenSections([]);
       setNewPageUrl('');
+      setNewPageMetaTitle('');
+      setNewPageMetaDescription('');
       // Navigate the iframe to the freshly-scaffolded page
       if (createdUrl && iframeRef.current) {
         iframeRef.current.src = '/preview' + createdUrl + '?_t=' + Date.now();
@@ -892,6 +1088,56 @@ export default function ProjectPreview() {
       setNewPageError(err.response?.data?.error || 'Failed to create page');
     } finally {
       setNewPageCreating(false);
+    }
+  }
+
+  function submitGoTo() {
+    setGoToError('');
+    const raw = goToUrl.trim();
+    if (!raw) { setGoToError('Type a URL like /blogs/my-post'); return; }
+    // Accept absolute URLs (http://…/path) → strip origin to project-relative path.
+    // Accept project-relative URLs (with or without leading slash).
+    let pathOnly = raw;
+    try {
+      if (/^https?:\/\//i.test(raw)) {
+        const u = new URL(raw);
+        pathOnly = u.pathname + (u.search || '') + (u.hash || '');
+      }
+    } catch { /* fall through with raw */ }
+    if (!pathOnly.startsWith('/')) pathOnly = '/' + pathOnly;
+    if (iframeRef.current) {
+      iframeRef.current.src = '/preview' + pathOnly + (pathOnly.includes('?') ? '&' : '?') + '_t=' + Date.now();
+    }
+    setGoToOpen(false);
+  }
+
+  async function submitNewBlog() {
+    setBlogError('');
+    if (!blogTitle.trim()) { setBlogError('Title is required'); return; }
+    if (!blogSlug.trim()) { setBlogError('Slug is required'); return; }
+    if (!blogMetaTitle.trim()) { setBlogError('Meta title is required'); return; }
+    if (!blogMetaDescription.trim()) { setBlogError('Meta description is required'); return; }
+    setBlogCreating(true);
+    try {
+      const res = await apiClient.createBlog(id, {
+        title: blogTitle.trim(),
+        slug: blogSlug.trim() || undefined,
+        meta_title: blogMetaTitle.trim() || undefined,
+        meta_description: blogMetaDescription.trim() || undefined,
+      });
+      const createdUrl = res.data?.url;
+      setBlogOpen(false);
+      setBlogTitle(''); setBlogSlug(''); setBlogMetaTitle(''); setBlogMetaDescription('');
+      // Navigate iframe to the freshly-scaffolded blog page so it's immediately
+      // editable via the AI flow (click any element → describe a change).
+      if (createdUrl && iframeRef.current) {
+        iframeRef.current.src = '/preview' + createdUrl + '?_t=' + Date.now();
+      }
+      addChat('ai', `Blog created at ${createdUrl}. Click on the heading, image, or body to edit each piece.`, 'success');
+    } catch (err) {
+      setBlogError(err.response?.data?.error || 'Failed to create blog');
+    } finally {
+      setBlogCreating(false);
     }
   }
 
@@ -1015,9 +1261,10 @@ export default function ProjectPreview() {
           image_media_type: submittedImage.mediaType
         })
       });
-      // Keep selectedElement across follow-up prompts so the user can refine the
-      // edit without re-clicking Select. Cleared only when they pick a new element
-      // or when the change is accepted (status='review').
+      // Keep selectedElement (and the red overlay) across follow-up prompts so the
+      // user can refine an edit on the same section repeatedly without re-clicking
+      // Select. Selection is only cleared when the user explicitly picks a new
+      // element (Select mode) or navigates to a different page.
       const cr = res.data;
       setImage(null);
       setResult({ id: cr.id, status: cr.status, message: 'Processing…', stagingUrl: null });
@@ -1110,9 +1357,13 @@ export default function ProjectPreview() {
             setPendingDiff(null);
             setStreamingTokens('');
             setLastAppliedId(cr.id);
-            // Change accepted — clear selection so the next unrelated prompt requires a fresh pick
-            setSelectedElement(null);
-            clearHighlight();
+            // DO NOT clear selectedElement here — the user often wants to keep
+            // editing the same section across many prompts ("now make it red",
+            // "now move it down", "now change the heading"). Re-acquiring the
+            // selection after every successful edit is the bug we're fixing.
+            // Selection only resets when they explicitly click Select on a new
+            // element. Keep the red overlay visible too as a confirmation that
+            // the section is still locked in.
           } else if (s === 'failed') {
             setResult(prev => ({ ...prev, id: cr.id, status: 'failed', message: 'Change failed' }));
             setPendingDiff(null);
@@ -1171,8 +1422,67 @@ export default function ProjectPreview() {
                 <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 border border-emerald-100">Live</span>
               </div>
               <div className="flex items-center gap-0.5 flex-shrink-0">
-                <button onClick={openNewPage} title="Create a new page from sections"
-                  className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">+ Page</button>
+                <div className="relative">
+                  <button onClick={() => setNewMenuOpen(o => !o)} title="Create a new page or blog"
+                    className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">
+                    + New ▾
+                  </button>
+                  {newMenuOpen && (
+                    <>
+                      {/* click-outside catcher */}
+                      <div className="fixed inset-0 z-40" onClick={() => setNewMenuOpen(false)} />
+                      <div className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 min-w-[120px] overflow-hidden">
+                        <button onClick={() => { setNewMenuOpen(false); openNewPage(); }}
+                          className="block w-full text-left px-3 py-2 text-[12px] text-gray-700 hover:bg-gray-50">
+                          Page
+                          <div className="text-[10px] text-gray-400">From sections</div>
+                        </button>
+                        <button onClick={() => { setNewMenuOpen(false); setBlogOpen(true); setBlogError(''); setBlogTitle(''); setBlogSlug(''); setBlogMetaTitle(''); setBlogMetaDescription(''); }}
+                          className="block w-full text-left px-3 py-2 text-[12px] text-gray-700 hover:bg-gray-50 border-t border-gray-100">
+                          Blog
+                          <div className="text-[10px] text-gray-400">Image · heading · body</div>
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+                {/* Go to — type any project-relative URL and the iframe jumps to it.
+                    Useful when the URL isn't reachable through navigation
+                    (deep links, draft pages, etc.). Submits on Enter; closes on
+                    Escape, click-outside, or successful go. */}
+                <div className="relative">
+                  <button onClick={() => { setGoToOpen(o => !o); setGoToError(''); }} title="Go to a specific URL"
+                    className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">
+                    → Go to
+                  </button>
+                  {goToOpen && (
+                    <>
+                      <div className="fixed inset-0 z-40" onClick={() => setGoToOpen(false)} />
+                      <div className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 p-3 w-72">
+                        <label className="block text-[11px] font-medium text-gray-700 mb-1">Navigate to URL</label>
+                        <input value={goToUrl} onChange={e => setGoToUrl(e.target.value)} autoFocus
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') { e.preventDefault(); submitGoTo(); }
+                            else if (e.key === 'Escape') setGoToOpen(false);
+                          }}
+                          placeholder="/blogs/my-post or /toptracer"
+                          className="w-full px-2.5 py-1.5 border border-gray-300 rounded-md text-[12px] text-gray-900 placeholder:text-gray-400 bg-white focus:outline-none focus:border-gray-500" />
+                        {goToError && <div className="text-[10.5px] text-red-600 mt-1">{goToError}</div>}
+                        <div className="flex gap-1.5 mt-2 justify-end">
+                          <button onClick={() => setGoToOpen(false)}
+                            className="text-[11px] px-2 py-1 text-gray-600 hover:text-gray-900">Cancel</button>
+                          <button onClick={submitGoTo}
+                            className="text-[11px] px-3 py-1 bg-gray-900 text-white rounded-md hover:opacity-90">Go</button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+                <button onClick={() => setLiveEditMode(v => !v)}
+                  title={liveEditMode ? 'Exit live edit mode' : 'Edit text and images directly on the page'}
+                  className={`text-[11px] px-2 py-1 rounded-md transition-colors font-medium ${liveEditMode ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'text-gray-700 hover:bg-gray-100'}`}>
+                  {liveEditMode ? '✓ Editing' : '✎ Edit'}
+                </button>
                 <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
                   title="Refresh preview"
                   className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↻</button>
@@ -1207,6 +1517,51 @@ export default function ProjectPreview() {
               </div>
             )}
             {chatMessages.map(msg => {
+              if (msg.type === 'live_edit' && msg.data) {
+                // Inline-edit bubble: shows what changed + a Revert button.
+                // Reverted edits gray out. Accept either `previous`/`value` (old
+                // schema) or `previous_value`/`new_value` (current schema; what
+                // the backend writes when POST /text-overrides creates the chat
+                // row). Both forms exist in chat history at the moment.
+                const d = msg.data;
+                const previous = d.previous_value ?? d.previous ?? '';
+                const value = d.new_value ?? d.value ?? '';
+                const oid = d.override_id;
+                const isReverted = oid && revertedOverrides.has(oid);
+                const fieldLabel = d.field === 'src' ? 'Image' : d.field === 'alt' ? 'Alt text' : 'Text';
+                return (
+                  <div key={msg.id} className={`rounded-xl border ${isReverted ? 'border-gray-300 bg-gray-50' : 'border-emerald-300 bg-emerald-50/40'} px-3 py-2 text-xs`}>
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={isReverted ? 'text-gray-500' : 'text-emerald-700'}>
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                      </svg>
+                      <span className={`font-semibold ${isReverted ? 'text-gray-600' : 'text-emerald-800'}`}>
+                        {isReverted ? `Reverted ${fieldLabel.toLowerCase()} edit` : `Live edit · ${fieldLabel}`}
+                      </span>
+                      <span className="text-[10px] text-gray-500 truncate flex-1 text-right font-mono">{d.url}</span>
+                    </div>
+                    {d.field === 'src' ? (
+                      <div className="space-y-0.5 text-[11px]">
+                        <div className="text-gray-600 truncate">from <span className="font-mono">{truncate(previous || '(none)', 60)}</span></div>
+                        <div className="text-gray-800 truncate">to <span className="font-mono">{truncate(value, 60)}</span></div>
+                      </div>
+                    ) : (
+                      <div className="space-y-0.5 text-[11px]">
+                        <div className="text-gray-600 line-through truncate">{truncate(previous, 80) || <em>(empty)</em>}</div>
+                        <div className="text-gray-900 truncate">{truncate(value, 80)}</div>
+                      </div>
+                    )}
+                    {!isReverted && oid && (
+                      <div className="flex justify-end mt-1.5">
+                        <button onClick={() => handleRevertOverride(oid)}
+                          className="text-[11px] text-gray-700 hover:text-red-600 px-2 py-0.5 rounded-md border border-gray-300 hover:bg-white">
+                          ↩ Revert this edit
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              }
               if (msg.type === 'file_change' && msg.data) {
                 const isExpanded = expandedDiffs.has(msg.id);
                 const reqId = msg.data.requestId;
@@ -1283,15 +1638,25 @@ export default function ProjectPreview() {
                   </div>
                 );
               }
+              // AI clarification questions get a warm amber palette so they
+              // read as "needs your input" rather than informational. Tailwind's
+              // built-in palette doesn't have these specific hexes, so we apply
+              // them via inline style; the className still owns layout.
+              const isQuestion = msg.role !== 'user' && msg.type === 'question';
+              const qStyle = isQuestion
+                ? { backgroundColor: '#FFF9E3', color: '#D39401', borderColor: '#D39401' }
+                : undefined;
               return (
                 <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                  <div className={`max-w-[88%] text-[13px] leading-relaxed ${
+                  <div
+                    style={qStyle}
+                    className={`max-w-[88%] text-[13px] leading-relaxed ${
                     msg.role === 'user'
                       ? 'rounded-2xl rounded-br-sm bg-gray-200 text-gray-900 px-3.5 py-2'
                       : msg.type === 'error'
                       ? 'rounded-xl bg-red-50 text-red-800 border border-red-300 px-3 py-2 font-medium'
-                      : msg.type === 'question'
-                      ? 'rounded-xl bg-blue-50 text-blue-900 border border-blue-300 px-3 py-2 font-medium'
+                      : isQuestion
+                      ? 'rounded-xl px-3 py-2 font-medium border'
                       : msg.type === 'success'
                       ? 'rounded-xl bg-gray-50 text-gray-900 border border-gray-400 px-3 py-2 font-medium'
                       : msg.type === 'confirm'
@@ -1543,12 +1908,27 @@ export default function ProjectPreview() {
             </div>
 
             <div className="px-5 py-4 overflow-y-auto" style={{ scrollbarWidth: 'thin' }}>
-              <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">URL</label>
+              <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">URL <span className="text-red-500">*</span></label>
               <input value={newPageUrl} onChange={e => { setNewPageUrl(e.target.value); setNewPageError(''); }}
                 placeholder="/play/coaching" autoFocus
                 onKeyDown={e => { if (e.key === 'Enter') submitNewPage(); }}
                 className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm text-black focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 mb-1 placeholder:text-stone-400" />
               <p className="text-[10px] text-stone-500 mb-4">The last segment becomes the blade filename. Letters, digits, dashes, underscores only.</p>
+
+              <div className="grid grid-cols-2 gap-3 mb-4">
+                <div>
+                  <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">Meta title <span className="text-red-500">*</span> <span className="text-stone-400 normal-case font-normal">(SEO)</span></label>
+                  <input value={newPageMetaTitle} onChange={e => { setNewPageMetaTitle(e.target.value); setNewPageError(''); }}
+                    placeholder="Browser tab title"
+                    className="w-full px-3 py-2 border-2 border-stone-200 rounded-xl text-sm text-black placeholder:text-stone-400 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400" />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-1.5">Meta description <span className="text-red-500">*</span> <span className="text-stone-400 normal-case font-normal">(SEO)</span></label>
+                  <input value={newPageMetaDescription} onChange={e => { setNewPageMetaDescription(e.target.value); setNewPageError(''); }}
+                    placeholder="Short description shown in search results"
+                    className="w-full px-3 py-2 border-2 border-stone-200 rounded-xl text-sm text-black placeholder:text-stone-400 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400" />
+                </div>
+              </div>
 
               <div className="grid grid-cols-3 gap-3">
                 <div className="col-span-2">
@@ -1689,10 +2069,62 @@ export default function ProjectPreview() {
             <div className="flex gap-2 px-5 py-4 border-t border-gray-100 bg-gray-50 rounded-b-2xl">
               <button onClick={() => !newPageCreating && setNewPageOpen(false)}
                 className="flex-1 py-2 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-100">Cancel</button>
-              <button onClick={submitNewPage} disabled={newPageCreating || !newPageUrl.trim() || chosenSections.length === 0}
+              <button onClick={submitNewPage} disabled={newPageCreating || !newPageUrl.trim() || !newPageMetaTitle.trim() || !newPageMetaDescription.trim() || chosenSections.length === 0}
                 className="flex-1 py-2 text-white rounded-xl text-sm font-semibold disabled:opacity-50"
                 style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
                 {newPageCreating ? 'Creating…' : 'Create page'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {blogOpen && (
+        <>
+          <div className="fixed inset-0 bg-black/40 z-50" onClick={() => !blogCreating && setBlogOpen(false)} />
+          <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md z-50">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">Create new blog</h3>
+            <p className="text-xs text-gray-500 mb-4">A blank blog page with placeholder image, heading, and body. Click any element after creation to edit via AI.</p>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Title <span className="text-red-500">*</span></label>
+                <input value={blogTitle} onChange={e => setBlogTitle(e.target.value)} autoFocus
+                  placeholder="My First Blog Post"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder:text-gray-400 bg-white" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Slug <span className="text-red-500">*</span></label>
+                <input value={blogSlug} onChange={e => setBlogSlug(e.target.value)}
+                  placeholder="my-first-blog-post"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder:text-gray-400 bg-white font-mono" />
+                <p className="text-[10px] text-gray-400 mt-1">URL: /blogs/{blogSlug || '<slug>'}</p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Meta title <span className="text-red-500">*</span> <span className="text-gray-400 font-normal">(SEO)</span></label>
+                <input value={blogMetaTitle} onChange={e => setBlogMetaTitle(e.target.value)}
+                  placeholder={blogTitle || 'Browser tab title'}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder:text-gray-400 bg-white" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Meta description <span className="text-red-500">*</span> <span className="text-gray-400 font-normal">(SEO)</span></label>
+                <textarea value={blogMetaDescription} onChange={e => setBlogMetaDescription(e.target.value)}
+                  rows={2}
+                  placeholder="Short description shown in search results"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder:text-gray-400 bg-white resize-none" />
+              </div>
+
+              {blogError && <div className="p-2 bg-red-50 border border-red-200 text-red-700 rounded text-xs">{blogError}</div>}
+            </div>
+
+            <div className="flex gap-2 mt-5">
+              <button type="button" onClick={() => !blogCreating && setBlogOpen(false)}
+                className="flex-1 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50">Cancel</button>
+              <button onClick={submitNewBlog}
+                disabled={blogCreating || !blogTitle.trim() || !blogSlug.trim() || !blogMetaTitle.trim() || !blogMetaDescription.trim()}
+                className="flex-1 py-2 text-white rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
+                style={{ background: 'linear-gradient(135deg, #1b4332, #2d6a4f)' }}>
+                {blogCreating ? 'Creating…' : 'Create blog'}
               </button>
             </div>
           </div>

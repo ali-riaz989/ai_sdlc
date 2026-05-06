@@ -1,0 +1,36 @@
+{{-- Blog template — injected verbatim into newly-created blog pages.
+     Project-agnostic; uses the host project's existing layout (e.g. layouts.static
+     for LGC) so the new page inherits header/footer/CSS automatically. Image,
+     heading, and body are placeholder so the user can click each in the AI
+     editor and customize. --}}
+<section class="blog-detail-section py-5">
+    <div class="container">
+        <article class="blog-post mx-auto" style="max-width: 800px;">
+            <header class="blog-header mb-4">
+                <h1 class="blog-title">__BLOG_TITLE__</h1>
+                <p class="blog-meta text-muted">
+                    <span class="blog-date">__BLOG_DATE__</span>
+                </p>
+            </header>
+
+            {{-- Inline SVG data-URI placeholder so the page renders cleanly
+                 without a real /images/placeholder.jpg in the project. Clicking
+                 the <img> in the AI editor still works — the mechanical
+                 src-swap replaces this with `{{ asset('images/<uploaded>') }}`
+                 once the user uploads a real image. --}}
+            <div class="blog-image mb-4">
+                <img
+                    src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><rect width='800' height='450' fill='%23e9ecef'/><g fill='%23adb5bd' font-family='system-ui,sans-serif' text-anchor='middle'><text x='400' y='215' font-size='28' font-weight='600'>Click to upload an image</text><text x='400' y='250' font-size='15'>Select this image, then drop or paste a file in the chat</text></g></svg>"
+                    alt="__BLOG_TITLE__"
+                    class="img-fluid rounded"
+                    style="width: 100%; height: auto;">
+            </div>
+
+            <div class="blog-body">
+                <p>Start writing your blog post here. Click on this paragraph to change the text, click on the image above to replace it, or click on the heading to rename the post.</p>
+
+                <p>You can describe your topic, share insights, or tell a story. Use the AI editor to add new sections, change styles, or restructure the content however you like.</p>
+            </div>
+        </article>
+    </div>
+</section>

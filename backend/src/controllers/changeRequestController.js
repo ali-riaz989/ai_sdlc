@@ -613,6 +613,72 @@ class ChangeRequestController {
         return;
       }
 
+      // ── File deletion (SHAPE D) ─────────────────────────────────────────
+      // Used for "remove this page" / "delete blog X" intents. We delete the
+      // chosen blade file AND, when it lives under static_pages/ or blogs/,
+      // automatically strip the matching Route::get(<url>, …) from
+      // routes/web.php so the URL no longer resolves. Both file states are
+      // saved into generated_code so the existing Restore button rebuilds
+      // them on revert.
+      if (generated.mode === 'delete') {
+        const delTargetAbs = path.join(project.local_path, generated.file_path);
+        let delOriginal;
+        try { delOriginal = await fs.readFile(delTargetAbs, 'utf-8'); }
+        catch { await this._fail(requestId, emit, `Cannot delete file (not found or unreadable): ${generated.file_path}`); return; }
+
+        emitFile(generated.file_path, 'delete', 'generating');
+        await fs.unlink(delTargetAbs);
+
+        // Auto-cleanup of the route entry — applies only to user-scaffolded
+        // pages (static_pages/, blogs/). Other deletions (rare) leave web.php
+        // alone.
+        const isUserPage = /resources[\\/]+views[\\/]+frontend[\\/]+(static_pages|blogs)[\\/]+/.test(generated.file_path);
+        const diffEntries = [{
+          file_path: generated.file_path,
+          change_type: 'delete',
+          diff: { old_block: delOriginal, new_block: '', reasoning: generated.reasoning || 'Page removed' }
+        }];
+
+        await sequelize.query(
+          `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
+           VALUES ($1, $2, $3, $4, $5, 'delete', $6)`,
+          { bind: [uuidv4(), requestId, generated.file_path, delOriginal, '', JSON.stringify(diffEntries[0].diff)] }
+        );
+
+        if (isUserPage) {
+          const slug = path.basename(generated.file_path, '.blade.php');
+          const webRel = 'routes/web.php';
+          const webAbs = path.join(project.local_path, webRel);
+          try {
+            const webOrig = await fs.readFile(webAbs, 'utf-8');
+            // Remove any Route::<verb>(...) statement whose first quoted arg
+            // ends with the slug. Conservative: matches the slug as the last
+            // segment so /play/coaching and /coaching are both caught.
+            const slugEsc = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const re = new RegExp(`^[ \\t]*Route::\\w+\\(\\s*['"][^'"]*\\b${slugEsc}['"][^;]*;[ \\t]*\\r?\\n?`, 'gm');
+            const webNew = webOrig.replace(re, '');
+            if (webNew !== webOrig) {
+              emitFile(webRel, 'modify', 'generating');
+              await fs.writeFile(webAbs, webNew, 'utf-8');
+              await sequelize.query(
+                `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
+                 VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+                { bind: [uuidv4(), requestId, webRel, webOrig, webNew, JSON.stringify({ old_block: webOrig, new_block: webNew, reasoning: 'Removed route for deleted page' })] }
+              );
+              diffEntries.push({ file_path: webRel, change_type: 'modify', diff: { old_block: webOrig, new_block: webNew, reasoning: 'Removed route for deleted page' } });
+            }
+          } catch (e) {
+            logger.warn('Could not strip route from web.php after page deletion', { error: e.message });
+          }
+        }
+
+        await this._clearViewCache(project.local_path);
+        await this._updateStatus(requestId, 'pending_review');
+        emit('pending_review', JSON.stringify({ message: 'Page removed', diff: diffEntries }));
+        logger.info('Page deletion applied', { requestId, file: generated.file_path, reasoning: generated.reasoning });
+        return;
+      }
+
       // Load the full file the AI chose
       const targetAbs = path.join(project.local_path, generated.file_path);
       let targetOriginal;

@@ -4,7 +4,6 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
-import RecentRequests from '@/components/features/dashboard/RecentRequests';
 import AddProjectModal from '@/components/features/projects/AddProjectModal';
 
 export default function Home() {
@@ -172,8 +171,6 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Recent change requests — full-width listing under the projects grid */}
-            <RecentRequests />
           </div>
         )}
       </main>

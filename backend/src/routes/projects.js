@@ -180,9 +180,11 @@ router.post('/:id/ensure-section-previews', authenticateToken, async (req, res, 
 // Returns: { url, blade_file, route }
 router.post('/:id/pages', authenticateToken, async (req, res, next) => {
   try {
-    const { url, sections } = req.body || {};
+    const { url, sections, meta_title, meta_description } = req.body || {};
     if (typeof url !== 'string' || !url.trim()) return res.status(400).json({ error: 'url is required' });
     if (!Array.isArray(sections) || !sections.length) return res.status(400).json({ error: 'sections must be a non-empty array' });
+    if (typeof meta_title !== 'string' || !meta_title.trim()) return res.status(400).json({ error: 'meta_title is required' });
+    if (typeof meta_description !== 'string' || !meta_description.trim()) return res.status(400).json({ error: 'meta_description is required' });
 
     const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
     if (!projects.length) return res.status(404).json({ error: 'Project not found' });
@@ -259,8 +261,18 @@ router.post('/:id/pages', authenticateToken, async (req, res, next) => {
         return res.status(500).json({ error: `failed to render section "${s}": ${msg}` });
       }
     }
+    // Patch the project's layout(s) so @yield('meta_title') and
+    // @yield('meta_description') back the per-page <title> + meta description.
+    // Same idempotent helper that blog creation uses — no-op after the first
+    // call. See ensureLayoutMetaYields() further down for the implementation.
+    await ensureLayoutMetaYields(localPath, ['layouts/static.blade.php']);
+
     const bladeBody = bladeParts.join('\n\n');
+    const safe = (s) => String(s || '').replace(/[<>]/g, '').replace(/'/g, "\\'");
     const bladeContent = `@extends('layouts.static')
+
+@section('meta_title', '${safe(meta_title)}')
+@section('meta_description', '${safe(meta_description)}')
 
 @section('content')
 ${bladeBody}
@@ -275,10 +287,140 @@ ${bladeBody}
     const newWebContent = insertRouteAboveCatchAll(webContent, routeLine);
     await fs.writeFile(webPhpAbs, newWebContent, 'utf-8');
 
+    // Clear compiled views so Blade picks up the patched layout immediately
+    await new Promise(resolve => require('child_process').exec('php artisan view:clear', { cwd: localPath }, () => resolve()));
+
     logger.info('Page scaffolded', { url: routePath, blade: bladeRel, sections: sections.length });
     res.json({ url: routePath, blade_file: bladeRel, route: routeLine });
   } catch (error) { next(error); }
 });
+
+// POST /api/projects/:id/blogs - Scaffold a new blog detail page from the
+// project-agnostic template at backend/templates/blog-page.html.
+//
+// Body: { url: "/blogs/my-first-post", title: "My First Post" }
+//   - URL becomes the route path; last segment is the blade filename
+//   - title is substituted into the template heading and image alt text
+//
+// Output:
+//   1. resources/views/frontend/blogs/<slug>.blade.php (extends layouts.static
+//      so it picks up the project's existing header/footer/CSS — works the
+//      same for LGC today and any future project that has a layout named
+//      `static`. The layout name could be made configurable per-project later.)
+//   2. Route::get('<url>', ...) inserted into routes/web.php
+//
+// Returns: { url, blade_file }
+router.post('/:id/blogs', authenticateToken, async (req, res, next) => {
+  try {
+    const { slug: rawSlug, title, meta_title, meta_description } = req.body || {};
+    if (typeof title !== 'string' || !title.trim()) return res.status(400).json({ error: 'title is required' });
+
+    // Slug is optional — derive from title if not provided. Filename + URL come
+    // from this single value (we don't ask for a separate URL because the slug
+    // IS the URL's last segment for blogs: /blogs/<slug>).
+    const derivedSlug = (rawSlug && String(rawSlug).trim())
+      || title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(derivedSlug)) {
+      return res.status(400).json({ error: 'slug must contain only letters, digits, underscores, dashes' });
+    }
+    const slug = derivedSlug;
+    const cleanUrl = `/blogs/${slug}`;
+
+    const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+    const localPath = projects[0].local_path;
+
+    const bladeRel = path.join('resources', 'views', 'frontend', 'blogs', `${slug}.blade.php`);
+    const bladeAbs = path.join(localPath, bladeRel);
+    try { await fs.access(bladeAbs); return res.status(409).json({ error: 'A blog with this slug already exists' }); }
+    catch {}
+
+    const webPhpAbs = path.join(localPath, 'routes/web.php');
+    let webContent;
+    try { webContent = await fs.readFile(webPhpAbs, 'utf-8'); }
+    catch { return res.status(500).json({ error: 'routes/web.php not found in project' }); }
+    const escaped = `blogs/${slug}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`Route::\\w+\\s*\\(\\s*['"]\\/?${escaped}['"]`).test(webContent)) {
+      return res.status(409).json({ error: 'Route already exists for this slug' });
+    }
+
+    // Patch the project's layout(s) so <title> and <meta name="description"> can
+    // be overridden per-page via @yield. Idempotent — only rewrites the static
+    // tags if they don't already use @yield. We try layouts.static first since
+    // that's what blog pages extend; if absent, we fall through.
+    await ensureLayoutMetaYields(localPath, ['layouts/static.blade.php']);
+
+    const templatePath = path.join(__dirname, '..', '..', 'templates', 'blog-page.html');
+    let template;
+    try { template = await fs.readFile(templatePath, 'utf-8'); }
+    catch { return res.status(500).json({ error: 'blog template missing on server' }); }
+    const today = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+    const safe = (s) => String(s || '').replace(/[<>]/g, '').replace(/'/g, "\\'");
+    const body = template
+      .replace(/__BLOG_TITLE__/g, safe(title))
+      .replace(/__BLOG_DATE__/g, today);
+
+    const finalMetaTitle = (meta_title && String(meta_title).trim()) || title.trim();
+    const finalMetaDesc = (meta_description && String(meta_description).trim()) || '';
+
+    // The two @section directives feed @yield('meta_title') / @yield('meta_description')
+    // we just patched into the layout. Sections without args use a closing
+    // @endsection; for one-arg sections we use the inline form so the file stays compact.
+    const bladeContent =
+`@extends('layouts.static')
+
+@section('meta_title', '${safe(finalMetaTitle)}')
+@section('meta_description', '${safe(finalMetaDesc)}')
+
+@section('content')
+${body}
+@endsection
+`;
+    await fs.mkdir(path.dirname(bladeAbs), { recursive: true });
+    await fs.writeFile(bladeAbs, bladeContent, 'utf-8');
+
+    const viewName = `frontend.blogs.${slug}`;
+    const routeLine = `Route::get('${cleanUrl}', function () { return view('${viewName}'); });`;
+    const newWebContent = insertRouteAboveCatchAll(webContent, routeLine);
+    await fs.writeFile(webPhpAbs, newWebContent, 'utf-8');
+
+    // Clear compiled views so Blade picks up the patched layout immediately
+    await new Promise(resolve => require('child_process').exec('php artisan view:clear', { cwd: localPath }, () => resolve()));
+
+    logger.info('Blog scaffolded', { url: cleanUrl, blade: bladeRel });
+    res.json({ url: cleanUrl, blade_file: bladeRel, slug, route: routeLine });
+  } catch (error) { next(error); }
+});
+
+// Idempotently patch the project's layout(s) so per-page meta_title and
+// meta_description sections work. Replaces the first hardcoded <title>...</title>
+// and <meta name="description" content="..."> with @yield-based versions, only
+// if the layout doesn't already use @yield. Safe to call repeatedly.
+async function ensureLayoutMetaYields(localPath, relLayoutPaths) {
+  for (const rel of relLayoutPaths) {
+    const abs = path.join(localPath, 'resources', 'views', rel);
+    let content;
+    try { content = await fs.readFile(abs, 'utf-8'); } catch { continue; }
+    let changed = false;
+    if (!/@yield\(\s*['"]meta_title['"]/.test(content)) {
+      const titleMatch = content.match(/<title>([^<]*)<\/title>/);
+      if (titleMatch) {
+        const fallback = titleMatch[1].trim() || 'Site';
+        content = content.replace(titleMatch[0], `<title>@yield('meta_title', '${fallback.replace(/'/g, "\\'")}')</title>`);
+        changed = true;
+      }
+    }
+    if (!/@yield\(\s*['"]meta_description['"]/.test(content)) {
+      const descMatch = content.match(/<meta\s+name=["']description["']\s+content=["']([^"']*)["']\s*\/?>/i);
+      if (descMatch) {
+        const fallback = (descMatch[1] || '').trim();
+        content = content.replace(descMatch[0], `<meta name="description" content="@yield('meta_description', '${fallback.replace(/'/g, "\\'")}')" />`);
+        changed = true;
+      }
+    }
+    if (changed) await fs.writeFile(abs, content, 'utf-8');
+  }
+}
 
 // POST /api/projects/:id/resolve-route - Map a live page URL to its blade file once,
 // so the chat-edit flow can skip repeating this on every prompt.
@@ -1052,6 +1194,127 @@ router.post('/:id/reset', authenticateToken, requireRole('admin'), async (req, r
     logger.error('Reset failed', { error: error.message });
     next(error);
   }
+});
+
+// POST /api/projects/:id/upload-image
+// Accepts a base64 image + media type, saves it to the project's
+// public/images/<file>, returns the asset URL. Used by the live-edit flow
+// when the user replaces an <img> by clicking it (parent receives a
+// dataUrl from the iframe and forwards it here). Body limit set generously
+// since images can be large; the express json limit (10mb) caps it.
+//
+// Response: { url: "/images/ai-1700000000.jpg", asset_path: "{{ asset('images/...') }}" }
+router.post('/:id/upload-image', authenticateToken, async (req, res, next) => {
+  try {
+    const { base64, media_type } = req.body || {};
+    if (!base64 || typeof base64 !== 'string') return res.status(400).json({ error: 'base64 is required' });
+    const [projects] = await sequelize.query('SELECT local_path FROM projects WHERE id = $1', { bind: [req.params.id] });
+    if (!projects.length) return res.status(404).json({ error: 'Project not found' });
+
+    const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp', 'image/svg+xml': '.svg' }[media_type] || '.jpg';
+    const filename = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 6)}${ext}`;
+    const uploadDir = path.join(projects[0].local_path, 'public', 'images');
+    await fs.mkdir(uploadDir, { recursive: true });
+    // Strip a leading "data:image/...;base64," prefix if the client sent the full data URL
+    const clean = base64.replace(/^data:[^,]+,/, '');
+    await fs.writeFile(path.join(uploadDir, filename), Buffer.from(clean, 'base64'));
+    const url = `/images/${filename}`;
+    res.json({ url, asset_path: `{{ asset('${url.substring(1)}') }}` });
+  } catch (error) { next(error); }
+});
+
+// ── Live edit (text/image overrides) ──────────────────────────────────────
+// Project-wide event-sourced override layer. Every save is a new row; "active"
+// value for a (url, selector, field) is the newest non-reverted row. Revert =
+// flip `reverted=true`, the next-newest non-reverted row becomes active. This
+// gives unlimited step-by-step undo without touching source code or the
+// project's own DB. See schema.sql for the table.
+
+// GET /api/projects/:id/text-overrides?url=/blogs/foo
+//   Returns the active override (latest non-reverted) for each (selector,
+//   field) on that URL. Used by the live-edit client to apply overrides on
+//   page load. Open to any authenticated user — overrides are project-scoped.
+router.get('/:id/text-overrides', authenticateToken, async (req, res, next) => {
+  try {
+    const url = (req.query.url || '').toString();
+    if (!url) return res.status(400).json({ error: 'url is required' });
+    // DISTINCT ON (selector, field) returns the newest row per group when we
+    // ORDER BY (selector, field) ASC, created_at DESC.
+    const [rows] = await sequelize.query(
+      `SELECT DISTINCT ON (selector, field)
+              id, selector, field, new_value, previous_value, created_at
+         FROM text_overrides
+        WHERE project_id = $1 AND url = $2 AND reverted = false
+        ORDER BY selector, field, created_at DESC`,
+      { bind: [req.params.id, url] }
+    );
+    res.json({ overrides: rows });
+  } catch (error) { next(error); }
+});
+
+// POST /api/projects/:id/text-overrides
+// Body: { url, selector, field, previous_value, new_value }
+// Creates a new event row + a chat_messages row of type 'live_edit' so the
+// edit appears in the user's chat thread alongside AI changes.
+router.post('/:id/text-overrides', authenticateToken, async (req, res, next) => {
+  try {
+    const { url, selector, field, previous_value, new_value } = req.body || {};
+    if (!url || !selector) return res.status(400).json({ error: 'url and selector are required' });
+    const fld = (field === 'src' || field === 'alt') ? field : 'text';
+    if (typeof new_value !== 'string') return res.status(400).json({ error: 'new_value must be a string' });
+
+    const [rows] = await sequelize.query(
+      `INSERT INTO text_overrides (project_id, url, selector, field, previous_value, new_value, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, url, selector, field, previous_value, new_value, created_at`,
+      { bind: [req.params.id, url, selector, fld, previous_value || null, new_value, req.user.id] }
+    );
+    const override = rows[0];
+
+    // Mirror into chat so the user sees their inline edits in the thread next
+    // to AI edits, with a Revert button. The bubble's renderer reads
+    // `data.override_id` and offers revert via the existing pattern.
+    await sequelize.query(
+      `INSERT INTO chat_messages (user_id, project_id, role, text, type, data)
+       VALUES ($1, $2, 'ai', $3, 'live_edit', $4)`,
+      { bind: [
+        req.user.id, req.params.id,
+        `Edited ${fld} on ${url}`,
+        JSON.stringify({
+          override_id: override.id,
+          url, selector, field: fld,
+          previous_value: override.previous_value,
+          new_value: override.new_value,
+        })
+      ]}
+    ).catch(() => {});
+
+    res.status(201).json(override);
+  } catch (error) { next(error); }
+});
+
+// POST /api/projects/:id/text-overrides/:oid/revert
+// Marks a specific override row as reverted. The next-most-recent non-reverted
+// row for the same (selector, field) becomes active automatically — that's
+// the "step back" behavior. Editors can revert their own; admins any.
+router.post('/:id/text-overrides/:oid/revert', authenticateToken, async (req, res, next) => {
+  try {
+    const oid = parseInt(req.params.oid, 10);
+    if (!Number.isFinite(oid)) return res.status(400).json({ error: 'invalid id' });
+
+    const [rows] = await sequelize.query(
+      'SELECT user_id, reverted FROM text_overrides WHERE id = $1 AND project_id = $2',
+      { bind: [oid, req.params.id] }
+    );
+    if (!rows.length) return res.status(404).json({ error: 'override not found' });
+    if (rows[0].reverted) return res.json({ ok: true, already_reverted: true });
+    if (req.user.role !== 'admin' && rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You can only revert your own edits' });
+    }
+
+    await sequelize.query('UPDATE text_overrides SET reverted = true WHERE id = $1', { bind: [oid] });
+    res.json({ ok: true });
+  } catch (error) { next(error); }
 });
 
 // ── Chat persistence ──────────────────────────────────────────────────────
