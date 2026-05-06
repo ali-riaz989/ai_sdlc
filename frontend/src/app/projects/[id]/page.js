@@ -1554,22 +1554,41 @@ export default function ProjectPreview() {
                         {isExpanded ? 'Hide diff' : 'Show diff'}
                       </button>
                     </div>
-                    <div className="px-3 py-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-[12px] font-mono text-gray-800 truncate flex-1" title={d.url}>{d.url}</span>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-emerald-600 flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>
-                      </div>
+                    <div className="px-3 py-2 space-y-1.5">
+                      {/* Show the URL only when it's an actual sub-page —
+                          on the homepage it's just "/" and reads as noise. */}
+                      {d.url && d.url !== '/' && (
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[12px] font-mono text-gray-800 truncate flex-1" title={d.url}>{d.url}</span>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-emerald-600 flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>
+                        </div>
+                      )}
+                      {/* Inline before → after preview, always visible. The
+                          previous value is struck through; the new value is
+                          plain. HTML markup is stripped for text edits so the
+                          bubble reads cleanly. "Show diff" toggle expands to
+                          a wider monospaced view for longer values. */}
+                      {(() => {
+                        const prevTxt = d.field === 'src' ? (previous || '(none)') : stripHtml(previous);
+                        const valTxt = d.field === 'src' ? value : stripHtml(value);
+                        return (
+                          <div className="space-y-0.5 text-[11px]">
+                            <div className="text-gray-500 line-through truncate">{truncate(prevTxt, 100) || <em className="text-gray-400">(empty)</em>}</div>
+                            <div className="text-gray-900 truncate">{truncate(valTxt, 100) || <em className="text-gray-400">(empty)</em>}</div>
+                          </div>
+                        );
+                      })()}
                       {isExpanded && (
-                        <div className="mt-1.5 rounded-md overflow-hidden border border-gray-300 bg-gray-50 text-[10.5px] font-mono leading-relaxed">
+                        <div className="rounded-md overflow-hidden border border-gray-300 bg-gray-50 text-[10.5px] font-mono leading-relaxed mt-1">
                           {d.field === 'src' ? (
                             <>
-                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(previous || '(none)', 200)}</pre>
-                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(value, 200)}</pre>
+                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(previous || '(none)', 400)}</pre>
+                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(value, 400)}</pre>
                             </>
                           ) : (
                             <>
-                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(stripHtml(previous), 200) || '(empty)'}</pre>
-                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(stripHtml(value), 200) || '(empty)'}</pre>
+                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(stripHtml(previous), 400) || '(empty)'}</pre>
+                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(stripHtml(value), 400) || '(empty)'}</pre>
                             </>
                           )}
                         </div>
@@ -1672,8 +1691,13 @@ export default function ProjectPreview() {
               // read as "needs your input" rather than informational. Tailwind's
               // built-in palette doesn't have these specific hexes, so we apply
               // them via inline style; the className still owns layout.
+              // AI clarification questions AND error responses share the same
+              // amber palette — both are "the AI needs your attention" prompts;
+              // distinct red for errors was alarming and visually duplicated
+              // the question bubble above it.
               const isQuestion = msg.role !== 'user' && msg.type === 'question';
-              const qStyle = isQuestion
+              const isAiError = msg.role !== 'user' && msg.type === 'error';
+              const qStyle = (isQuestion || isAiError)
                 ? { backgroundColor: '#FFF9E3', color: '#D39401', borderColor: '#D39401' }
                 : undefined;
               return (
@@ -1683,9 +1707,7 @@ export default function ProjectPreview() {
                     className={`max-w-[88%] text-[13px] leading-relaxed ${
                     msg.role === 'user'
                       ? 'rounded-2xl rounded-br-sm bg-gray-200 text-gray-900 px-3.5 py-2'
-                      : msg.type === 'error'
-                      ? 'rounded-xl bg-red-50 text-red-800 border border-red-300 px-3 py-2 font-medium'
-                      : isQuestion
+                      : (isQuestion || isAiError)
                       ? 'rounded-xl px-3 py-2 font-medium border'
                       : msg.type === 'success'
                       ? 'rounded-xl bg-gray-50 text-gray-900 border border-gray-400 px-3 py-2 font-medium'
