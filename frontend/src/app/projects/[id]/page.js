@@ -1729,6 +1729,13 @@ export default function ProjectPreview() {
               const qStyle = (isQuestion || isAiError)
                 ? { backgroundColor: '#FFF9E3', color: '#D39401', borderColor: '#D39401' }
                 : undefined;
+              // Visual line-break before each lettered/numbered option marker
+              // ("(a)", "(b)", "(1)", etc.) so multi-choice clarifications
+              // render with each option on its own line. Combined with
+              // `whitespace-pre-wrap` on the bubble, the inserted `\n`s become
+              // real line breaks at render time. No-op when no markers exist.
+              const formatOptions = (s) => String(s || '').replace(/(\S)[ \t]*\(([a-dA-D]|[1-9])\)[ \t]+/g, '$1\n($2) ');
+              const bubbleText = (isQuestion || isAiError) ? formatOptions(msg.text) : msg.text;
               return (
                 <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : ''}`}>
                   <div
@@ -1737,14 +1744,14 @@ export default function ProjectPreview() {
                     msg.role === 'user'
                       ? 'rounded-2xl rounded-br-sm bg-gray-200 text-gray-900 px-3.5 py-2'
                       : (isQuestion || isAiError)
-                      ? 'rounded-xl px-3 py-2 font-medium border'
+                      ? 'rounded-xl px-3 py-2 font-medium border whitespace-pre-wrap'
                       : msg.type === 'success'
                       ? 'rounded-xl bg-gray-50 text-gray-900 border border-gray-400 px-3 py-2 font-medium'
                       : msg.type === 'confirm'
                       ? 'rounded-xl bg-amber-50 text-amber-900 border border-amber-300 px-3 py-2 font-medium'
                       : 'text-gray-900 whitespace-pre-wrap'
                   }`}>
-                    {msg.text}
+                    {bubbleText}
                   </div>
                 </div>
               );
