@@ -1518,55 +1518,74 @@ export default function ProjectPreview() {
             )}
             {chatMessages.map(msg => {
               if (msg.type === 'live_edit' && msg.data) {
-                // Inline-edit bubble: shows what changed + a Revert button.
-                // Reverted edits gray out. Accept either `previous`/`value` (old
-                // schema) or `previous_value`/`new_value` (current schema; what
-                // the backend writes when POST /text-overrides creates the chat
-                // row). Both forms exist in chat history at the moment.
+                // Renders in the same gray "file_change" card style — header
+                // line with edit icon + summary + Show/Hide diff toggle, body
+                // showing the URL like a file path, footer with Revert. Diff
+                // is collapsed by default (per the user: don't show raw HTML
+                // in the bubble).
                 const d = msg.data;
                 const previous = d.previous_value ?? d.previous ?? '';
                 const value = d.new_value ?? d.value ?? '';
                 const oid = d.override_id;
                 const isReverted = oid && revertedOverrides.has(oid);
-                const fieldLabel = d.field === 'src' ? 'Image' : d.field === 'alt' ? 'Alt text' : 'Text';
-                return (
-                  <div key={msg.id} className={`rounded-xl border ${isReverted ? 'border-gray-300 bg-gray-50' : 'border-emerald-300 bg-emerald-50/40'} px-3 py-2 text-xs`}>
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={isReverted ? 'text-gray-500' : 'text-emerald-700'}>
-                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                      </svg>
-                      <span className={`font-semibold ${isReverted ? 'text-gray-600' : 'text-emerald-800'}`}>
-                        {isReverted ? `Reverted ${fieldLabel.toLowerCase()} edit` : `Live edit · ${fieldLabel}`}
-                      </span>
-                      <span className="text-[10px] text-gray-500 truncate flex-1 text-right font-mono">{d.url}</span>
-                    </div>
-                    {d.field === 'src' ? (
-                      <div className="space-y-0.5 text-[11px]">
-                        <div className="text-gray-600 truncate">from <span className="font-mono">{truncate(previous || '(none)', 60)}</span></div>
-                        <div className="text-gray-800 truncate">to <span className="font-mono">{truncate(value, 60)}</span></div>
+                const fieldLabel = d.field === 'src' ? 'image' : d.field === 'alt' ? 'alt text' : 'text';
+                const isExpanded = expandedDiffs.has(msg.id);
+                const stripHtml = (s) => String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+                if (isReverted) {
+                  return (
+                    <div key={msg.id} className="rounded-xl border border-gray-400 bg-gray-50 px-3 py-2 text-xs text-gray-800">
+                      <div className="flex items-center gap-1.5 font-semibold text-gray-900">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                        Reverted {fieldLabel} edit
                       </div>
-                    ) : (
-                      // Text overrides now save innerHTML to preserve inline
-                      // children (icons inside buttons, <strong>, etc.). Strip
-                      // tags + collapse whitespace for the bubble preview so
-                      // diffs read cleanly without raw markup leaking through.
-                      (() => {
-                        const stripHtml = (s) => String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-                        const prevTxt = stripHtml(previous);
-                        const valTxt = stripHtml(value);
-                        return (
-                          <div className="space-y-0.5 text-[11px]">
-                            <div className="text-gray-600 line-through truncate">{truncate(prevTxt, 80) || <em>(empty)</em>}</div>
-                            <div className="text-gray-900 truncate">{truncate(valTxt, 80)}</div>
-                          </div>
-                        );
-                      })()
-                    )}
-                    {!isReverted && oid && (
-                      <div className="flex justify-end mt-1.5">
-                        <button onClick={() => handleRevertOverride(oid)}
-                          className="text-[11px] text-gray-700 hover:text-red-600 px-2 py-0.5 rounded-md border border-gray-300 hover:bg-white">
-                          ↩ Revert this edit
+                      <div className="mt-0.5 text-[11px] text-gray-700 font-mono truncate">{d.url}</div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div key={msg.id} className="rounded-xl border border-gray-400 bg-white">
+                    <div className="px-3 py-2 border-b border-gray-200 flex items-center gap-1.5">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-500"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                      <span className="text-[12px] font-medium text-gray-800 flex-1">Live edited {fieldLabel}</span>
+                      <button type="button" onClick={() => toggleDiffExpanded(msg.id)}
+                        className="text-[11px] text-gray-500 hover:text-gray-800 px-1.5 py-0.5 rounded hover:bg-gray-100 transition-colors">
+                        {isExpanded ? 'Hide diff' : 'Show diff'}
+                      </button>
+                    </div>
+                    <div className="px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-[12px] font-mono text-gray-800 truncate flex-1" title={d.url}>{d.url}</span>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-emerald-600 flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>
+                      </div>
+                      {isExpanded && (
+                        <div className="mt-1.5 rounded-md overflow-hidden border border-gray-300 bg-gray-50 text-[10.5px] font-mono leading-relaxed">
+                          {d.field === 'src' ? (
+                            <>
+                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(previous || '(none)', 200)}</pre>
+                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(value, 200)}</pre>
+                            </>
+                          ) : (
+                            <>
+                              <pre className="px-2 py-1 bg-red-50/60 text-red-700 whitespace-pre-wrap break-all max-h-24 overflow-auto">- {truncate(stripHtml(previous), 200) || '(empty)'}</pre>
+                              <pre className="px-2 py-1 bg-emerald-50/60 text-emerald-800 whitespace-pre-wrap break-all max-h-24 overflow-auto">+ {truncate(stripHtml(value), 200) || '(empty)'}</pre>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    {oid && (
+                      <div className="px-3 py-2 border-t border-gray-200 flex items-center justify-between">
+                        <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
+                          Checkpoint
+                        </div>
+                        <button type="button" onClick={() => handleRevertOverride(oid)}
+                          title="Restore the value as it was before this edit"
+                          className="flex items-center gap-1 text-[11px] text-gray-700 hover:text-gray-900 px-2 py-1 rounded-md border border-gray-400 hover:bg-gray-50 transition-colors">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                          Restore
                         </button>
                       </div>
                     )}
