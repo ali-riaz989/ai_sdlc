@@ -1478,7 +1478,16 @@ export default function ProjectPreview() {
                     </>
                   )}
                 </div>
-                <button onClick={() => setLiveEditMode(v => !v)}
+                <button onClick={() => {
+                  // Live edit and Select are mutually exclusive: contenteditable
+                  // and the select-overlay click capture would fight over the
+                  // same clicks. Turning Edit on cancels Select.
+                  setLiveEditMode(v => {
+                    const next = !v;
+                    if (next) { setSelectMode(false); clearHighlight(); }
+                    return next;
+                  });
+                }}
                   title={liveEditMode ? 'Exit live edit mode' : 'Edit text and images directly on the page'}
                   className={`text-[11px] px-2 py-1 rounded-md transition-colors font-medium ${liveEditMode ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'text-gray-700 hover:bg-gray-100'}`}>
                   {liveEditMode ? '✓ Editing' : '✎ Edit'}
@@ -1486,7 +1495,17 @@ export default function ProjectPreview() {
                 <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
                   title="Refresh preview"
                   className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↻</button>
-                <button onClick={() => { clearHighlight(); setSelectMode(v => !v); }}
+                <button onClick={() => {
+                  // Mirror of the Edit toggle — turning Select on cancels Live edit
+                  // so the iframe doesn't have both contenteditable AND the
+                  // hover/click overlay simultaneously fighting over events.
+                  clearHighlight();
+                  setSelectMode(v => {
+                    const next = !v;
+                    if (next) setLiveEditMode(false);
+                    return next;
+                  });
+                }}
                   title={selectMode ? 'Cancel select' : 'Select an element'}
                   className={`text-[11px] px-2 py-1 rounded-md transition-colors ${selectMode ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100'}`}>
                   {selectMode ? '✓ Selecting' : '⊹ Select'}
