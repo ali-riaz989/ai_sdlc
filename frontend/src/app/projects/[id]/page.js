@@ -632,7 +632,7 @@ export default function ProjectPreview() {
       // Editing those affects every page that extends the layout — warn explicitly.
       const isInLayout = bladeSrc && /\/(layouts|partials)\//.test(bladeSrc);
       const layoutFile = isInLayout ? bladeSrc.split(':')[0] : null;
-      addChat('ai', `Selected: ${elDesc}. What would you like to do? (change text, update style, replace image, etc.)`, 'text');
+      addChat('ai', `Selected: ${elDesc}. What would you like to do?`, 'text');
       if (isInLayout) {
         addChat(
           'ai',
@@ -1721,8 +1721,12 @@ export default function ProjectPreview() {
                 represented by the dancing-Claude indicator INSIDE the chat thread —
                 no separate pill above the input. Only failures/rejections need a pill
                 here; the success "Ready for review" / "Preview ready" state is implicit
-                (the file_change bubble in the thread already announces the change). */}
-            {result && ['failed', 'rejected'].includes(result.status) && (
+                (the file_change bubble in the thread already announces the change).
+                When the AI's failure reason is actually a clarification question
+                (already shown as the amber question bubble above), skip the pill —
+                duplicating the same text under a "Failed" label is confusing. */}
+            {result && ['failed', 'rejected'].includes(result.status)
+              && classifyAiFailureMessage(result.message) !== 'question' && (
               <div className="flex items-center gap-2 text-xs bg-white border border-gray-200 rounded-xl px-3 py-1.5">
                 <span className={`${STATUS_COLORS[result.status] || 'text-gray-500'} flex-shrink-0 font-medium`}>{STATUS_LABELS[result.status] || result.status}</span>
                 {result.message && <span className="text-gray-400 truncate">{result.message}</span>}
