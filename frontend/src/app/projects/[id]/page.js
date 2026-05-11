@@ -114,6 +114,25 @@ export default function ProjectPreview() {
     } catch {}
   }
 
+  // Hide the global page chrome (#header, #footer) inside a same-origin
+  // section-preview iframe. Used by the New Page section picker so that
+  // available-sections thumbnails — and chosen sections beyond the first —
+  // show only the section itself, not the surrounding navigation bar.
+  // No-op if the iframe is cross-origin or already navigated away.
+  function hideChromeInIframe(e) {
+    try {
+      const doc = e?.currentTarget?.contentDocument;
+      if (!doc || !doc.head) return;
+      // Idempotent: re-injection just adds another sheet, but check anyway.
+      if (doc.getElementById('__lgc_hide_chrome__')) return;
+      const style = doc.createElement('style');
+      style.id = '__lgc_hide_chrome__';
+      style.textContent =
+        '#header, header#header, footer, #footer, .footer { display: none !important; }';
+      doc.head.appendChild(style);
+    } catch { /* cross-origin iframe — skip silently */ }
+  }
+
   // Chat helpers
   // Optimistic write: append to local state immediately (instant UX), then persist
   // to DB in the background. The DB row's id replaces the temp client id once we
@@ -2187,6 +2206,7 @@ export default function ProjectPreview() {
                                     transformOrigin: 'top left',
                                   }}
                                   title={s.displayName}
+                                  onLoad={hideChromeInIframe}
                                 />
                               </div>
                               <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-emerald-600 text-white text-[10px] font-bold opacity-0 group-hover:opacity-100 transition-opacity">+ Add</span>
@@ -2265,6 +2285,7 @@ export default function ProjectPreview() {
                                           transformOrigin: 'top left',
                                         }}
                                         title={meta?.displayName || name}
+                                        onLoad={i === 0 ? undefined : hideChromeInIframe}
                                       />
                                     </div>
                                   </div>
