@@ -232,7 +232,7 @@ export default function ProjectPreview() {
   // "In flight" covers the whole edit lifecycle, not just the brief HTTP submit window.
   // While the backend is processing (pending → analyzing → generating_code → pending_review),
   // the dancing-Claude indicator keeps rotating through fun verbs.
-  const isInFlight = submitting || (result && !['review', 'failed', 'rejected'].includes(result.status));
+  const isInFlight = submitting || (result && !['review', 'pending_review', 'failed', 'rejected'].includes(result.status));
   useEffect(() => {
     if (!isInFlight) return;
     let lastIdx = -1;
