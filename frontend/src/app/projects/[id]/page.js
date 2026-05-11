@@ -1032,6 +1032,14 @@ export default function ProjectPreview() {
   }, [result?.status]);
 
 
+  // Set when reloadIframe() is called, consumed by the iframe's onLoad handler
+  // to force-bust CSS/JS subresources after every AI edit. Setting iframe.src
+  // with a cache-bust query only forces a fresh HTML fetch — the <link href=
+  // "main.css"> inside that HTML reuses the browser's cached CSS unless its
+  // own URL changes too. After load we rewrite those URLs with ?_= so the
+  // fresh edits actually paint.
+  const needsSubresourceBustRef = useRef(false);
+
   function reloadIframe() {
     if (!iframeRef.current) return;
     // Prefer the actual current URL (same-origin via /preview proxy) so we stay on the page the user navigated to.
@@ -1043,7 +1051,29 @@ export default function ProjectPreview() {
     } catch { /* cross-origin — shouldn't happen with proxy, but be safe */ }
     if (!target) target = currentPageUrl || iframeRef.current.src;
     const base = target.split('?')[0];
+    needsSubresourceBustRef.current = true;
     iframeRef.current.src = base + '?_t=' + Date.now();
+  }
+
+  // Force the iframe document to re-fetch its CSS / JS sub-resources by
+  // appending a cache-buster query to every <link> and <script src>. Runs
+  // after iframe load when reloadIframe() flagged a bust. Same-origin
+  // access (via the /preview/ proxy) makes this safe.
+  function bustIframeSubresources() {
+    try {
+      const doc = iframeRef.current?.contentDocument;
+      if (!doc) return;
+      const stamp = '_=' + Date.now();
+      const rewrite = (el, attr) => {
+        const v = el.getAttribute(attr);
+        if (!v) return;
+        const stripped = v.replace(/[?&]_=\d+/, '');
+        const sep = stripped.includes('?') ? '&' : '?';
+        el.setAttribute(attr, stripped + sep + stamp);
+      };
+      for (const link of doc.querySelectorAll('link[rel="stylesheet"]')) rewrite(link, 'href');
+      for (const s of doc.querySelectorAll('script[src]')) rewrite(s, 'src');
+    } catch { /* cross-origin or doc not ready — skip */ }
   }
 
   // applyChange / rejectChange were the manual Accept/Reject handlers — removed
@@ -2142,6 +2172,10 @@ export default function ProjectPreview() {
                   } catch {}
                 };
                 readUrl();
+                if (needsSubresourceBustRef.current) {
+                  needsSubresourceBustRef.current = false;
+                  bustIframeSubresources();
+                }
               }}
             />
             {highlightRect && (
