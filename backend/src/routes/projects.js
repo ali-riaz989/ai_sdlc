@@ -1361,11 +1361,24 @@ router.get('/:id/chat-messages', authenticateToken, async (req, res, next) => {
     // Pull newest-first by id (created_at can collide on bulk inserts), then
     // reverse to oldest-first for client rendering. `has_more` = whether the
     // next page exists, so the client knows when to stop loading older.
+    //
+    // For live_edit rows the bubble's "reverted" state must be the truth from
+    // text_overrides.reverted (not just whatever the client's revertedOverrides
+    // Set says — that's empty after a refresh). LEFT JOIN on the override_id
+    // pulled out of the data JSONB so the row carries an `override_reverted`
+    // boolean. Frontend reads it on hydration.
     const [rows] = await sequelize.query(
-      `SELECT id, user_id, project_id, role, text, type, data, change_request_id, created_at
-         FROM chat_messages
-        WHERE ${where.join(' AND ')}
-        ORDER BY id DESC
+      `SELECT cm.id, cm.user_id, cm.project_id, cm.role, cm.text, cm.type, cm.data,
+              cm.change_request_id, cm.created_at,
+              CASE
+                WHEN cm.type = 'live_edit' AND cm.data ? 'override_id'
+                THEN (SELECT reverted FROM text_overrides
+                       WHERE id = ((cm.data->>'override_id')::bigint))
+                ELSE NULL
+              END AS override_reverted
+         FROM chat_messages cm
+        WHERE ${where.join(' AND ').replace(/\bproject_id\b/, 'cm.project_id').replace(/\buser_id\b/g, 'cm.user_id').replace(/\bid <\b/, 'cm.id <')}
+        ORDER BY cm.id DESC
         LIMIT $${params.length}`,
       { bind: params }
     );

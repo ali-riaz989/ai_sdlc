@@ -5,6 +5,7 @@ const routeResolver = require('../services/routeResolver');
 const projectCache = require('../utils/projectCache');
 const auditLogger = require('../utils/auditLogger');
 const logger = require('../utils/logger');
+const requestLogger = require('../utils/requestLogger');
 const { exec } = require('child_process');
 const crypto = require('crypto');
 const uuidv4 = () => crypto.randomUUID();
@@ -13,6 +14,53 @@ const fs = require('fs').promises;
 
 
 class ChangeRequestController {
+  // Set of change_request IDs the user has asked to STOP via the cancel
+  // endpoint. The controller checks this set at key points in the flow
+  // (after the AI returns, before writing files) and bails cleanly instead
+  // of applying the change. The cancel route also flips the DB row to
+  // 'rejected', so the frontend's existing failure path renders it as an
+  // "Action reverted" / "Cancelled" card.
+  _cancelled = new Set();
+  _isCancelled(requestId) { return this._cancelled.has(requestId); }
+  markCancelled(requestId) { this._cancelled.add(requestId); }
+  _clearCancelled(requestId) { this._cancelled.delete(requestId); }
+
+  // Pending-confirmation map: when the AI plans an edit far from where the user
+  // clicked, we save the proposed edit here keyed by `${userId}:${projectId}`
+  // and surface a "should I go ahead?" question. If the user's next prompt is
+  // affirmative, we apply the saved edit. Otherwise we discard and continue.
+  _pendingConfirmations = new Map();
+  // Permissive affirmative detector. Matches any SHORT prompt that contains
+  // a yes-like word at a word boundary AND no negation. "yes", "ya", "yup",
+  // "I said yes", "yeah do it", "ok go ahead", "sure thing", "👍", "✅" — all
+  // count. "no", "cancel", "nope", "don't" suppress the match so the user
+  // can dismiss the pending confirmation cleanly.
+  _affirmativeWordRe = /\b(y|ya|yah|yas|yass|yup|yepp?|yeah|yes|ok|okay|sure|fine|confirm(?:ed)?|agree[d]?|definitely|absolutely|right|correct|proceed|continue)\b/i;
+  _negativeWordRe = /\b(no|nope|nah|cancel|stop|skip|never\s?mind|don'?t|do\s?not)\b/i;
+  _affirmativeEmojiRe = /[\u{1F44D}\u{2705}✓✔\u{1F197}]/u; // 👍 ✅ ✓ ✔ 🆗
+  isAffirmative(prompt) {
+    const s = String(prompt || '').trim();
+    if (!s) return false;
+    if (this._affirmativeEmojiRe.test(s)) return true;
+    // Cap length so we don't match a yes-word buried inside a long new request.
+    if (s.length > 60) return false;
+    if (this._negativeWordRe.test(s)) return false;
+    return this._affirmativeWordRe.test(s);
+  }
+  _setPendingConfirmation(userId, projectId, entry) {
+    const key = `${userId}:${projectId}`;
+    entry.expiresAt = Date.now() + 5 * 60 * 1000;
+    this._pendingConfirmations.set(key, entry);
+  }
+  _takePendingConfirmation(userId, projectId) {
+    const key = `${userId}:${projectId}`;
+    const entry = this._pendingConfirmations.get(key);
+    if (!entry) return null;
+    this._pendingConfirmations.delete(key);
+    if (entry.expiresAt < Date.now()) return null;
+    return entry;
+  }
+
   async create(req, res, next) {
     try {
       const { project_id, title, prompt, category, image_base64, image_media_type, current_page_url, page_context, conversation, selected_element, resolved_blade_file, iframe_viewport } = req.body;
@@ -124,10 +172,48 @@ class ChangeRequestController {
       if (io) io.to(`cr-${requestId}`).emit(`change-request:${requestId}:files`, { file, change_type, status });
     };
 
+    let _telStarted = false;
+    // Watchdog: if the request is still in a non-terminal state after this
+    // timeout (e.g. the Anthropic API hangs, network drops, downstream code
+    // blocks), force-fail it so the UI doesn't sit in "processing" forever.
+    // Cleared in the finally block once normal flow completes.
+    const WATCHDOG_MS = 3 * 60 * 1000; // 3 minutes
+    const TERMINAL = new Set(['review', 'pending_review', 'failed', 'rejected']);
+    const watchdogTimer = setTimeout(async () => {
+      try {
+        const [r] = await sequelize.query('SELECT status FROM change_requests WHERE id = $1', { bind: [requestId] });
+        const status = r[0]?.status;
+        if (!status || TERMINAL.has(status)) return; // already done
+        logger.warn('Change request watchdog fired', { requestId, status, after_ms: WATCHDOG_MS });
+        await this._fail(requestId, emit, 'This change is taking longer than expected. Something went wrong on my side — please try again.', 'timeout');
+      } catch (e) {
+        logger.error('Watchdog cleanup failed', { requestId, error: e.message });
+      }
+    }, WATCHDOG_MS);
+
     try {
       logger.info('Processing change request', { requestId, currentPageUrl });
       const [rows] = await sequelize.query('SELECT * FROM change_requests WHERE id = $1', { bind: [requestId] });
       const changeRequest = rows[0];
+
+      // ── Open a structured telemetry context for this request ─────────────
+      // Single in-memory ctx that aggregates timings, tokens, retries, errors
+      // and commits to `request_logs` once at the end (in finally below).
+      requestLogger.start(requestId, { user_id: changeRequest?.user_id, project_id: project.id });
+      _telStarted = true;
+
+      // ── Pending-confirmation intercept ───────────────────────────────────
+      // A previous change request planned an edit far from the user's click
+      // and asked them to confirm. If this new prompt is short + affirmative
+      // ("yes", "ok", "go ahead", etc.), apply the saved edit instead of
+      // re-running the AI. Any non-affirmative reply clears the pending and
+      // continues as a fresh prompt.
+      const pending = this._takePendingConfirmation(changeRequest.user_id, project.id);
+      if (pending && this.isAffirmative(changeRequest.prompt)) {
+        logger.info('Applying pending confirmation', { requestId, prompt: changeRequest.prompt });
+        await this._applyPendingEdit(requestId, project, pending, emit, emitFile);
+        return;
+      }
 
       // ── Resolve current page → blade file ────────────────────────────────
       // Prefer the client-provided blade (pre-resolved once per URL, cached in the
@@ -148,7 +234,9 @@ class ChangeRequestController {
       if (!pageBladeFile && currentPageUrl) {
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Resolving page…');
+        requestLogger.phaseBegin(requestId, 'route_resolve');
         const resolved = await routeResolver.resolve(project.local_path, currentPageUrl);
+        requestLogger.phaseEnd(requestId, 'route_resolve');
         if (resolved) {
           try {
             await fs.access(resolved.abs_path);
@@ -165,29 +253,49 @@ class ChangeRequestController {
 
       // When the blade file is resolved → always use directGenerate (1 API call).
       if (pageBladeFile) {
-        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement, iframeViewport);
+        requestLogger.setPipeline(requestId, 'directGenerate');
+        await this._directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext, imageData, conversation, selectedElement, iframeViewport, currentPageUrl);
       } else if (routeUnresolved) {
         // The user is on a specific page but we cannot map the URL to a blade file.
         // Scanning the whole project is unsafe — it will pick an unrelated file. Fail clearly.
         const urlPath = (currentPageUrl || '').replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '') || '/';
         await this._fail(requestId, emit,
-          `Could not find the Laravel route for "${urlPath}". The link in the page may be broken, or the route is missing from routes/web.php. Navigate to a page with a working route, then try again.`);
+          `Could not find the Laravel route for "${urlPath}". The link in the page may be broken, or the route is missing from routes/web.php. Navigate to a page with a working route, then try again.`,
+          'route_unresolved');
       } else {
         // No page URL was sent at all — fall back to full pipeline (e.g. dashboard prompt)
         await this._updateStatus(requestId, 'analyzing');
         emit('analyzing', 'Classifying change…');
-        const classification = await aiService.classifyChange(changeRequest.prompt);
+        const classification = await aiService.classifyChange(changeRequest.prompt, { requestId });
         logger.info('Classified', { type: classification.type, requestId });
 
         if (classification.type === 'text_swap' && !imageData) {
+          requestLogger.setPipeline(requestId, 'fastTextSwap');
           await this._fastTextSwapPath(requestId, project, changeRequest, classification, pageBladeFile, emit, emitFile);
         } else {
+          requestLogger.setPipeline(requestId, 'fullPipeline');
           await this._fullAIPipeline(requestId, project, changeRequest, imageData, pageBladeFile, emit, emitFile, io, pageContext);
         }
       }
     } catch (error) {
       logger.error('Change request processing failed', { requestId, error: error.message, stack: error.stack });
+      if (_telStarted) requestLogger.recordError(requestId, error);
       await this._fail(requestId, emit, `Processing failed: ${error.message}`);
+    } finally {
+      // Disarm the watchdog — normal flow finished one way or another.
+      clearTimeout(watchdogTimer);
+      // ALWAYS commit the telemetry row, even on uncaught errors. We re-read
+      // the final status from DB so the row reflects truth (in case _fail
+      // didn't run for some reason). commit() never throws.
+      if (_telStarted) {
+        try {
+          const [r] = await sequelize.query('SELECT status FROM change_requests WHERE id = $1', { bind: [requestId] });
+          await requestLogger.commit(requestId, { status: r[0]?.status || 'unknown' });
+        } catch (commitErr) {
+          logger.warn('Final telemetry status read failed', { requestId, error: commitErr.message });
+          await requestLogger.commit(requestId, { status: 'unknown' });
+        }
+      }
     }
   }
 
@@ -233,6 +341,7 @@ class ChangeRequestController {
          VALUES ($1, $2, $3, $4, $5, 'modify')`,
         { bind: [uuidv4(), requestId, f.file_path, f.original_content, f.generated_content] }
       );
+      requestLogger.recordFileChange(requestId, { path: f.file_path, op: 'fast-text-swap', bytes: (f.generated_content || '').length });
     }
 
     await this._clearViewCache(project.local_path);
@@ -244,7 +353,7 @@ class ChangeRequestController {
   // ── Direct-edit flow: user selects an element in the iframe, AI edits it ──
   // Select-first is the only supported path — if nothing is selected, we fail fast
   // rather than guessing a section and asking the user to confirm.
-  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null, iframeViewport = null) {
+  async _directGenerate(requestId, project, changeRequest, pageBladeFile, emit, emitFile, io, pageContext = null, imageData = null, conversation = null, selectedElement = null, iframeViewport = null, currentPageUrl = null) {
     if (!(selectedElement?.section || selectedElement?.text || selectedElement?.classes || selectedElement?.isImage)) {
       await this._fail(requestId, emit, 'Click the Select button and choose the element you want to edit, then describe the change.');
       return;
@@ -401,8 +510,10 @@ class ChangeRequestController {
             const diffInfo = { old_block: oldImgTag, new_block: newImgTag, reasoning: 'Replaced selected image' };
             await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
               { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
+            requestLogger.recordFileChange(requestId, { path: pageBladeFile.blade_file, op: 'image-swap', bytes: finalContent.length });
             await fs.writeFile(absPath, finalContent, 'utf-8');
             await this._clearViewCache(project.local_path);
+            await this._invalidateOverridesForPage(project.id, currentPageUrl);
             await this._updateStatus(requestId, 'pending_review');
             emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: pageBladeFile.blade_file, ...diffInfo }] }));
             return;
@@ -597,6 +708,7 @@ class ChangeRequestController {
         aiPrompt += `\n\nINTENT: ADD a new image (do NOT replace the clicked image). Find the nearest repeating block at the click region (carousel slide, gallery card, brand tile, etc.), copy it as old_block, and emit old_block + a CLONED block using the uploaded image's asset path as new_block. Preserve the original image; insert alongside.`;
       }
 
+      requestLogger.phaseBegin(requestId, 'edit');
       const generated = await aiService.executeEditMulti({
         prompt: aiPrompt,
         selectedElement,
@@ -606,11 +718,82 @@ class ChangeRequestController {
         savedImageUrl,
         onToken,
         iframeViewport,
+        _ctx: { requestId },
       });
+      requestLogger.phaseEnd(requestId, 'edit');
 
-      if (generated.mode === 'skip' || !generated.file_path) {
-        await this._fail(requestId, emit, generated.reason || 'AI could not determine the edit');
+      // ── Cancellation gate ───────────────────────────────────────────────
+      // If the user clicked STOP while the AI was thinking, the cancel route
+      // has marked this requestId in _cancelled and flipped the DB row to
+      // 'rejected'. Bail out before touching any file — the frontend has
+      // already been told the request was cancelled.
+      if (this._isCancelled(requestId)) {
+        this._clearCancelled(requestId);
+        logger.info('Change request cancelled by user', { requestId });
         return;
+      }
+
+      if (generated.mode === 'skip' || (!generated.file_path && generated.mode !== 'multi')) {
+        await this._fail(requestId, emit, generated.reason || 'I need a bit more info to make this change. Could you describe the change in more detail?');
+        return;
+      }
+
+      // ── Multi-file edit (SHAPE A-MULTI) ─────────────────────────────────
+      // Single user request that needs changes spanning N files (animation
+      // markup + CSS keyframes, class rename across blade + CSS, etc.). Apply
+      // each edit sequentially. If ANY edit fails to apply, roll back the
+      // ones we already wrote — the whole change is all-or-nothing so the
+      // project is never left in a half-edited state.
+      if (generated.mode === 'multi') {
+        const applied = []; // [{ abs, originalContent, newContent, file_path, diffInfo }] for rollback
+        const diffEntries = [];
+        try {
+          for (const edit of generated.edits) {
+            const targetAbs = path.join(project.local_path, edit.file_path);
+            const original = await fs.readFile(targetAbs, 'utf-8');
+            // Reuse the same block-replace helper as single-file edits — same
+            // matching/normalisation tiers, same fuzzy fallback, same nearest-
+            // to-click tie-break (clickLine only meaningful for the file the
+            // user actually clicked in; for sibling edits like CSS we pass -1).
+            const replaceClickLine = (edit.file_path === pageBladeFile.blade_file) ? clickLine : -1;
+            const finalContent = this._applyBlockReplace(original, edit.old_block, edit.new_block, replaceClickLine);
+            if (!finalContent) {
+              throw new Error(`Could not locate text to replace in ${edit.file_path} — old_block did not match the file. The AI's multi-edit was rejected to prevent a half-finished change.`);
+            }
+            await fs.writeFile(targetAbs, finalContent, 'utf-8');
+            const diffInfo = { old_block: edit.old_block, new_block: edit.new_block, reasoning: edit.reasoning || generated.reasoning };
+            applied.push({ abs: targetAbs, originalContent: original, newContent: finalContent, file_path: edit.file_path, diffInfo });
+            emitFile(edit.file_path, 'modify', 'generating');
+          }
+
+          // All edits succeeded → persist diff rows
+          for (const a of applied) {
+            await sequelize.query(
+              `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
+               VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+              { bind: [uuidv4(), requestId, a.file_path, a.originalContent, a.newContent, JSON.stringify(a.diffInfo)] }
+            );
+            requestLogger.recordFileChange(requestId, { path: a.file_path, op: 'multi-edit', bytes: a.newContent.length });
+            diffEntries.push({ file_path: a.file_path, ...a.diffInfo });
+          }
+
+          await this._clearViewCache(project.local_path);
+          await this._invalidateOverridesForPage(project.id, currentPageUrl);
+          await this._updateStatus(requestId, 'pending_review');
+          emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: diffEntries }));
+          logger.info('Multi-file edit applied', { requestId, files: applied.map(a => a.file_path), reasoning: generated.reasoning });
+          return;
+        } catch (e) {
+          // Rollback every file we already wrote so the project is not half-edited
+          logger.warn('Multi-file edit failed; rolling back', { error: e.message, applied: applied.length });
+          for (const a of applied) {
+            try { await fs.writeFile(a.abs, a.originalContent, 'utf-8'); } catch (rbErr) {
+              logger.error('Rollback write failed', { file: a.file_path, error: rbErr.message });
+            }
+          }
+          await this._fail(requestId, emit, e.message || 'Multi-file edit failed');
+          return;
+        }
       }
 
       // ── File deletion (SHAPE D) ─────────────────────────────────────────
@@ -644,6 +827,7 @@ class ChangeRequestController {
            VALUES ($1, $2, $3, $4, $5, 'delete', $6)`,
           { bind: [uuidv4(), requestId, generated.file_path, delOriginal, '', JSON.stringify(diffEntries[0].diff)] }
         );
+        requestLogger.recordFileChange(requestId, { path: generated.file_path, op: 'delete', bytes: 0 });
 
         if (isUserPage) {
           const slug = path.basename(generated.file_path, '.blade.php');
@@ -665,6 +849,7 @@ class ChangeRequestController {
                  VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
                 { bind: [uuidv4(), requestId, webRel, webOrig, webNew, JSON.stringify({ old_block: webOrig, new_block: webNew, reasoning: 'Removed route for deleted page' })] }
               );
+              requestLogger.recordFileChange(requestId, { path: webRel, op: 'route-strip', bytes: webNew.length });
               diffEntries.push({ file_path: webRel, change_type: 'modify', diff: { old_block: webOrig, new_block: webNew, reasoning: 'Removed route for deleted page' } });
             }
           } catch (e) {
@@ -673,6 +858,7 @@ class ChangeRequestController {
         }
 
         await this._clearViewCache(project.local_path);
+        await this._invalidateOverridesForPage(project.id, currentPageUrl);
         await this._updateStatus(requestId, 'pending_review');
         emit('pending_review', JSON.stringify({ message: 'Page removed', diff: diffEntries }));
         logger.info('Page deletion applied', { requestId, file: generated.file_path, reasoning: generated.reasoning });
@@ -728,12 +914,25 @@ class ChangeRequestController {
           const SLACK = 40;
           const inRegion = oldBlockEndLine >= clickLine - SLACK && oldBlockStartLine <= clickLine + SLACK;
           if (!inRegion) {
-            logger.warn('AI edit lands outside click region', {
+            logger.warn('AI edit lands outside click region — saving as pending confirmation', {
               clickLine: clickLine + 1, oldBlockLines: `${oldBlockStartLine + 1}-${oldBlockEndLine + 1}`,
               old_preview: generated.old_block.substring(0, 120),
             });
-            await this._fail(requestId, emit,
-              `The AI tried to edit lines ${oldBlockStartLine + 1}–${oldBlockEndLine + 1}, but you clicked around line ${clickLine + 1}. Please retry with a more specific prompt that names the element you want to change.`);
+            // Save the AI's proposed edit so the next affirmative prompt can apply it
+            // without re-running the AI. Skip the click-region check on apply.
+            this._setPendingConfirmation(changeRequest.user_id, project.id, {
+              generated,
+              pageBladeFile,
+              targetAbs,
+              targetOriginal,
+              currentPageUrl,
+            });
+            const clickedSection = (selectedElement?.section || '').toString().trim() || 'this part of the page';
+            const reason = (generated.reasoning || '').toString().trim();
+            const msg = reason
+              ? `You clicked on the ${clickedSection}, but the change I figured out would happen on a different part of the page. Here's what I'd do: ${reason} — should I go ahead with that? Reply "yes" to confirm, or click the right element and try again.`
+              : `You clicked on the ${clickedSection}, but the change I figured out would happen on a different part of the page. Should I go ahead with the change there? Reply "yes" to confirm, or click the right element and try again.`;
+            await this._fail(requestId, emit, msg);
             return;
           }
         }
@@ -849,8 +1048,10 @@ class ChangeRequestController {
       emitFile(generated.file_path, 'modify', 'generating');
       await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
         { bind: [uuidv4(), requestId, generated.file_path, targetOriginal, finalContent, JSON.stringify(diffInfo)] });
+      requestLogger.recordFileChange(requestId, { path: generated.file_path, op: generated.mode || 'modify', bytes: finalContent.length });
       await fs.writeFile(targetAbs, finalContent, 'utf-8');
       await this._clearViewCache(project.local_path);
+      await this._invalidateOverridesForPage(project.id, currentPageUrl);
       await this._updateStatus(requestId, 'pending_review');
       emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: generated.file_path, ...diffInfo }] }));
       logger.info('Unified edit applied', { requestId, file: generated.file_path, reasoning: generated.reasoning });
@@ -1569,7 +1770,7 @@ class ChangeRequestController {
     }
 
     const styledPrompt = `The user selected an element <${selectedElement.tag || 'div'}> with classes: "${selectedElement.classes || ''}". Edit the CSS rule(s) that target those classes.\n\nRequest: ${changeRequest.prompt}`;
-    const generated = await aiService.executeEdit(styledPrompt, scoped, picked.rel, imageData, null, 'css', conversation);
+    const generated = await aiService.executeEdit(styledPrompt, scoped, picked.rel, imageData, null, 'css', conversation, { requestId });
 
     if (generated.mode !== 'replace' || !generated.old_block) {
       return { applied: false, reason: generated.reason || 'ai_skip' };
@@ -1581,6 +1782,7 @@ class ChangeRequestController {
     const diffInfo = { old_block: generated.old_block, new_block: generated.new_block, reasoning: generated.reasoning };
     await sequelize.query(`INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff) VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
       { bind: [uuidv4(), requestId, picked.rel, picked.content, finalCss, JSON.stringify(diffInfo)] });
+    requestLogger.recordFileChange(requestId, { path: picked.rel, op: 'css-modify', bytes: finalCss.length });
     await fs.writeFile(picked.abs, finalCss, 'utf-8');
     await this._clearViewCache(project.local_path);
     await this._updateStatus(requestId, 'pending_review');
@@ -1614,7 +1816,8 @@ class ChangeRequestController {
         bladeContent,
         imageData,
         changeHistory,
-        relatedFiles
+        relatedFiles,
+        { requestId }
       ));
     } else {
       // FALLBACK: use cached full project context
@@ -1624,7 +1827,7 @@ class ChangeRequestController {
         await projectCache.set(project.id, projectContext);
       }
       ({ result: analysis, messages: analyzeMessages } = await aiService.analyzeChangeRequest(
-        changeRequest.prompt, projectContext, changeRequest.category, imageData, changeHistory
+        changeRequest.prompt, projectContext, changeRequest.category, imageData, changeHistory, { requestId }
       ));
     }
 
@@ -1665,7 +1868,7 @@ class ChangeRequestController {
       if (window) logger.info('Using windowed context', { file: step.file_path, lines: `${window.startLine}-${window.endLine}`, score: window.score });
 
       // Thread the analyze conversation — AI already knows the plan, no need to re-explain
-      const generated = await aiService.generateCode(step, contentForAI, analyzeMessages, onToken);
+      const generated = await aiService.generateCode(step, contentForAI, analyzeMessages, onToken, null, null, { requestId });
 
       let finalContent;
       if (generated.mode === 'replace') {
@@ -1713,6 +1916,7 @@ class ChangeRequestController {
          VALUES ($1, $2, $3, $4, $5, $6)`,
         { bind: [gcId, requestId, step.file_path, originalContent, finalContent, step.change_type] }
       );
+      requestLogger.recordFileChange(requestId, { path: step.file_path, op: step.change_type, bytes: (finalContent || '').length });
 
       generatedFiles.push({
         file_path: step.file_path,
@@ -1968,6 +2172,39 @@ class ChangeRequestController {
     });
   }
 
+  // After an AI edit lands, mark every active live-edit override on the same
+  // page as reverted. Rationale: the live-edit override layer applies AFTER
+  // the page renders (it overwrites el.innerHTML / el.src), so a stale
+  // override would silently invalidate the AI's edit on next reload — the
+  // user sees the AI claim success but the page reverts to the old override.
+  // This makes the AI edit the source of truth: any prior inline-edit on the
+  // same URL is superseded. The chat bubbles render as "Reverted text edit"
+  // automatically on next chat reload (joins to text_overrides.reverted).
+  async _invalidateOverridesForPage(projectId, currentPageUrl) {
+    if (!projectId || !currentPageUrl) return 0;
+    // Normalise the same way the live-edit client does: strip origin and the
+    // /preview proxy prefix; keep path only.
+    let url = String(currentPageUrl).replace(/^https?:\/\/[^/]+/, '');
+    url = url.split('?')[0].split('#')[0];
+    if (url.startsWith('/preview')) url = url.replace(/^\/preview/, '') || '/';
+    if (!url) url = '/';
+    try {
+      const [rows] = await sequelize.query(
+        `UPDATE text_overrides SET reverted = true
+          WHERE project_id = $1 AND url = $2 AND reverted = false
+       RETURNING id`,
+        { bind: [projectId, url] }
+      );
+      if (rows.length) {
+        logger.info('Invalidated live-edit overrides after AI edit', { projectId, url, count: rows.length });
+      }
+      return rows.length;
+    } catch (e) {
+      logger.warn('Failed to invalidate overrides', { error: e.message });
+      return 0;
+    }
+  }
+
   async _updateStatus(requestId, newStatus) {
     await sequelize.query(
       'UPDATE change_requests SET status = $1, updated_at = NOW() WHERE id = $2',
@@ -1977,7 +2214,9 @@ class ChangeRequestController {
   }
 
   // Set status='failed' AND persist the reason so the frontend can display the real error.
-  async _fail(requestId, emit, reason) {
+  // category is optional — when set, overrides the auto-detection in
+  // requestLogger so the structured store gets the right error_category.
+  async _fail(requestId, emit, reason, category = null) {
     const msg = reason || 'Unknown error';
     try {
       await sequelize.query(
@@ -1988,6 +2227,7 @@ class ChangeRequestController {
       logger.warn('Failed to persist error_message', { error: e.message });
     }
     logger.warn('Change request failed', { requestId, reason: msg });
+    requestLogger.recordError(requestId, msg, category);
     if (emit) emit('failed', msg);
   }
 
@@ -2007,6 +2247,44 @@ class ChangeRequestController {
     } catch {
       return [];
     }
+  }
+
+  // Apply a saved pending-confirmation edit (user just said "yes" to a
+  // proposal that was outside their click region). Mirrors the success path
+  // in _directGenerate for the single-file replace mode — which is the only
+  // mode click-region validation runs on, so the only mode that ever lands
+  // here. No new AI call, no validation. Files are re-read from disk to
+  // tolerate intervening edits.
+  async _applyPendingEdit(requestId, project, pending, emit, emitFile) {
+    const { generated, pageBladeFile, currentPageUrl } = pending;
+    const targetAbs = path.join(project.local_path, generated.file_path);
+    let targetOriginal;
+    try { targetOriginal = await fs.readFile(targetAbs, 'utf-8'); }
+    catch {
+      await this._fail(requestId, emit, `The file I was going to change isn't where I left it. Try clicking the element again and describing the change.`);
+      return;
+    }
+    const finalContent = this._applyBlockReplace(targetOriginal, generated.old_block, generated.new_block, -1);
+    if (!finalContent) {
+      await this._fail(requestId, emit, `The page changed since I made that suggestion — I can't apply it as-is anymore. Click the element you want to change and tell me what you'd like.`);
+      return;
+    }
+    const diffInfo = { old_block: generated.old_block, new_block: generated.new_block, reasoning: generated.reasoning };
+    emitFile(generated.file_path, 'modify', 'generating');
+    await sequelize.query(
+      `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
+       VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
+      { bind: [uuidv4(), requestId, generated.file_path, targetOriginal, finalContent, JSON.stringify(diffInfo)] }
+    );
+    requestLogger.recordFileChange(requestId, { path: generated.file_path, op: 'confirm', bytes: finalContent.length });
+    await fs.writeFile(targetAbs, finalContent, 'utf-8');
+    await this._clearViewCache(project.local_path);
+    await this._invalidateOverridesForPage(project.id, currentPageUrl);
+    await this._updateStatus(requestId, 'pending_review');
+    emit('pending_review', JSON.stringify({ message: 'Preview ready', diff: [{ file_path: generated.file_path, ...diffInfo }], confirmed: true }));
+    logger.info('Pending confirmation applied', { requestId, file: generated.file_path });
+    // Suppress unused-var warning for blade file reference (kept for parity with the main path)
+    void pageBladeFile;
   }
 }
 

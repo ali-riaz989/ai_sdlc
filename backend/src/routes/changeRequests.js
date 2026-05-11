@@ -208,6 +208,30 @@ router.post('/:id/restore', authenticateToken, async (req, res, next) => {
 });
 
 // Reject — restore original files from DB since the preview wrote them to disk
+// STOP an in-flight change request. The processor will see the cancellation
+// flag at its next checkpoint (right after the AI call returns) and bail out
+// without writing any files. The DB row flips to 'rejected' immediately so
+// the frontend's failure path renders the "Cancelled" card.
+router.post('/:id/cancel', authenticateToken, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await sequelize.query('SELECT status FROM change_requests WHERE id = $1', { bind: [id] });
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    const current = rows[0].status;
+    if (['review', 'pending_review', 'failed', 'rejected'].includes(current)) {
+      return res.json({ message: 'Already finished', status: current });
+    }
+    changeRequestController.markCancelled(id);
+    await sequelize.query("UPDATE change_requests SET status = 'rejected', error_message = $2, updated_at = NOW() WHERE id = $1",
+      { bind: [id, 'Cancelled by user'] });
+    const io = req.app.get('io');
+    if (io) io.to(`cr-${id}`).emit(`change-request:${id}`, { status: 'rejected', message: 'Cancelled by user' });
+    res.json({ message: 'Cancelled' });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post('/:id/reject', authenticateToken, async (req, res, next) => {
   try {
     const { id } = req.params;

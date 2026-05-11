@@ -167,3 +167,45 @@ CREATE TABLE IF NOT EXISTS text_overrides (
 );
 CREATE INDEX IF NOT EXISTS idx_text_overrides_apply ON text_overrides(project_id, url, reverted, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_text_overrides_user  ON text_overrides(user_id, project_id, created_at DESC);
+
+-- ── Column-drift safety ─────────────────────────────────────────────────────
+-- CREATE TABLE IF NOT EXISTS above is a no-op when the table already exists,
+-- so any column added to a pre-existing table after the first deploy needs an
+-- explicit ALTER here. ADD COLUMN IF NOT EXISTS keeps these idempotent — safe
+-- to re-run migrate.sh repeatedly. Keep this list in sync with the CREATE
+-- TABLE definitions above when you add new columns.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+-- ── Request telemetry (per change_request) ─────────────────────────────────
+-- One structured row per change_request lifecycle. Single DB write at the end
+-- of processing aggregates everything: timings, tokens, retries, AI reasoning,
+-- file mutations, errors. Surfaced in the admin "/admin/logs" UI for testing.
+CREATE TABLE IF NOT EXISTS request_logs (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  change_request_id   UUID NOT NULL UNIQUE REFERENCES change_requests(id) ON DELETE CASCADE,
+  user_id             INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  project_id          UUID REFERENCES projects(id) ON DELETE SET NULL,
+  status              VARCHAR(32) NOT NULL,
+  pipeline            VARCHAR(32),                          -- directGenerate | fastTextSwap | fullPipeline
+  duration_ms         INTEGER,
+  ai_calls            INTEGER NOT NULL DEFAULT 0,
+  retries             INTEGER NOT NULL DEFAULT 0,
+  input_tokens        INTEGER NOT NULL DEFAULT 0,
+  output_tokens       INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+  cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+  files_touched       INTEGER NOT NULL DEFAULT 0,
+  error_category      VARCHAR(64),
+  error_message       TEXT,
+  reasoning           TEXT,
+  events              JSONB NOT NULL DEFAULT '[]'::jsonb,
+  phase_breakdown     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ai_calls_detail     JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at          TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_request_logs_created  ON request_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_logs_status   ON request_logs(status);
+CREATE INDEX IF NOT EXISTS idx_request_logs_user     ON request_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_logs_project  ON request_logs(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_logs_duration ON request_logs(duration_ms DESC) WHERE duration_ms IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_request_logs_errors   ON request_logs(error_category) WHERE error_category IS NOT NULL;

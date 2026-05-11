@@ -1,5 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const logger = require('../utils/logger');
+const requestLogger = require('../utils/requestLogger');
 
 class AIService {
   constructor() {
@@ -15,9 +16,10 @@ class AIService {
   }
 
   // ─── Step 1: Fast classifier (<2 s) ────────────────────────────────────────
-  async classifyChange(prompt) {
+  async classifyChange(prompt, _ctx = null) {
     logger.info('Classifying change', { prompt: prompt.substring(0, 80) });
     try {
+      const t0 = Date.now();
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 200,
@@ -27,9 +29,11 @@ class AIService {
           content: `Classify this change request for a Laravel website:\n"${prompt}"\n\nReply ONLY with JSON:\n{"type":"text_swap"|"structural","target_text":"exact text to find (empty if structural)","new_text":"replacement text (empty if structural)"}`
         }]
       });
+      if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'classifyChange', model: this.model, ms: Date.now() - t0, response });
       return this._extractJSON(response.content[0].text);
     } catch (error) {
       logger.warn('Classification failed, falling back to structural', { error: error.message });
+      if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
       return { type: 'structural' };
     }
   }
@@ -48,8 +52,9 @@ class AIService {
   }
 
   // Fallback: send only the single file + prompt to Claude for targeted replacement
-  async _locateAndSwap(fileContent, _filePath, targetText, newText) {
+  async _locateAndSwap(fileContent, _filePath, targetText, newText, _ctx = null) {
     try {
+      const t0 = Date.now();
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: fileContent.length + 500,
@@ -59,8 +64,10 @@ class AIService {
           content: `In this file, replace "${targetText}" with "${newText}".\n\nFile content:\n${fileContent}`
         }]
       });
+      if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: '_locateAndSwap', model: this.model, ms: Date.now() - t0, response });
       return { found: true, content: this._extractCode(response.content[0].text) };
     } catch (error) {
+      if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
       return { found: false, content: fileContent };
     }
   }
@@ -68,7 +75,7 @@ class AIService {
 
   // ─── Execute edit — old_block/new_block like Claude Code ────────────────
   // AI receives the RAW SOURCE CODE of the section and returns exact text replacement
-  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null, language = 'blade', conversation = null) {
+  async executeEdit(prompt, sectionContent, filePath, imageData = null, savedImageUrl = null, language = 'blade', conversation = null, _ctx = null) {
     logger.info('Executing edit', { file: filePath, language, hasConversation: !!(conversation?.length) });
 
     let editInstruction = prompt;
@@ -127,27 +134,32 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
       : [textBlock];
 
     try {
+      const t0 = Date.now();
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
       });
+      if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'executeEdit', model: this.model, ms: Date.now() - t0, response });
       let result;
       try {
         result = this._extractJSON(response.content[0].text);
       } catch (jsonErr) {
         logger.warn('AI returned invalid JSON in executeEdit', { response: response.content[0].text.substring(0, 500) });
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, jsonErr, 'invalid_json');
         return { mode: 'skip' };
       }
 
       if (result?.error) {
         logger.warn('AI reported ambiguity', { error: result.error });
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, result.error, 'ambiguous');
         return { mode: 'skip', reason: result.error };
       }
 
       if (result?.old_block !== undefined && result?.new_block !== undefined) {
         logger.info('Edit ready', { reasoning: result.reasoning, old_preview: result.old_block.substring(0, 80) });
+        if (_ctx?.requestId) requestLogger.recordReasoning(_ctx.requestId, result.reasoning);
         return { mode: 'replace', old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
       }
 
@@ -155,6 +167,7 @@ Return ONLY valid JSON: {"old_block":"...","new_block":"...","reasoning":"..."}`
       return { mode: 'skip' };
     } catch (error) {
       logger.error('Edit execution failed', { error: error.message });
+      if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
       const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
         ? 'Rate limit reached — wait a moment and try again'
         : error.message?.includes('Connection')
@@ -188,6 +201,44 @@ Then pick ONE of these two output shapes, whichever fits the request. Return ONL
 OUTPUT SHAPE A — in-place find-and-replace (default for edits, additions, image swaps, deletions):
 {"file_path":"<exact path from a FILE header>","old_block":"<exact verbatim lines from that file>","new_block":"<replacement lines>","reasoning":"<short>"}
 
+OUTPUT SHAPE A-MULTI — when a single user request needs changes in MULTIPLE files (e.g. an animation that touches both HTML + CSS keyframes, a new component referenced in a layout, a renamed class used in both blade + CSS), emit ALL of them in one response:
+{"edits":[
+  {"file_path":"<file1>","old_block":"...","new_block":"..."},
+  {"file_path":"<file2>","old_block":"...","new_block":"..."}
+],"reasoning":"<one short reason explaining the whole change>"}
+
+AUDIENCE — non-technical users:
+
+The person writing the prompt is NOT a developer. They will not say "remove the keyframe animation on .marquee__inner". They will say things like "stop that text scrolling", "make this stop moving", "freeze this section", "I don't want it spinning anymore". They describe what they SEE on the page, not the underlying mechanism.
+
+Your job is to translate their everyday description into the right technical change. Look at the element they clicked (its tag, classes, text), look at what is moving / coloured / sized / animating, and figure out which file(s) implement that visible behavior. The user does NOT know the difference between HTML, CSS, JS, blade, or compiled output — they just want the result.
+
+When you write the reasoning field that the user will read, ALSO use everyday language: "Stopped the scrolling text" / "Made the heading bigger" / "Turned off the slow fade on this image". Do NOT mention technical terms like "@keyframes", "animation property", "CSS cascade", "selector specificity", "blade partial". The user does not need to know what you edited or how — they only need to know that what they asked for is done.
+
+CRITICAL RULE — locate the source of truth before editing:
+
+The user describes a visual outcome. The implementation of that outcome may live in HTML, CSS, JS, or a combination. Before choosing edits, identify WHICH files own the behavior the user is changing, then edit ALL of them together in SHAPE A-MULTI.
+
+Rules of thumb (apply generically, not as keyword matches):
+1. If the user is changing how something LOOKS or BEHAVES, the implementation likely lives in CSS — search EVERY attached CSS file for the element's class names before assuming an HTML-only edit is enough.
+2. If you are ADDING a class name, attribute, or selector in HTML/blade, the rule defining it must exist in CSS — if it doesn't, add it too.
+3. If you are REMOVING / DISABLING any CSS property, apply the CSS CASCADE LAW described below — deleting one declaration is almost never enough.
+4. If interactivity is involved (sliders, modals, accordions, dropdowns, etc.), check the attached JS — the init code may need to change alongside the markup.
+5. If a class name is being renamed, every file that references it (blade + CSS + JS) must be updated in one SHAPE A-MULTI response.
+
+CSS CASCADE LAW (critical — most multi-file failures happen here):
+
+The browser computes EACH CSS property independently from the cascade. If file A declares some property on a selector and file B (loaded later) declares OTHER properties on the same selector WITHOUT mentioning the first one, the browser still applies file A's property — file B did not override it. Deleting the line from file B leaves file A's rule intact, so the user still sees the same behavior.
+
+When the user asks you to remove / disable / turn off any visual behavior, follow this procedure in order, and emit SHAPE A-MULTI covering ALL files involved:
+
+(a) Search EVERY attached CSS file for declarations of that property on selectors matching the target element's classes (and ancestor selectors, media queries, hover states). Enumerate every rule that sets it.
+(b) Prefer to remove the property from EVERY rule that declares it — cleanest fix, edits the source of truth.
+(c) If editing every declaring file is impractical, fall back to OVERRIDING by writing the explicit "off" value on the same selector in the CSS file that loads LAST in the page. An override placed in a later-loaded file still wins.
+(d) Never assume one edit is sufficient. After choosing your edits, ask yourself: "if the user reloads the page, will the visible behavior they wanted off actually be off?" If even one declaration in another file could still apply, include an edit that defeats it.
+
+Workflow: read the attached files, translate the user's everyday request into the visible behavior they're targeting, locate every rule that drives that behavior, decide the smallest set of edits that fully achieves it, and emit them all. A change is "applied" only if a user reloading the page sees the new behavior — if any part still produces the old result, the edit is a failure.
+
 OUTPUT SHAPE B — structural move (use ONLY when the user wants to relocate a block of markup):
 {"file_path":"<exact path from a FILE header>","move":{"source_start":"<verbatim first line of the block to MOVE>","source_end":"<verbatim last line of the block to MOVE>","insert_before":"<verbatim first line of where the block should land>"},"reasoning":"<short>"}
 
@@ -219,6 +270,19 @@ SHAPE A RULES (old_block / new_block):
 - Do NOT invent code not present in the files.
 - ADDING NEW CONTENT: find a nearby existing block; put those lines in old_block EXACTLY; put those same lines PLUS your new content in new_block.
 - If truly appending to the very end: old_block = last 2–5 non-empty lines verbatim; new_block = those same lines followed by your new content.
+
+PRINCIPLE OF MINIMUM CHANGE (critical — applies to every edit):
+
+The user is non-technical. They describe a small visible problem and expect a small fix. Your edits MUST be the minimum possible to achieve the described visible outcome.
+
+Hard rules:
+1. Prefer modifying an existing declaration on an existing rule over restructuring HTML or adding new markup. If a single property tweak achieves the outcome, that is the right answer.
+2. NEVER invent new class names, wrapper elements, or HTML structure that didn't exist in the file. Target the element's existing classes — do not introduce a new wrapper.
+3. NEVER introduce inline style attributes unless the existing markup already uses inline styles on that element. Prefer editing the rule on the existing class.
+4. When the visible problem is about spacing, size, or position, locate the existing CSS property that produces what the user sees and change only that property. If you cannot identify with confidence which property produces the visible outcome, return a clarification question with 2-3 concrete options rather than guessing a structural change.
+5. If your new_block for a styling request exceeds the size of the old_block by more than a handful of lines, that is a strong signal you are over-editing — reconsider whether a property-level change in CSS would suffice.
+
+Self-check before emitting: would a smaller, more targeted edit achieve the same visible outcome? If yes, redo with that smaller edit.
 
 MULTIPLE EDITS IN ONE PROMPT (very important — do not split into multiple turns):
 - Users often pack several changes into one request: "Replace this blog with this image, title 'Hello World', date '01 May 2021', description '…'", or "Change the heading to X, the button text to Y, and remove the subtitle".
@@ -260,6 +324,11 @@ DEFAULT TO ACTING ON THE CLICK REGION:
 - Example: user clicked inside an FAQ accordion's General tab and prompted "add a new FAQ" → add a new accordion item to the General tab's @foreach block (or the first accordion-item near the click), don't ask which tab.
 - Example: user clicked a testimonial card and prompted "make this red" → edit the styling of the card containing the marked line, don't ask which testimonial.
 
+WHEN THE PROMPT CLEARLY TARGETS A DIFFERENT ELEMENT THAN THE CLICK:
+- If the user's words name a specific element (e.g. a button by its label text, a heading by its content, an image by its alt text) that exists ELSEWHERE in the file and is NOT what they clicked, EMIT THE SHAPE A EDIT for that named element. Do not return an error telling them to re-click — the runtime will detect the click/edit mismatch and ask the user "should I go ahead with that?" as a confirmation, and apply on yes.
+- Your job is to identify the right target and emit the edit. The runtime owns the user-facing confirmation. NEVER tell the user to "click directly on …" or "please click the … button" in your error/reasoning — that flow is handled for you.
+- If you are NOT confident which element the user means (no clear signal in their words), THEN return a SHAPE C question listing the candidates.
+
 VOICE — applies to EVERY error, question, and reasoning message you produce:
 - Always address the user in the SECOND PERSON.
 - When referring to what they typed, ALWAYS use "You said to …" (e.g. "You said to change the heading", "You said to remove this page").
@@ -267,9 +336,15 @@ VOICE — applies to EVERY error, question, and reasoning message you produce:
 - "You clicked …" is fine when describing what they selected on the page.
 
 AMBIGUITY (only when truly unsolvable): If, after reading the click region, you still cannot proceed, return {"error":"<why>"}.
-- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You said to change this image, but you clicked the .testimonials-slider near 'Steve' which has no image. Did you mean to (a) replace Steve's portrait above, or (b) change the testimonial text instead?"
+- The error MUST reference the click region by name. Pull a heading, class, or surrounding element identifier from the marked area to make it concrete. Example: "You said to change this image, but you clicked the slider near 'Steve' which has no image. Did you mean to (a) replace Steve's portrait above, or (b) change the testimonial text instead?"
 - DO NOT return generic errors like "ambiguous", "cannot determine", or "please clarify which element". Always reference WHAT you saw at the click region.
-- Phrase the error as a question (ends with "?") whenever you're asking the user to disambiguate between two reasonable interpretations — the UI styles questions differently from hard errors.`;
+- Phrase the error as a question (ends with "?") whenever you're asking the user to disambiguate between two reasonable interpretations — the UI styles questions differently from hard errors.
+
+RELATIVE MEASUREMENTS (very important — common non-technical phrasing):
+- Phrases like "make it double / half / bigger / smaller / wider / narrower / taller / shorter" describe a CHANGE relative to a current size. They are NOT a target value on their own.
+- Before applying, check: does the target element have an explicit measurement in CSS or inline style (e.g. width: 240px, height: 60px, font-size: 20px)? If yes, compute the new value (double = ×2, half = ÷2, bigger = +25%, smaller = ×0.8, etc.) and apply.
+- If the element has NO explicit measurement (width is auto, height is auto, size is content-driven), you CANNOT silently invent a number. Return a SHAPE C question that names the visible element and offers concrete options. Example: "You said to make the Member's Area button wider, but it currently sizes to fit its text. About how wide should it be — a little bigger (around 220px), much bigger (around 320px), or full-width across its container?"
+- Always offer 2 or 3 concrete options the user can pick by clicking — never a free-form "what value?" question.`;
   }
 
   // Shared with warmEditCache — both callers must produce IDENTICAL bytes for cache hits.
@@ -315,7 +390,7 @@ AMBIGUITY (only when truly unsolvable): If, after reading the click region, you 
   // onToken (optional): callback invoked with each text delta as Claude streams the response —
   //                     hook this to socket emission for live UI feedback.
   // Returns { mode: 'replace', file_path, old_block, new_block, reasoning } or { mode: 'skip', reason }
-  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null, iframeViewport = null }) {
+  async executeEditMulti({ prompt, selectedElement, candidates, conversation = null, imageData = null, savedImageUrl = null, onToken = null, iframeViewport = null, _ctx = null, _attempt = 1 }) {
     logger.info('Multi-file edit', { candidates: candidates.map(c => `${c.path} (${c.type})`), hasConversation: !!(conversation?.length) });
 
     let editInstruction = prompt;
@@ -392,25 +467,67 @@ Return ONLY valid JSON.`;
       if (typeof onToken === 'function') stream.on('text', (delta) => onToken(delta));
       const finalMessage = await stream.finalMessage();
       const u = finalMessage.usage || {};
+      const aiMs = Date.now() - t0;
       logger.info('Edit token usage', {
-        ms: Date.now() - t0, model: this.editModel,
+        ms: aiMs, model: this.editModel,
         input: u.input_tokens, cache_read: u.cache_read_input_tokens || 0,
         cache_create: u.cache_creation_input_tokens || 0, output: u.output_tokens,
       });
+      if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'executeEditMulti', model: this.editModel, ms: aiMs, response: finalMessage, attempt: _attempt });
       // Synthesise a response-shaped object so the rest of the function reads identically.
       const response = finalMessage;
       let result;
       try { result = this._extractJSON(response.content[0].text); }
-      catch { logger.warn('AI returned invalid JSON in executeEditMulti'); return { mode: 'skip' }; }
+      catch (jsonErr) {
+        logger.warn('AI returned invalid JSON in executeEditMulti');
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, jsonErr, 'invalid_json');
+        return { mode: 'skip' };
+      }
 
-      if (result?.error) return { mode: 'skip', reason: result.error };
+      if (result?.error) {
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, result.error, 'ambiguous');
+        return { mode: 'skip', reason: result.error };
+      }
 
       // SHAPE D: file deletion. Claude emits { file_path, delete: true }.
       // Caller is expected to also strip any matching Route::get from web.php
       // for static_pages/blogs (deterministic post-processing in the controller).
       if (result?.delete === true && result?.file_path) {
         logger.info('File deletion requested', { file: result.file_path, reasoning: result.reasoning });
+        if (_ctx?.requestId) requestLogger.recordReasoning(_ctx.requestId, result.reasoning);
         return { mode: 'delete', file_path: result.file_path, reasoning: result.reasoning };
+      }
+
+      // SHAPE A-MULTI: multiple file edits in one response. Used when a single
+      // user request needs changes that span more than one file (animation
+      // markup + CSS keyframes, class rename across blade + CSS, etc.). The
+      // controller applies each edit sequentially using the same uniqueness
+      // and apply logic as single-file SHAPE A.
+      if (Array.isArray(result?.edits) && result.edits.length > 0) {
+        const edits = result.edits.filter(e => e && typeof e.old_block === 'string' && typeof e.new_block === 'string');
+        if (edits.length === 0) {
+          return { mode: 'skip', reason: 'multi-edit response had no usable edits' };
+        }
+        // Backfill missing file_path on individual edits using the candidate inference helper.
+        for (const e of edits) {
+          if (!e.file_path) e.file_path = (() => {
+            const hits = candidates.filter(c => c.content && c.content.includes(e.old_block));
+            if (hits.length === 1) return hits[0].path;
+            if (hits.length > 1 && clickedFilePath) {
+              const preferred = hits.find(h => h.path === clickedFilePath);
+              if (preferred) return preferred.path;
+            }
+            return null;
+          })();
+        }
+        const missing = edits.filter(e => !e.file_path);
+        if (missing.length) {
+          if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, `multi-edit had ${missing.length} edit(s) with no resolvable file_path`, 'ambiguous');
+          return { mode: 'skip', reason: `Multi-file edit had ${missing.length} edit(s) whose target file couldn't be determined` };
+        }
+        logger.info('Multi-file edit ready', { count: edits.length, files: edits.map(e => e.file_path).join(', '), reasoning: result.reasoning });
+        if (_ctx?.requestId) requestLogger.recordReasoning(_ctx.requestId, result.reasoning);
+        return { mode: 'multi', edits, reasoning: result.reasoning };
       }
 
       // Infer file_path if Claude forgot to include it: look for candidates whose content
@@ -436,21 +553,25 @@ Return ONLY valid JSON.`;
           return { mode: 'skip', reason: 'Could not determine which file to move within' };
         }
         logger.info('Structural move ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        if (_ctx?.requestId) requestLogger.recordReasoning(_ctx.requestId, result.reasoning);
         return { mode: 'move', file_path: filePath, ...result.move, reasoning: result.reasoning };
       }
       if (result?.old_block !== undefined && result?.new_block !== undefined) {
         const filePath = result.file_path || inferFilePath(result.old_block);
         if (!filePath) {
           logger.warn('old_block not unique to any candidate — Claude must specify file_path', { old_preview: (result.old_block || '').substring(0, 80) });
+          if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, 'AI edit did not specify which file', 'ambiguous');
           return { mode: 'skip', reason: 'AI edit did not specify which file, and the target text appears in multiple files' };
         }
         logger.info('Multi-file edit ready', { file: filePath, inferred: !result.file_path, reasoning: result.reasoning });
+        if (_ctx?.requestId) requestLogger.recordReasoning(_ctx.requestId, result.reasoning);
         return { mode: 'replace', file_path: filePath, old_block: result.old_block, new_block: result.new_block, reasoning: result.reasoning };
       }
       logger.warn('AI returned unexpected shape in executeEditMulti', { keys: Object.keys(result || {}) });
       return { mode: 'skip' };
     } catch (error) {
       logger.error('Multi-file edit failed', { error: error.message });
+      if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
       const reason = error.message?.includes('rate_limit') || error.message?.includes('429')
         ? 'Rate limit reached — wait a moment and try again'
         : error.message?.includes('Connection')
@@ -462,7 +583,7 @@ Return ONLY valid JSON.`;
 
   // ─── Step 2b: Scoped page analysis — only one blade file sent ─────────────
   // Returns { result, messages } — messages threads into the generate step.
-  async analyzePageChange(prompt, bladeFilePath, bladeContent, imageData = null, changeHistory = '', relatedFiles = []) {
+  async analyzePageChange(prompt, bladeFilePath, bladeContent, imageData = null, changeHistory = '', relatedFiles = [], _ctx = null) {
     logger.info('Analyzing scoped page change', { file: bladeFilePath });
 
     const truncated = bladeContent.length > 12000
@@ -486,12 +607,14 @@ Return ONLY valid JSON.`;
       ? [{ type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.base64 } }, textBlock]
       : [textBlock];
 
+    const _t0_apc = Date.now();
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: 800,
       system: 'You are an expert Laravel developer. Analyze the change request for the given blade file only. Respond ONLY with valid JSON.',
       messages: [{ role: 'user', content: userContent }]
     });
+    if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'analyzePageChange', model: this.model, ms: Date.now() - _t0_apc, response });
 
     const result = this._extractJSON(response.content[0].text);
 
@@ -506,7 +629,7 @@ Return ONLY valid JSON.`;
 
   // ─── Step 3: Full pipeline — analyze then generate ─────────────────────────
   // Returns { result, messages } — messages threads into the generate step.
-  async analyzeChangeRequest(prompt, projectContext, category, imageData = null, changeHistory = '') {
+  async analyzeChangeRequest(prompt, projectContext, category, imageData = null, changeHistory = '', _ctx = null) {
     logger.info('Starting AI analysis', { category, hasImage: !!imageData });
 
     const systemPrompt = this._buildAnalysisSystemPrompt(projectContext, changeHistory);
@@ -540,12 +663,14 @@ Return ONLY valid JSON.`;
       : [textBlock];
 
     try {
+      const _t0_acr = Date.now();
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 1000,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
       });
+      if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'analyzeChangeRequest', model: this.model, ms: Date.now() - _t0_acr, response });
 
       const result = this._extractJSON(response.content[0].text);
       logger.info('AI analysis completed', { complexity: result.complexity, risk: result.risk_level });
@@ -558,6 +683,7 @@ Return ONLY valid JSON.`;
       return { result, messages };
     } catch (error) {
       logger.error('AI analysis failed', { error: error.message });
+      if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
       throw new Error(`AI analysis failed: ${error.message}`);
     }
   }
@@ -570,7 +696,7 @@ Return ONLY valid JSON.`;
   // priorMessages: conversation thread from the preceding analyze call.
   // When provided, the AI already knows the plan — we only send the full file
   // in the new user turn, saving tokens on re-explaining the change.
-  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null, imageData = null) {
+  async generateCode(fileInfo, originalContent = null, priorMessages = [], onToken = null, pageContext = null, imageData = null, _ctx = null) {
     logger.info('Generating code', { file: fileInfo.file_path, threaded: priorMessages.length > 0 });
 
     const systemPrompt = `You are an AI code editor making precise surgical edits to a Laravel Blade file.
@@ -641,15 +767,18 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
         // For image requests: use non-streaming create() — stream() can hang with images
         if (imageData) {
           logger.info('Using non-streaming API for image request');
+          const _t0 = Date.now();
           const response = await this.client.messages.create({
             model: this.model,
             max_tokens: 4096,
             system: systemPrompt,
             messages
           });
+          if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'generateCode:image', model: this.model, ms: Date.now() - _t0, response });
           let result;
           try { result = this._extractJSON(response.content[0].text); } catch {
             logger.warn('AI response not valid JSON (image)', { response: response.content[0].text.substring(0, 300) });
+            if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, 'invalid JSON', 'invalid_json');
             return { mode: 'skip' };
           }
           if (result?.old_block !== undefined && result?.new_block !== undefined) {
@@ -660,6 +789,7 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
 
         if (onToken) {
           let accumulated = '';
+          const _t0 = Date.now();
           const stream = this.client.messages.stream({
             model: this.model,
             max_tokens: 4096,
@@ -670,12 +800,14 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
             accumulated += chunk;
             onToken(chunk);
           });
-          await stream.finalMessage();
+          const finalMsg = await stream.finalMessage();
+          if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'generateCode:stream', model: this.model, ms: Date.now() - _t0, response: finalMsg });
           let result;
           try {
             result = this._extractJSON(accumulated);
           } catch (jsonErr) {
             logger.warn('AI response not valid JSON', { file: fileInfo.file_path, response: accumulated.substring(0, 500) });
+            if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, jsonErr, 'invalid_json');
             return { mode: 'skip' };
           }
           if (result?.old_block !== undefined && result?.new_block !== undefined) {
@@ -685,12 +817,14 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
           logger.warn('AI returned unexpected JSON shape, skipping', { file: fileInfo.file_path, keys: Object.keys(result || {}), response: accumulated.substring(0, 300) });
           return { mode: 'skip' };
         } else {
+          const _t0 = Date.now();
           const response = await this.client.messages.create({
             model: this.model,
             max_tokens: 4096,
             system: systemPrompt,
             messages
           });
+          if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'generateCode:replace', model: this.model, ms: Date.now() - _t0, response });
 
           const result = this._extractJSON(response.content[0].text);
           if (result?.old_block !== undefined && result?.new_block !== undefined) {
@@ -702,6 +836,7 @@ Return ONLY the JSON edit. old_block must NOT include line numbers:
         }
       } catch (error) {
         logger.error('Code generation failed', { file: fileInfo.file_path, error: error.message });
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
         throw new Error(`Code generation failed: ${error.message}`);
       }
     } else {
@@ -718,6 +853,7 @@ Create this new file.`;
       try {
         if (onToken) {
           let accumulated = '';
+          const _t0 = Date.now();
           const stream = this.client.messages.stream({
             model: this.model,
             max_tokens: 4096,
@@ -728,17 +864,20 @@ Create this new file.`;
             accumulated += chunk;
             onToken(chunk);
           });
-          await stream.finalMessage();
+          const finalMsg = await stream.finalMessage();
+          if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'generateCode:newfile-stream', model: this.model, ms: Date.now() - _t0, response: finalMsg });
           const content = this._extractCode(accumulated);
           logger.info('New file generated (streamed)', { file: fileInfo.file_path, bytes: content.length });
           return { mode: 'create', content };
         } else {
+          const _t0 = Date.now();
           const response = await this.client.messages.create({
             model: this.model,
             max_tokens: 4096,
             system: newFileSystemPrompt,
             messages: [...priorMessages, { role: 'user', content: userPrompt }]
           });
+          if (_ctx?.requestId) requestLogger.recordAiCall(_ctx.requestId, { fn: 'generateCode:newfile', model: this.model, ms: Date.now() - _t0, response });
 
           const content = this._extractCode(response.content[0].text);
           logger.info('New file generated', { file: fileInfo.file_path, bytes: content.length });
@@ -746,6 +885,7 @@ Create this new file.`;
         }
       } catch (error) {
         logger.error('Code generation failed', { file: fileInfo.file_path, error: error.message });
+        if (_ctx?.requestId) requestLogger.recordError(_ctx.requestId, error);
         throw new Error(`Code generation failed: ${error.message}`);
       }
     }

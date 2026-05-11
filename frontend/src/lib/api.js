@@ -53,6 +53,7 @@ export const apiClient = {
   getChangeRequest: (id) => api.get(`/api/change-requests/${id}`),
   listChangeRequests: (filters = {}) => api.get('/api/change-requests', { params: filters }),
   applyChangeRequest: (id) => api.post(`/api/change-requests/${id}/apply`),
+  cancelChangeRequest: (id) => api.post(`/api/change-requests/${id}/cancel`),
   rejectChangeRequest: (id) => api.post(`/api/change-requests/${id}/reject`),
   restoreChangeRequest: (id) => api.post(`/api/change-requests/${id}/restore`),
 
@@ -69,6 +70,11 @@ export const apiClient = {
   saveOverride: (projectId, data) => api.post(`/api/projects/${projectId}/text-overrides`, data),
   revertOverride: (projectId, overrideId) => api.post(`/api/projects/${projectId}/text-overrides/${overrideId}/revert`),
   uploadProjectImage: (projectId, base64, media_type) => api.post(`/api/projects/${projectId}/upload-image`, { base64, media_type }),
+
+  // Admin telemetry (admin only)
+  listRequestLogs: (params = {}) => api.get('/api/admin/request-logs', { params }),
+  getRequestLog: (id) => api.get(`/api/admin/request-logs/${id}`),
+  getAdminMetrics: (range = '24h') => api.get('/api/admin/request-logs/metrics', { params: { range } }),
 
   // Users (admin only)
   listUsers: () => api.get('/api/users'),

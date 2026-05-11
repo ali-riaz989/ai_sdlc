@@ -151,10 +151,214 @@
     if (t.closest && t.closest('button[type="submit"]')) { e.preventDefault(); return; }
   }
 
+  // ── Floating format toolbar (Word-like) ──────────────────────────────────
+  // A single persistent toolbar anchored to the iframe document. Appears above
+  // whichever contenteditable element currently has focus. Buttons issue
+  // execCommand to format the selection in-place; the existing onTextBlur
+  // captures the resulting innerHTML, so persistence "just works" — formatting
+  // changes flow through the same /text-overrides path as plain text edits.
+  let formatToolbar = null;
+  let activeEditable = null;
+  let toolbarHideTimer = null;
+  const FONT_FAMILIES = [
+    ['Default', ''],
+    ['Sans-serif', 'sans-serif'],
+    ['Serif', 'serif'],
+    ['Monospace', 'monospace'],
+    ['Inter', 'Inter, sans-serif'],
+    ['Helvetica', 'Helvetica, Arial, sans-serif'],
+    ['Georgia', 'Georgia, serif'],
+    ['Times', '"Times New Roman", Times, serif'],
+    ['Courier', '"Courier New", Courier, monospace'],
+  ];
+  const FONT_SIZES = ['10', '12', '14', '16', '18', '20', '24', '28', '32', '36', '48'];
+
+  function buildToolbar() {
+    if (formatToolbar) return formatToolbar;
+    const tb = document.createElement('div');
+    tb.id = '__lgc_format_toolbar';
+    tb.style.cssText =
+      'position:absolute;display:none;z-index:2147483647;' +
+      'background:#1f2937;color:#f3f4f6;border:1px solid #111827;' +
+      'border-radius:8px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,0.18);' +
+      'font:13px/1 system-ui,-apple-system,sans-serif;' +
+      'display:none;align-items:center;gap:2px;user-select:none;';
+    // Stop mousedown on plain buttons from blurring the contenteditable —
+    // otherwise pressing Bold clears the selection before execCommand fires.
+    // BUT: <select> needs its native mousedown to open the dropdown, and
+    // <input type="color"> needs it to open the picker. Only preventDefault
+    // for elements that don't have their own popover behavior.
+    tb.addEventListener('mousedown', (e) => {
+      if (e.target.closest('select, input, textarea, option')) return;
+      e.preventDefault();
+    });
+
+    const mkBtn = (label, title, onClick) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.title = title;
+      b.innerHTML = label;
+      b.style.cssText =
+        'min-width:28px;height:28px;padding:0 6px;background:transparent;' +
+        'color:inherit;border:0;border-radius:4px;cursor:pointer;font:inherit;' +
+        'display:inline-flex;align-items:center;justify-content:center;';
+      b.addEventListener('mouseenter', () => { b.style.background = 'rgba(255,255,255,0.12)'; });
+      b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
+      b.addEventListener('click', (e) => { e.preventDefault(); onClick(); });
+      return b;
+    };
+    const mkSep = () => {
+      const s = document.createElement('span');
+      s.style.cssText = 'display:inline-block;width:1px;height:20px;background:rgba(255,255,255,0.18);margin:0 3px;';
+      return s;
+    };
+    const mkSelect = (options, title, onChange) => {
+      const sel = document.createElement('select');
+      sel.title = title;
+      sel.style.cssText =
+        'height:24px;background:#374151;color:#f3f4f6;border:0;border-radius:4px;' +
+        'padding:0 4px;font:12px/1 inherit;cursor:pointer;outline:none;';
+      for (const [label, value] of options) {
+        const o = document.createElement('option');
+        o.value = String(value);
+        o.textContent = label;
+        sel.appendChild(o);
+      }
+      sel.addEventListener('change', () => onChange(sel.value));
+      return sel;
+    };
+
+    const exec = (cmd, value) => {
+      try { document.execCommand(cmd, false, value); } catch {}
+    };
+
+    // Select all — picks up the full contents of the active editable so
+    // formatting / color buttons apply to everything in one click. Selects
+    // within `activeEditable` (not the whole iframe document).
+    tb.appendChild(mkBtn('⌘A', 'Select all in this block', () => {
+      if (!activeEditable) return;
+      const sel = document.getSelection();
+      const range = document.createRange();
+      try { range.selectNodeContents(activeEditable); } catch { return; }
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }));
+    tb.appendChild(mkSep());
+
+    // Inline formatting
+    tb.appendChild(mkBtn('<b>B</b>', 'Bold (Ctrl+B)', () => exec('bold')));
+    tb.appendChild(mkBtn('<i>I</i>', 'Italic (Ctrl+I)', () => exec('italic')));
+    tb.appendChild(mkBtn('<u>U</u>', 'Underline (Ctrl+U)', () => exec('underline')));
+    tb.appendChild(mkBtn('<s>S</s>', 'Strikethrough', () => exec('strikeThrough')));
+    tb.appendChild(mkSep());
+
+    // Color picker — native input, hidden behind a button label
+    const colorWrap = document.createElement('label');
+    colorWrap.title = 'Text color';
+    colorWrap.style.cssText =
+      'min-width:28px;height:28px;padding:0 6px;border-radius:4px;cursor:pointer;' +
+      'display:inline-flex;align-items:center;justify-content:center;position:relative;';
+    colorWrap.addEventListener('mouseenter', () => { colorWrap.style.background = 'rgba(255,255,255,0.12)'; });
+    colorWrap.addEventListener('mouseleave', () => { colorWrap.style.background = 'transparent'; });
+    colorWrap.innerHTML = '<span style="font-weight:600;border-bottom:3px solid #ef4444;line-height:1;">A</span>';
+    const colorInput = document.createElement('input');
+    colorInput.type = 'color';
+    colorInput.style.cssText = 'position:absolute;inset:0;opacity:0;cursor:pointer;';
+    colorInput.addEventListener('input', () => {
+      // Color input opens on click; preserve selection by deferring exec
+      exec('foreColor', colorInput.value);
+    });
+    colorWrap.appendChild(colorInput);
+    tb.appendChild(colorWrap);
+
+    tb.appendChild(mkSep());
+
+    // Font family / size selects
+    const fontSel = mkSelect(FONT_FAMILIES, 'Font family', (v) => exec('fontName', v || 'inherit'));
+    tb.appendChild(fontSel);
+    const sizeSel = mkSelect([['Size…', ''], ...FONT_SIZES.map(s => [s + 'px', s])], 'Font size', (v) => {
+      if (!v) return;
+      // execCommand('fontSize') uses 1-7 scale; we want px. Wrap selection in
+      // a span with the chosen px value instead.
+      const sel = document.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      const range = sel.getRangeAt(0);
+      const span = document.createElement('span');
+      span.style.fontSize = v + 'px';
+      try { range.surroundContents(span); } catch {
+        // Selection crosses element boundaries; fall back to wrapping cloned
+        // contents and re-inserting.
+        const frag = range.extractContents();
+        span.appendChild(frag);
+        range.insertNode(span);
+      }
+      sizeSel.selectedIndex = 0; // reset label to "Size…"
+    });
+    tb.appendChild(sizeSel);
+
+    tb.appendChild(mkSep());
+
+    // Lists — bullet and numbered. execCommand toggles them on / off.
+    tb.appendChild(mkBtn('• ☰', 'Bulleted list',  () => exec('insertUnorderedList')));
+    tb.appendChild(mkBtn('1. ☰', 'Numbered list', () => exec('insertOrderedList')));
+
+    tb.appendChild(mkSep());
+
+    // Alignment
+    tb.appendChild(mkBtn('⬱', 'Align left', () => exec('justifyLeft')));
+    tb.appendChild(mkBtn('☰', 'Align center', () => exec('justifyCenter')));
+    tb.appendChild(mkBtn('⬲', 'Align right', () => exec('justifyRight')));
+
+    tb.appendChild(mkSep());
+
+    // Clear formatting
+    tb.appendChild(mkBtn('✕', 'Remove formatting', () => exec('removeFormat')));
+
+    document.body.appendChild(tb);
+    formatToolbar = tb;
+    return tb;
+  }
+
+  function showToolbarFor(el) {
+    if (!editEnabled || !el) return;
+    clearTimeout(toolbarHideTimer);
+    activeEditable = el;
+    const tb = buildToolbar();
+    const rect = el.getBoundingClientRect();
+    const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
+    const scrollX = window.scrollX || document.documentElement.scrollLeft || 0;
+    // Position above the element; flip below if there's no room above.
+    tb.style.display = 'inline-flex';
+    const tbRect = tb.getBoundingClientRect();
+    const aboveTop = rect.top + scrollY - tbRect.height - 8;
+    const belowTop = rect.bottom + scrollY + 8;
+    const top = aboveTop > scrollY + 4 ? aboveTop : belowTop;
+    let left = rect.left + scrollX;
+    // Keep within viewport horizontally
+    const maxLeft = scrollX + window.innerWidth - tbRect.width - 8;
+    if (left > maxLeft) left = Math.max(scrollX + 8, maxLeft);
+    tb.style.top = top + 'px';
+    tb.style.left = left + 'px';
+  }
+
+  function hideToolbar() {
+    if (!formatToolbar) return;
+    formatToolbar.style.display = 'none';
+    activeEditable = null;
+  }
+
   function enableEdit() {
     editEnabled = true;
     document.addEventListener('click', suppressNav, true);
     document.addEventListener('submit', suppressNav, true);
+
+    // Show toolbar when focus enters an editable; hide (with grace period
+    // to allow toolbar clicks) when it leaves.
+    document.addEventListener('focusin', onEditableFocusIn, true);
+    document.addEventListener('focusout', onEditableFocusOut, true);
+    // Reposition toolbar on scroll/resize so it stays glued above the focused element
+    document.addEventListener('scroll', onScrollResize, true);
+    window.addEventListener('resize', onScrollResize);
 
     // Make text-bearing elements editable. We restrict the candidate tags to
     // common content tags so we don't accidentally make navigation chrome
@@ -224,10 +428,41 @@
     });
   }
 
+  function onEditableFocusIn(e) {
+    const el = e.target;
+    if (!el || !editableEls.has(el)) return;
+    showToolbarFor(el);
+  }
+  function onEditableFocusOut(e) {
+    // Delay hide so a click on a toolbar button or its <select> (which move
+    // focus briefly) doesn't dismiss the toolbar before the click handler
+    // runs. Focus is considered still "with us" if it's inside another
+    // editable OR inside the toolbar itself (font/size dropdowns, color
+    // picker, formatting buttons all live there).
+    clearTimeout(toolbarHideTimer);
+    toolbarHideTimer = setTimeout(() => {
+      const ae = document.activeElement;
+      const stillEditing = ae && editableEls.has(ae);
+      const inToolbar = ae && formatToolbar && formatToolbar.contains(ae);
+      if (!stillEditing && !inToolbar) hideToolbar();
+    }, 120);
+  }
+  function onScrollResize() {
+    if (activeEditable && formatToolbar && formatToolbar.style.display !== 'none') {
+      showToolbarFor(activeEditable);
+    }
+  }
+
   function disableEdit() {
     editEnabled = false;
     document.removeEventListener('click', suppressNav, true);
     document.removeEventListener('submit', suppressNav, true);
+    document.removeEventListener('focusin', onEditableFocusIn, true);
+    document.removeEventListener('focusout', onEditableFocusOut, true);
+    document.removeEventListener('scroll', onScrollResize, true);
+    window.removeEventListener('resize', onScrollResize);
+    hideToolbar();
+    if (formatToolbar) { formatToolbar.remove(); formatToolbar = null; }
     editableEls.forEach(el => {
       el.contentEditable = 'false';
       el.style.outline = '';

@@ -7,8 +7,8 @@ function validateChangeRequest(req, res, next) {
   if (!title || title.trim().length === 0) {
     return res.status(400).json({ error: 'title is required' });
   }
-  if (!prompt || prompt.trim().length < 10) {
-    return res.status(400).json({ error: 'prompt must be at least 10 characters' });
+  if (!prompt || prompt.trim().length < 2) {
+    return res.status(400).json({ error: 'prompt must be at least 2 characters' });
   }
   if (prompt.length > 5000) {
     return res.status(400).json({ error: 'prompt must not exceed 5000 characters' });

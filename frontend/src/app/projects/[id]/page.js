@@ -36,6 +36,7 @@ export default function ProjectPreview() {
   const { user, loading } = useAuth();
 
   const [project, setProject] = useState(null);
+  const [publishToast, setPublishToast] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [image, setImage] = useState(null); // { base64, mediaType, preview }
   const [submitting, setSubmitting] = useState(false);
@@ -157,11 +158,23 @@ export default function ProjectPreview() {
     const prevHeight = el.scrollHeight;
     try {
       const res = await apiClient.loadChatMessages(id, { before: oldestChatId, limit: 100 });
-      const older = (res.data?.messages || []).map(m => ({
+      const olderList = res.data?.messages || [];
+      const older = olderList.map(m => ({
         id: m.id, role: m.role, text: m.text || '', type: m.type || 'text',
         data: m.data || null, change_request_id: m.change_request_id || null,
       }));
       if (older.length) {
+        // Merge the new reverted-override IDs into the client-side set —
+        // older paginated reverts must keep rendering correctly when scrolled into view.
+        setRevertedOverrides(prev => {
+          const next = new Set(prev);
+          for (const m of olderList) {
+            if (m.type === 'live_edit' && m.override_reverted && m.data?.override_id != null) {
+              next.add(m.data.override_id);
+            }
+          }
+          return next;
+        });
         setChatMessages(prev => [...older, ...prev]);
         setOldestChatId(res.data?.oldest_id ?? oldestChatId);
         setHasMoreChat(!!res.data?.has_more);
@@ -258,6 +271,10 @@ export default function ProjectPreview() {
 
   // Dedup failure messages: socket and polling can both fire 'failed' for the same request.
   const handledFailuresRef = useRef(new Set());
+  // Mirror of handledFailuresRef for the success path: prevents the socket update
+  // and the polling fallback from each pushing their own "Changes Applied" card
+  // for the same change request.
+  const handledFileChangesRef = useRef(new Set());
 
   // Heuristic: an AI "failure" message that asks for clarification (ambiguous element,
   // multiple matches, "did you mean…") is really a question, not an error. Render it
@@ -618,7 +635,7 @@ export default function ProjectPreview() {
       const info = {
         tag: el.tagName.toLowerCase(),
         text: el.innerText?.trim().substring(0, 100) || '',
-        classes: el.className?.substring(0, 80) || '',
+        classes: el.clasclassNamesName?.substring(0, 80) || '',
         section: sectionLabel || 'unknown section',
         isImage: el.tagName === 'IMG',
         src: el.tagName === 'IMG' ? el.src?.substring(0, 200) : null,
@@ -920,7 +937,8 @@ export default function ProjectPreview() {
     // that pre-date this feature simply aren't in the DB and won't appear.
     apiClient.loadChatMessages(id, { limit: 100 })
       .then(res => {
-        const msgs = (res.data?.messages || []).map(m => ({
+        const list = res.data?.messages || [];
+        const msgs = list.map(m => ({
           id: m.id,
           role: m.role,
           text: m.text || '',
@@ -929,6 +947,17 @@ export default function ProjectPreview() {
           change_request_id: m.change_request_id || null,
         }));
         setChatMessages(msgs);
+        // Seed the client-side reverted set from each row's override_reverted
+        // truth bit (joined server-side from text_overrides). Without this, a
+        // refreshed page renders past reverts as "Live edit" again because
+        // revertedOverrides starts empty.
+        const reverted = new Set();
+        for (const m of list) {
+          if (m.type === 'live_edit' && m.override_reverted && m.data?.override_id != null) {
+            reverted.add(m.data.override_id);
+          }
+        }
+        setRevertedOverrides(reverted);
         setOldestChatId(res.data?.oldest_id ?? null);
         setHasMoreChat(!!res.data?.has_more);
         // Scroll to the bottom once the messages render
@@ -1299,12 +1328,23 @@ export default function ProjectPreview() {
           // Snapshot the file list + diffs into chat history. Each bubble has its
           // own Revert button, which is now the only way to undo a change.
           const snapshot = filesRef.current.map(f => ({ ...f, status: f.status === 'generating' ? 'done' : f.status }));
-          if (snapshot.length) {
+          if (snapshot.length && !handledFileChangesRef.current.has(cr.id)) {
+            handledFileChangesRef.current.add(cr.id);
             addChat('ai', '', 'file_change', { files: snapshot, diffs: parsed?.diff || [], requestId: cr.id });
             setFiles([]);
           }
           reloadIframe(); // show the live preview immediately
           setStreamingTokens('');
+          // When the change was applied via the confirmation flow (the user
+          // said "yes" to a proposal that landed on a different element than
+          // they had selected), clear the stale selection so the next prompt
+          // starts fresh. The element that actually got changed is different
+          // from what the red overlay was on — keeping the old selection
+          // would mislead the next refinement prompt.
+          if (parsed?.confirmed) {
+            setSelectedElement(null);
+            clearHighlight();
+          }
           // Auto-accept: skip the manual Accept/Reject step entirely. The change
           // moves straight to 'review'. If the user wants to undo, they click
           // Revert on the file_change bubble.
@@ -1350,7 +1390,8 @@ export default function ProjectPreview() {
             setResult(prev => ({ ...prev, id: cr.id, status: s, message: 'Preview ready' }));
             // Fallback snapshot via polling path, in case the socket update didn't fire
             const snap = filesRef.current.map(f => ({ ...f, status: f.status === 'generating' ? 'done' : f.status }));
-            if (snap.length) {
+            if (snap.length && !handledFileChangesRef.current.has(cr.id)) {
+              handledFileChangesRef.current.add(cr.id);
               addChat('ai', '', 'file_change', { files: snap, diffs: [], requestId: cr.id });
               setFiles([]);
             }
@@ -1417,116 +1458,167 @@ export default function ProjectPreview() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gray-100">
+    <div className="flex flex-col h-screen bg-[#1a1c1c]">
+
+      {/* Publish success toast — slides in from the top for ~3s, no real action. */}
+      {publishToast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg animate-toast-in"
+          style={{ backgroundColor: '#1f6b3a', color: '#ffffff' }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+          <span className="text-[13px] font-semibold">Your changes have been saved</span>
+        </div>
+      )}
+
+      {/* Full-width dark top bar — global editor chrome.
+          Left group: project identity + page-navigation controls.
+          Right group: history (undo/redo placeholder), Publish, avatar. */}
+      <header style={{ backgroundColor: '#f3f3f4', color: '#1a1c1c', borderBottom: '1px solid #e2e2e2' }}
+        className="sticky top-0 px-3 h-12 flex-shrink-0 flex items-center justify-between gap-3 z-30">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <button onClick={() => router.push('/')} title="Back to dashboard"
+            className="text-[#897266] hover:text-[#1a1c1c] text-base leading-none flex-shrink-0 px-1">←</button>
+          <span className="font-semibold text-[#1a1c1c] truncate text-[13px]">{project.display_name}</span>
+          <span className="text-[9px] bg-[#dcf3e1] text-[#1f6b3a] px-1.5 py-0.5 rounded font-semibold flex-shrink-0 border border-[#bfe5ca] uppercase tracking-wider">Live</span>
+
+          <div className="w-px h-5 bg-[#e2e2e2] mx-1.5" />
+
+          <div className="relative">
+            <button onClick={() => setNewMenuOpen(o => !o)} title="Create a new page or blog"
+              className="text-[12px] px-2 h-7 text-[#1a1c1c] rounded hover:bg-[#e8e8e8] transition-colors font-medium flex items-center gap-1">
+              + New <span className="text-[#897266]">▾</span>
+            </button>
+            {newMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setNewMenuOpen(false)} />
+                <div className="absolute top-full left-0 mt-1 bg-white border border-[#e2e2e2] rounded-lg shadow-lg z-50 min-w-[140px] overflow-hidden">
+                  <button onClick={() => { setNewMenuOpen(false); openNewPage(); }}
+                    className="block w-full text-left px-3 py-2 text-[12px] text-[#1a1c1c] hover:bg-[#f3f3f4]">
+                    Page
+                    <div className="text-[10px] text-[#897266]">From sections</div>
+                  </button>
+                  <button onClick={() => { setNewMenuOpen(false); setBlogOpen(true); setBlogError(''); setBlogTitle(''); setBlogSlug(''); setBlogMetaTitle(''); setBlogMetaDescription(''); }}
+                    className="block w-full text-left px-3 py-2 text-[12px] text-[#1a1c1c] hover:bg-[#f3f3f4] border-t border-[#e2e2e2]">
+                    Blog
+                    <div className="text-[10px] text-[#897266]">Image · heading · body</div>
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="relative">
+            <button onClick={() => { setGoToOpen(o => !o); setGoToError(''); }} title="Go to a specific URL"
+              className="text-[12px] px-2 h-7 text-[#1a1c1c] rounded hover:bg-[#e8e8e8] transition-colors font-medium flex items-center gap-1">
+              Go to <span className="text-[#897266]">▾</span>
+            </button>
+            {goToOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setGoToOpen(false)} />
+                <div className="absolute top-full left-0 mt-1 bg-white border border-[#e2e2e2] rounded-lg shadow-lg z-50 p-3 w-72">
+                  <label className="block text-[11px] font-medium text-[#564338] mb-1">Navigate to URL</label>
+                  <input value={goToUrl} onChange={e => setGoToUrl(e.target.value)} autoFocus
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { e.preventDefault(); submitGoTo(); }
+                      else if (e.key === 'Escape') setGoToOpen(false);
+                    }}
+                    placeholder="/blogs/my-post or /toptracer"
+                    className="w-full px-2.5 py-1.5 border border-[#ddc1b3] rounded text-[12px] text-[#1a1c1c] placeholder:text-[#897266] bg-white focus:outline-none focus:border-[#f6863d]" />
+                  {goToError && <div className="text-[10.5px] text-[#ba1a1a] mt-1">{goToError}</div>}
+                  <div className="flex gap-1.5 mt-2 justify-end">
+                    <button onClick={() => setGoToOpen(false)}
+                      className="text-[11px] px-2 py-1 text-[#564338] hover:text-[#1a1c1c]">Cancel</button>
+                    <button onClick={submitGoTo}
+                      className="text-[11px] px-3 py-1 bg-[#f6863d] text-white rounded hover:bg-[#9b4600]">Go</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          <button onClick={() => {
+            setLiveEditMode(v => {
+              const next = !v;
+              if (next) { setSelectMode(false); clearHighlight(); }
+              return next;
+            });
+          }}
+            title={liveEditMode ? 'Exit live edit mode' : 'Edit text and images directly on the page'}
+            className={`text-[12px] px-2 h-7 rounded transition-colors font-medium flex items-center gap-1 ${liveEditMode ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'text-[#1a1c1c] hover:bg-[#e8e8e8]'}`}>
+            {liveEditMode ? '✓ Editing' : '✎ Edit'}
+          </button>
+
+          <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
+            title="Refresh preview"
+            className="w-7 h-7 flex items-center justify-center rounded text-[#897266] hover:bg-[#e8e8e8] hover:text-[#1a1c1c] transition-colors">↻</button>
+
+          <button onClick={() => {
+            clearHighlight();
+            setSelectMode(v => {
+              const next = !v;
+              if (next) setLiveEditMode(false);
+              return next;
+            });
+          }}
+            title={selectMode ? 'Cancel select' : 'Select an element'}
+            className={`text-[12px] px-2 h-7 rounded transition-colors flex items-center gap-1.5 ${selectMode ? 'bg-[#1a1c1c] text-white font-semibold' : 'text-[#1a1c1c] hover:bg-[#e8e8e8]'}`}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 8V4h4" />
+              <path d="M16 4h4v4" />
+              <path d="M20 16v4h-4" />
+              <path d="M8 20H4v-4" />
+            </svg>
+            {selectMode ? 'Selecting' : 'Select'}
+          </button>
+
+          {result?.status === 'review' && lastAppliedId && (
+            <button onClick={handleRestore} title="Undo last change" className="w-7 h-7 flex items-center justify-center rounded text-[#897266] hover:bg-[#e8e8e8] hover:text-[#1a1c1c] transition-colors">↩</button>
+          )}
+        </div>
+
+        {/* Right group: history controls, Publish, avatar.
+            Undo/Redo are visual placeholders for now — functionality TBD. */}
+        <div className="flex items-center gap-3 flex-shrink-0">
+          <button title="Undo (coming soon)"
+            style={{ color: '#564338' }}
+            onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = '#e8e8e8'; e.currentTarget.style.color = '#1a1c1c'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; e.currentTarget.style.color = '#564338'; }}
+            className="w-9 h-9 flex items-center justify-center rounded transition-colors">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
+            </svg>
+          </button>
+          <button title="Redo (coming soon)"
+            style={{ color: '#564338' }}
+            onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = '#e8e8e8'; e.currentTarget.style.color = '#1a1c1c'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; e.currentTarget.style.color = '#564338'; }}
+            className="w-9 h-9 flex items-center justify-center rounded transition-colors">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 7v6h-6" /><path d="M3 17a9 9 0 0 1 15-6.7l3 2.7" />
+            </svg>
+          </button>
+          <button title="Publish changes"
+            onClick={() => {
+              setPublishToast(true);
+              setTimeout(() => setPublishToast(false), 2800);
+            }}
+            style={{ backgroundColor: '#9b4600' }}
+            onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = '#622a00'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = '#9b4600'; }}
+            className="px-5 h-9 text-white text-[13px] font-semibold rounded transition-colors">
+            Publish
+          </button>
+          <div className="w-9 h-9 rounded-full flex items-center justify-center text-[12px] font-semibold text-white"
+            style={{ backgroundColor: '#564338' }}>
+            {(user?.name || user?.email || '?').charAt(0).toUpperCase()}
+          </div>
+        </div>
+      </header>
 
       <div className="flex flex-1 overflow-hidden">
 
-        <aside className="w-[420px] flex-shrink-0 flex flex-col bg-white border-r border-gray-200">
-
-          {/* Sidebar header — scoped to the chat column only */}
-          <header className="bg-white border-b border-gray-200 px-3 py-2 flex-shrink-0 space-y-1">
-            <div className="flex items-center justify-between gap-2 min-w-0">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <button onClick={() => router.push('/')} title="Back" className="text-gray-400 hover:text-gray-700 text-base leading-none flex-shrink-0">←</button>
-                <span className="font-medium text-gray-900 truncate text-[13px]">{project.display_name}</span>
-                <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 border border-emerald-100">Live</span>
-              </div>
-              <div className="flex items-center gap-0.5 flex-shrink-0">
-                <div className="relative">
-                  <button onClick={() => setNewMenuOpen(o => !o)} title="Create a new page or blog"
-                    className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">
-                    + New ▾
-                  </button>
-                  {newMenuOpen && (
-                    <>
-                      {/* click-outside catcher */}
-                      <div className="fixed inset-0 z-40" onClick={() => setNewMenuOpen(false)} />
-                      <div className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 min-w-[120px] overflow-hidden">
-                        <button onClick={() => { setNewMenuOpen(false); openNewPage(); }}
-                          className="block w-full text-left px-3 py-2 text-[12px] text-gray-700 hover:bg-gray-50">
-                          Page
-                          <div className="text-[10px] text-gray-400">From sections</div>
-                        </button>
-                        <button onClick={() => { setNewMenuOpen(false); setBlogOpen(true); setBlogError(''); setBlogTitle(''); setBlogSlug(''); setBlogMetaTitle(''); setBlogMetaDescription(''); }}
-                          className="block w-full text-left px-3 py-2 text-[12px] text-gray-700 hover:bg-gray-50 border-t border-gray-100">
-                          Blog
-                          <div className="text-[10px] text-gray-400">Image · heading · body</div>
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
-                {/* Go to — type any project-relative URL and the iframe jumps to it.
-                    Useful when the URL isn't reachable through navigation
-                    (deep links, draft pages, etc.). Submits on Enter; closes on
-                    Escape, click-outside, or successful go. */}
-                <div className="relative">
-                  <button onClick={() => { setGoToOpen(o => !o); setGoToError(''); }} title="Go to a specific URL"
-                    className="text-[11px] px-2 py-1 text-gray-700 rounded-md hover:bg-gray-100 transition-colors font-medium">
-                    → Go to
-                  </button>
-                  {goToOpen && (
-                    <>
-                      <div className="fixed inset-0 z-40" onClick={() => setGoToOpen(false)} />
-                      <div className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 p-3 w-72">
-                        <label className="block text-[11px] font-medium text-gray-700 mb-1">Navigate to URL</label>
-                        <input value={goToUrl} onChange={e => setGoToUrl(e.target.value)} autoFocus
-                          onKeyDown={e => {
-                            if (e.key === 'Enter') { e.preventDefault(); submitGoTo(); }
-                            else if (e.key === 'Escape') setGoToOpen(false);
-                          }}
-                          placeholder="/blogs/my-post or /toptracer"
-                          className="w-full px-2.5 py-1.5 border border-gray-300 rounded-md text-[12px] text-gray-900 placeholder:text-gray-400 bg-white focus:outline-none focus:border-gray-500" />
-                        {goToError && <div className="text-[10.5px] text-red-600 mt-1">{goToError}</div>}
-                        <div className="flex gap-1.5 mt-2 justify-end">
-                          <button onClick={() => setGoToOpen(false)}
-                            className="text-[11px] px-2 py-1 text-gray-600 hover:text-gray-900">Cancel</button>
-                          <button onClick={submitGoTo}
-                            className="text-[11px] px-3 py-1 bg-gray-900 text-white rounded-md hover:opacity-90">Go</button>
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </div>
-                <button onClick={() => {
-                  // Live edit and Select are mutually exclusive: contenteditable
-                  // and the select-overlay click capture would fight over the
-                  // same clicks. Turning Edit on cancels Select.
-                  setLiveEditMode(v => {
-                    const next = !v;
-                    if (next) { setSelectMode(false); clearHighlight(); }
-                    return next;
-                  });
-                }}
-                  title={liveEditMode ? 'Exit live edit mode' : 'Edit text and images directly on the page'}
-                  className={`text-[11px] px-2 py-1 rounded-md transition-colors font-medium ${liveEditMode ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'text-gray-700 hover:bg-gray-100'}`}>
-                  {liveEditMode ? '✓ Editing' : '✎ Edit'}
-                </button>
-                <button onClick={() => { if (iframeRef.current) { const base = iframeRef.current.src.split('?')[0]; iframeRef.current.src = base + '?_t=' + Date.now(); } }}
-                  title="Refresh preview"
-                  className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↻</button>
-                <button onClick={() => {
-                  // Mirror of the Edit toggle — turning Select on cancels Live edit
-                  // so the iframe doesn't have both contenteditable AND the
-                  // hover/click overlay simultaneously fighting over events.
-                  clearHighlight();
-                  setSelectMode(v => {
-                    const next = !v;
-                    if (next) setLiveEditMode(false);
-                    return next;
-                  });
-                }}
-                  title={selectMode ? 'Cancel select' : 'Select an element'}
-                  className={`text-[11px] px-2 py-1 rounded-md transition-colors ${selectMode ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100'}`}>
-                  {selectMode ? '✓ Selecting' : '⊹ Select'}
-                </button>
-                {result?.status === 'review' && lastAppliedId && (
-                  <button onClick={handleRestore} title="Undo last change" className="w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">↩</button>
-                )}
-              </div>
-            </div>
-            {/* Project URL display removed per request — title + Live badge are enough. */}
-          </header>
+        <aside className="w-[420px] flex-shrink-0 flex flex-col bg-white border-r border-[#e2e2e2]">
 
 
           <div
@@ -1646,27 +1738,27 @@ export default function ProjectPreview() {
                 const isReverted = reqId && revertedRequests.has(reqId);
                 const hasAnyDiff = (msg.data.diffs || []).some(d => d.old_block || d.new_block);
                 if (isReverted) {
-                  // Compact "Restored" card — match Google AI Studio's restored-snapshot look,
-                  // with darker borders + text so it reads as a definite state change.
+                  // Red "ACTION REVERTED" card per design spec.
                   return (
-                    <div key={msg.id} className="rounded-xl border border-gray-400 bg-gray-50 px-3 py-2 text-xs text-gray-800">
-                      <div className="flex items-center gap-1.5 font-semibold text-gray-900">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
-                        Restored
+                    <div key={msg.id} className="rounded-lg border border-[#ba1a1a]/30 bg-[#fff5f5] px-3 py-2.5">
+                      <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-[0.1em] text-[#ba1a1a]">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                        ACTION REVERTED
                       </div>
-                      <div className="mt-0.5 text-[11px] text-gray-700 font-mono">{msg.data.files.map(f => f.file).join(', ')}</div>
+                      <div className="mt-1 text-[12px] text-[#1a1c1c] leading-relaxed">Restored files to their previous state.</div>
+                      <div className="mt-1 text-[11px] text-[#897266] font-mono truncate">{msg.data.files.map(f => f.file).join(', ')}</div>
                     </div>
                   );
                 }
                 return (
-                  <div key={msg.id} className="rounded-xl border border-gray-400 bg-white">
-                    <div className="px-3 py-2 border-b border-gray-200 flex items-center gap-1.5">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-500"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-                      <span className="text-[12px] font-medium text-gray-800 flex-1">Edited {msg.data.files.length} file{msg.data.files.length === 1 ? '' : 's'}</span>
+                  <div key={msg.id} className="rounded-lg border border-[#cfe8d6] bg-[#f4faf6]">
+                    <div className="px-3 py-2 border-b border-[#cfe8d6] flex items-center gap-1.5">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[#1f6b3a]"><polyline points="20 6 9 17 4 12"/></svg>
+                      <span className="text-[10px] font-semibold tracking-[0.1em] text-[#1f6b3a] flex-1">CHANGES APPLIED</span>
                       {hasAnyDiff && (
                         <button type="button" onClick={() => toggleDiffExpanded(msg.id)}
-                          className="text-[11px] text-gray-500 hover:text-gray-800 px-1.5 py-0.5 rounded hover:bg-gray-100 transition-colors">
-                          {isExpanded ? 'Hide diff' : 'Show diff'}
+                          className="text-[10px] font-semibold tracking-[0.1em] text-[#1f6b3a] hover:text-[#13502a] px-1 py-0.5 transition-colors">
+                          {isExpanded ? 'HIDE' : 'DETAILS'}
                         </button>
                       )}
                     </div>
@@ -1726,9 +1818,6 @@ export default function ProjectPreview() {
               // the question bubble above it.
               const isQuestion = msg.role !== 'user' && msg.type === 'question';
               const isAiError = msg.role !== 'user' && msg.type === 'error';
-              const qStyle = (isQuestion || isAiError)
-                ? { backgroundColor: '#FFF9E3', color: '#D39401', borderColor: '#D39401' }
-                : undefined;
               // Visual line-break before each lettered/numbered option marker
               // ("(a)", "(b)", "(1)", etc.) so multi-choice clarifications
               // render with each option on its own line. Combined with
@@ -1736,20 +1825,44 @@ export default function ProjectPreview() {
               // real line breaks at render time. No-op when no markers exist.
               const formatOptions = (s) => String(s || '').replace(/(\S)[ \t]*\(([a-dA-D]|[1-9])\)[ \t]+/g, '$1\n($2) ');
               const bubbleText = (isQuestion || isAiError) ? formatOptions(msg.text) : msg.text;
+
+              // Clarification (grey) and AI-error / action-reverted (red) get
+              // status-card framing per the design spec — labelled caps header
+              // + body text.
+              if (isQuestion) {
+                return (
+                  <div key={msg.id} className="rounded-lg border border-[#e2e2e2] bg-[#f3f3f4] px-3 py-2.5">
+                    <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-[0.1em] text-[#564338]">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                      CLARIFICATION
+                    </div>
+                    <div className="mt-1 text-[12px] text-[#1a1c1c] leading-relaxed whitespace-pre-wrap">{bubbleText}</div>
+                  </div>
+                );
+              }
+              if (isAiError) {
+                return (
+                  <div key={msg.id} className="rounded-lg border border-[#ba1a1a]/30 bg-[#fff5f5] px-3 py-2.5">
+                    <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-[0.1em] text-[#ba1a1a]">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                      ACTION REVERTED
+                    </div>
+                    <div className="mt-1 text-[12px] text-[#1a1c1c] leading-relaxed whitespace-pre-wrap">{bubbleText}</div>
+                  </div>
+                );
+              }
+
               return (
                 <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : ''}`}>
                   <div
-                    style={qStyle}
                     className={`max-w-[88%] text-[13px] leading-relaxed ${
                     msg.role === 'user'
-                      ? 'rounded-2xl rounded-br-sm bg-gray-200 text-gray-900 px-3.5 py-2'
-                      : (isQuestion || isAiError)
-                      ? 'rounded-xl px-3 py-2 font-medium border whitespace-pre-wrap'
+                      ? 'rounded-2xl rounded-br-sm bg-[#ffdbc9] text-[#622a00] px-3.5 py-2'
                       : msg.type === 'success'
-                      ? 'rounded-xl bg-gray-50 text-gray-900 border border-gray-400 px-3 py-2 font-medium'
+                      ? 'rounded-lg bg-[#f4faf6] text-[#1a1c1c] border border-[#cfe8d6] px-3 py-2 font-medium'
                       : msg.type === 'confirm'
-                      ? 'rounded-xl bg-amber-50 text-amber-900 border border-amber-300 px-3 py-2 font-medium'
-                      : 'text-gray-900 whitespace-pre-wrap'
+                      ? 'rounded-lg bg-[#fff8ec] text-[#622a00] border border-[#f0dcb8] px-3 py-2 font-medium'
+                      : 'text-[#1a1c1c] whitespace-pre-wrap'
                   }`}>
                     {bubbleText}
                   </div>
@@ -1777,16 +1890,18 @@ export default function ProjectPreview() {
               </div>
             )}
             {isInFlight && (
-              <div className="flex items-center gap-2 text-gray-700 text-[13px]">
-                {/* Claude-mark "dancing" while in flight. The 4-pointed star outline echoes
-                    Anthropic's brand mark; rotation+pulse keyframes live in globals.css. */}
-                <span className="animate-claude-dance" aria-hidden="true">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-orange-500">
-                    <path d="M12 1.5 L13.6 9.4 L21.5 11 L13.6 12.6 L12 20.5 L10.4 12.6 L2.5 11 L10.4 9.4 Z"/>
-                  </svg>
-                </span>
-                {/* key forces re-mount on word change so the fade-in keyframe fires every cycle */}
-                <span key={statusWord} className="animate-word-fade text-gray-700">{statusWord}…</span>
+              <div className="rounded-lg border border-[#e2e2e2] bg-[#f9f9f9] px-3 py-2.5">
+                <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-[0.1em] text-[#564338]">
+                  <span className="animate-claude-dance" aria-hidden="true">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="text-[#f6863d]">
+                      <path d="M12 1.5 L13.6 9.4 L21.5 11 L13.6 12.6 L12 20.5 L10.4 12.6 L2.5 11 L10.4 9.4 Z"/>
+                    </svg>
+                  </span>
+                  PROCESSING REQUEST
+                </div>
+                <div className="mt-1 text-[12px] text-[#1a1c1c] leading-relaxed">
+                  <span key={statusWord} className="animate-word-fade">{statusWord}…</span>
+                </div>
               </div>
             )}
             <div ref={chatEndRef} />
@@ -1870,7 +1985,7 @@ export default function ProjectPreview() {
                 and a single icon row below (history, attach, current-page chip, send). */}
             {/* Prompt box — always rendered with the prominent "selected" treatment so
                 it reads as the primary action target even before focus. Neutral gray, not jet-black. */}
-            <div className="rounded-2xl border-2 border-gray-300 bg-white shadow-sm focus-within:border-gray-500 focus-within:shadow-md transition-all">
+            <div className="rounded-lg border border-[#e2e2e2] bg-white focus-within:border-[#f6863d] focus-within:ring-1 focus-within:ring-[#f6863d] transition-all">
               <form onSubmit={handleSubmit}>
                 <textarea value={prompt}
                   onChange={e => setPrompt(e.target.value)}
@@ -1884,13 +1999,13 @@ export default function ProjectPreview() {
                   placeholder="Make changes, add new features, ask for anything"
                   disabled={submitting}
                   rows={2}
-                  className="w-full px-3.5 pt-3 pb-1 bg-transparent text-[13px] text-gray-900 placeholder:text-gray-400 focus:outline-none disabled:opacity-50 resize-none min-h-[44px] max-h-[200px] leading-snug"
+                  className="w-full px-3.5 pt-3 pb-1 bg-transparent text-[13px] text-[#1a1c1c] placeholder:text-[#897266] focus:outline-none disabled:opacity-50 resize-none min-h-[48px] max-h-[200px] leading-snug"
                 />
               </form>
               <div className="flex items-center gap-1 px-2 pb-2">
                 <button type="button" onClick={(e) => { e.stopPropagation(); setHistoryOpen(v => !v); }}
                   title="Prompt history"
-                  className={`w-8 h-8 flex items-center justify-center rounded-full transition-colors ${historyOpen ? 'bg-gray-100 text-gray-800' : 'text-gray-500 hover:bg-gray-100'}`}>
+                  className={`w-8 h-8 flex items-center justify-center rounded transition-colors ${historyOpen ? 'bg-[#f3f3f4] text-[#1a1c1c]' : 'text-[#897266] hover:bg-[#f3f3f4]'}`}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                   </svg>
@@ -1899,39 +2014,58 @@ export default function ProjectPreview() {
                   onChange={e => { loadImageFile(e.target.files[0]); e.target.value = ''; }} />
                 <button type="button" onClick={() => fileInputRef.current?.click()}
                   title="Attach screenshot"
-                  className="w-8 h-8 flex items-center justify-center rounded-full text-gray-500 hover:bg-gray-100 transition-colors">
+                  className="w-8 h-8 flex items-center justify-center rounded text-[#897266] hover:bg-[#f3f3f4] transition-colors">
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                   </svg>
                 </button>
-                {/* Current-page chip removed — the URL was visual noise inside the input. */}
                 <div className="flex-1" />
-                <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 3}
-                  title="Send"
-                  className={`w-8 h-8 flex items-center justify-center rounded-full transition-all ${submitting || imageLoading || prompt.trim().length < 3 ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-gray-900 text-white hover:bg-gray-700'}`}>
-                  {submitting
-                    ? <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>}
-                </button>
+                {isInFlight && result?.id ? (
+                  <button type="button" title="Stop this request"
+                    onClick={async () => {
+                      const idToCancel = result.id;
+                      try { await apiClient.cancelChangeRequest(idToCancel); } catch { /* still clear UI */ }
+                      setSubmitting(false);
+                      setFiles([]);
+                      setStreamingTokens('');
+                      setActivePrompt(null);
+                      setResult(prev => prev ? { ...prev, status: 'rejected', message: 'Cancelled by user' } : prev);
+                    }}
+                    className="w-9 h-9 flex items-center justify-center rounded bg-[#1a1c1c] text-white hover:bg-[#2f3131] transition-colors">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button type="button" onClick={handleSubmit} disabled={submitting || imageLoading || prompt.trim().length < 2}
+                    title="Send"
+                    className={`w-9 h-9 flex items-center justify-center rounded transition-all ${submitting || imageLoading || prompt.trim().length < 2 ? 'bg-[#f3f3f4] text-[#897266] cursor-not-allowed' : 'bg-[#f6863d] text-white hover:bg-[#9b4600]'}`}>
+                    {submitting
+                      ? <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>}
+                  </button>
+                )}
               </div>
             </div>
 
-            {/* Bottom controls — minimal, no borders */}
-            <div className="flex items-center justify-between pt-1.5">
-              <div className="flex items-center gap-2">
+            {/* Bottom controls — label-caps style per design spec */}
+            <div className="flex items-center justify-between pt-2 px-1">
+              <div className="flex items-center gap-3">
                 {chatMessages.length > 0 && (
-                  <button onClick={clearChat} className="text-[11px] text-gray-500 hover:text-gray-800 transition-colors">New chat</button>
+                  <button onClick={clearChat}
+                    className="text-[10px] font-semibold tracking-[0.1em] text-[#897266] hover:text-[#1a1c1c] transition-colors">
+                    NEW CHAT
+                  </button>
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-3">
                 <button type="button" onClick={handleReset} disabled={resetting}
-                  className="text-[11px] text-gray-500 hover:text-red-600 transition-colors disabled:opacity-50">
-                  {resetting ? 'Resetting…' : 'Reset all'}
+                  className="text-[10px] font-semibold tracking-[0.1em] text-[#897266] hover:text-[#ba1a1a] transition-colors disabled:opacity-50">
+                  {resetting ? 'RESETTING…' : 'RESET ALL'}
                 </button>
-                <span className="text-gray-300">·</span>
                 <button type="button" onClick={() => { setCommitMsg(''); setPushModalOpen(true); }}
-                  className="text-[11px] font-medium text-gray-700 hover:text-gray-900 transition-colors">
-                  Push to {project.push_branch || project.repo_branch}
+                  className="text-[10px] font-semibold tracking-[0.1em] text-[#9b4600] hover:text-[#622a00] transition-colors">
+                  PUSH TO {(project.push_branch || project.repo_branch || '').toUpperCase()}
                 </button>
               </div>
             </div>

@@ -20,6 +20,7 @@ const authRoutes = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
 const changeRequestRoutes = require('./routes/changeRequests');
 const userRoutes = require('./routes/users');
+const adminLogsRoutes = require('./routes/adminLogs');
 
 const app = express();
 const server = http.createServer(app);
@@ -48,6 +49,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/change-requests', changeRequestRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/admin/request-logs', adminLogsRoutes);
 
 // Error handling
 app.use(errorHandler);
