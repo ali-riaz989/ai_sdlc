@@ -512,6 +512,7 @@ class ChangeRequestController {
               { bind: [uuidv4(), requestId, pageBladeFile.blade_file, originalContent, finalContent, JSON.stringify(diffInfo)] });
             requestLogger.recordFileChange(requestId, { path: pageBladeFile.blade_file, op: 'image-swap', bytes: finalContent.length });
             await fs.writeFile(absPath, finalContent, 'utf-8');
+            emitFile(pageBladeFile.blade_file, 'modify', 'done');
             await this._clearViewCache(project.local_path);
             await this._invalidateOverridesForPage(project.id, currentPageUrl);
             await this._updateStatus(requestId, 'pending_review');
@@ -763,7 +764,7 @@ class ChangeRequestController {
             await fs.writeFile(targetAbs, finalContent, 'utf-8');
             const diffInfo = { old_block: edit.old_block, new_block: edit.new_block, reasoning: edit.reasoning || generated.reasoning };
             applied.push({ abs: targetAbs, originalContent: original, newContent: finalContent, file_path: edit.file_path, diffInfo });
-            emitFile(edit.file_path, 'modify', 'generating');
+            emitFile(edit.file_path, 'modify', 'done');
           }
 
           // All edits succeeded → persist diff rows
@@ -811,6 +812,7 @@ class ChangeRequestController {
 
         emitFile(generated.file_path, 'delete', 'generating');
         await fs.unlink(delTargetAbs);
+        emitFile(generated.file_path, 'delete', 'done');
 
         // Auto-cleanup of the route entry — applies only to user-scaffolded
         // pages (static_pages/, blogs/). Other deletions (rare) leave web.php
@@ -844,6 +846,7 @@ class ChangeRequestController {
             if (webNew !== webOrig) {
               emitFile(webRel, 'modify', 'generating');
               await fs.writeFile(webAbs, webNew, 'utf-8');
+              emitFile(webRel, 'modify', 'done');
               await sequelize.query(
                 `INSERT INTO generated_code (id, change_request_id, file_path, original_content, generated_content, change_type, diff)
                  VALUES ($1, $2, $3, $4, $5, 'modify', $6)`,
@@ -1050,6 +1053,7 @@ class ChangeRequestController {
         { bind: [uuidv4(), requestId, generated.file_path, targetOriginal, finalContent, JSON.stringify(diffInfo)] });
       requestLogger.recordFileChange(requestId, { path: generated.file_path, op: generated.mode || 'modify', bytes: finalContent.length });
       await fs.writeFile(targetAbs, finalContent, 'utf-8');
+      emitFile(generated.file_path, 'modify', 'done');
       await this._clearViewCache(project.local_path);
       await this._invalidateOverridesForPage(project.id, currentPageUrl);
       await this._updateStatus(requestId, 'pending_review');
@@ -2278,6 +2282,7 @@ class ChangeRequestController {
     );
     requestLogger.recordFileChange(requestId, { path: generated.file_path, op: 'confirm', bytes: finalContent.length });
     await fs.writeFile(targetAbs, finalContent, 'utf-8');
+    emitFile(generated.file_path, 'modify', 'done');
     await this._clearViewCache(project.local_path);
     await this._invalidateOverridesForPage(project.id, currentPageUrl);
     await this._updateStatus(requestId, 'pending_review');
