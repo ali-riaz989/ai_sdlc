@@ -1375,11 +1375,15 @@ export default function ProjectPreview() {
         if (update.status === 'rejected' || update.status === 'failed') {
           setPendingDiff(null);
           setStreamingTokens('');
-          reloadIframe(); // reload to show restored original
+          const reason = update.message || 'The change failed. Try again.';
+          const kind = classifyAiFailureMessage(reason);
+          // Only reload the iframe when a rollback may have happened. For a
+          // pure clarification question, nothing was written — reloading just
+          // disrupts the user's scroll/selection without any benefit.
+          if (kind !== 'question') reloadIframe();
           if (update.status === 'failed' && !handledFailuresRef.current.has(cr.id)) {
             handledFailuresRef.current.add(cr.id);
-            const reason = update.message || 'The change failed. Try again.';
-            addChat('ai', reason, classifyAiFailureMessage(reason));
+            addChat('ai', reason, kind);
             setActivePrompt(null);
           }
         }

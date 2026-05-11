@@ -617,32 +617,67 @@ class ChangeRequestController {
         }
       }
 
-      // Attach linked CSS files (scoped around the element's classes)
+      // Attach linked CSS files. For large files we slice them around EVERY
+      // line that references the clicked element's classes — not just the
+      // top-scoring window — so that base rules, :hover/:focus variants, and
+      // @media overrides (often hundreds of lines apart) all reach the AI.
       try {
         const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
+        const elClasses = (selectedElement?.classes || '')
+          .split(/\s+/)
+          .filter(c => c.length > 1 && !/^[0-9]/.test(c));
+        const PER_FILE_CAP = 40 * 1024;          // 40 KB total per file
+        const WINDOW_BEFORE = 8;
+        const WINDOW_AFTER = 40;                  // typical rule fits in ~30 lines
+
         for (const f of cssFiles) {
           try {
-            let content = await fs.readFile(f.abs, 'utf-8');
-            if (content.length > 12000 && selectedElement.classes) {
-              const classes = selectedElement.classes.split(/\s+/).filter(c => c.length > 1);
-              const cssLines = content.split('\n');
-              let best = -1, bestScore = 0;
-              for (let i = 0; i < cssLines.length; i++) {
-                let s = 0;
-                for (const cls of classes) if (cssLines[i].includes('.' + cls)) s++;
-                if (s > bestScore) { bestScore = s; best = i; }
-              }
-              if (best >= 0) {
-                const s = Math.max(0, best - 60);
-                const e = Math.min(cssLines.length, best + 180);
-                content = cssLines.slice(s, e).join('\n');
-              } else {
-                content = content.substring(0, 12000);
-              }
-            } else if (content.length > 12000) {
-              content = content.substring(0, 12000);
+            const content = await fs.readFile(f.abs, 'utf-8');
+            // Small enough — ship it whole.
+            if (content.length <= PER_FILE_CAP) {
+              candidates.push({ path: f.rel, content, type: 'css' });
+              continue;
             }
-            candidates.push({ path: f.rel, content, type: 'css' });
+            // No class hints at all (e.g. user clicked plain text) — fall back to head slice.
+            if (elClasses.length === 0) {
+              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* …truncated… */', type: 'css' });
+              continue;
+            }
+            const lines = content.split('\n');
+            // Find every line that mentions any of the element's classes — base
+            // selectors, pseudo-classes (:hover/:focus/:active), and parent/
+            // descendant combinations all show up here.
+            const hits = [];
+            for (let i = 0; i < lines.length; i++) {
+              for (const cls of elClasses) {
+                if (lines[i].includes('.' + cls)) { hits.push(i); break; }
+              }
+            }
+            if (hits.length === 0) {
+              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* …truncated… */', type: 'css' });
+              continue;
+            }
+            // Expand each hit into a window, then merge overlapping windows so
+            // adjacent rules don't get split apart.
+            const windows = hits.map(i => [Math.max(0, i - WINDOW_BEFORE), Math.min(lines.length, i + WINDOW_AFTER + 1)]);
+            windows.sort((a, b) => a[0] - b[0]);
+            const merged = [windows[0]];
+            for (let i = 1; i < windows.length; i++) {
+              const last = merged[merged.length - 1];
+              if (windows[i][0] <= last[1]) last[1] = Math.max(last[1], windows[i][1]);
+              else merged.push(windows[i]);
+            }
+            // Stitch the windows with a marker so the AI knows they're non-contiguous.
+            let stitched = '';
+            for (const [s, e] of merged) {
+              stitched += (stitched ? '\n/* …gap… */\n' : '') + lines.slice(s, e).join('\n');
+              if (stitched.length >= PER_FILE_CAP) {
+                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* …truncated… */';
+                break;
+              }
+            }
+            candidates.push({ path: f.rel, content: stitched, type: 'css' });
+            logger.info('CSS scoped slice', { file: f.rel, windows: merged.length, hits: hits.length, chars: stitched.length });
           } catch {}
         }
       } catch (cssErr) {
