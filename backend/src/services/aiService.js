@@ -285,6 +285,15 @@ Hard rules:
 
 Self-check before emitting: did you find an EXISTING rule that already declares this property on this element? If yes, your edit must change that value, NOT append a new rule somewhere else.
 
+NESTED CSS NOTATION YOU MUST RECOGNIZE:
+Some attached CSS files use SCSS-style nesting (an ampersand token, or descendant selectors inside a parent block). For example, the parent .x might contain an inner block opened with &:hover (which means hover on .x), or an inner .y block (which means .x .y), or an @media block (which means a responsive variant of .x). Treat these inner blocks as REAL rules:
+  - ampersand-colon-hover inside .x is the HOVER rule for .x — equivalent to .x:hover.
+  - A class block like .y inside .x is the descendant rule .x .y.
+  - An @media block inside .x is a responsive override for .x.
+You CAN and SHOULD edit values inside these nested blocks. Do not refuse with "I cannot find the .x:hover rule" when the file clearly shows .x containing an inner &:hover block — that nested form IS the rule. The slice you receive contains the entire enclosing parent; the property you want is inside it.
+
+Also: a comment like "additional unrelated CSS omitted" or "unrelated rules between these two windows" in the slice is NOT a sign that information is missing. It tells you that rules NOT touching the clicked element's classes were elided to save space. The rules visible above and below the marker are the relevant ones — those are the ones to edit. Don't ask the user for "the full file" because of these markers; the slice already contains every rule that mentions the element's classes.
+
 MULTIPLE EDITS IN ONE PROMPT (very important — do not split into multiple turns):
 - Users often pack several changes into one request: "Replace this blog with this image, title 'Hello World', date '01 May 2021', description '…'", or "Change the heading to X, the button text to Y, and remove the subtitle".
 - When the changes are CO-LOCATED (same card / section / block at the click region), expand old_block to cover the WHOLE enclosing block (the entire blog card, the entire CTA, the entire section <div>), and emit a new_block where every requested change is applied at once. ONE shape-A response, all edits inside.

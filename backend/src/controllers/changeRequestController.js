@@ -644,7 +644,7 @@ class ChangeRequestController {
           }
         }
         const elClasses = [...classSet];
-        const PER_FILE_CAP = 60 * 1024;          // 60 KB total per file
+        const PER_FILE_CAP = 120 * 1024;         // 120 KB total per file
         const WINDOW_BEFORE = 8;
         const WINDOW_AFTER = 40;                  // typical rule fits in ~30 lines
 
@@ -658,7 +658,7 @@ class ChangeRequestController {
             }
             // No class hints at all (e.g. user clicked plain text) — fall back to head slice.
             if (elClasses.length === 0) {
-              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* …truncated… */', type: 'css' });
+              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */', type: 'css' });
               continue;
             }
             const lines = content.split('\n');
@@ -672,7 +672,7 @@ class ChangeRequestController {
               }
             }
             if (hits.length === 0) {
-              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* …truncated… */', type: 'css' });
+              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */', type: 'css' });
               continue;
             }
             // Expand each hit into a window, then merge overlapping windows so
@@ -688,9 +688,9 @@ class ChangeRequestController {
             // Stitch the windows with a marker so the AI knows they're non-contiguous.
             let stitched = '';
             for (const [s, e] of merged) {
-              stitched += (stitched ? '\n/* …gap… */\n' : '') + lines.slice(s, e).join('\n');
+              stitched += (stitched ? '\n/* unrelated rules between these two windows */\n' : '') + lines.slice(s, e).join('\n');
               if (stitched.length >= PER_FILE_CAP) {
-                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* …truncated… */';
+                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
                 break;
               }
             }
@@ -735,9 +735,9 @@ class ChangeRequestController {
             }
             let stitched = '';
             for (const [s, e] of merged) {
-              stitched += (stitched ? '\n/* …gap… */\n' : '') + lines.slice(s, e).join('\n');
+              stitched += (stitched ? '\n/* unrelated rules between these two windows */\n' : '') + lines.slice(s, e).join('\n');
               if (stitched.length >= PER_FILE_CAP) {
-                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* …truncated… */';
+                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
                 break;
               }
             }
@@ -759,7 +759,7 @@ class ChangeRequestController {
         for (const f of jsFiles) {
           try {
             let content = await fs.readFile(f.abs, 'utf-8');
-            if (content.length > 14000) content = content.substring(0, 14000) + '\n/* …truncated… */';
+            if (content.length > 14000) content = content.substring(0, 14000) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
             candidates.push({ path: f.rel, content, type: 'js' });
           } catch {}
         }
