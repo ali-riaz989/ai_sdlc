@@ -684,6 +684,8 @@ class ChangeRequestController {
         logger.warn('CSS discovery failed', { error: cssErr.message });
       }
 
+      
+
       // Attach linked JS files — without these the AI is blind to slider/carousel
       // init code, modal triggers, AJAX form handlers, etc. Skip vendor/minified
       // bundles (they're huge and not editable). Cap each file at 14KB.
