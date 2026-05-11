@@ -11,8 +11,9 @@ backend/.env
 frontend/.env
 frontend/.env.local
 
-# Logs
-logs/
+# Logs (root-level only — the leading slash anchors it so it doesn't
+# match nested app routes named "logs", e.g. frontend/src/app/admin/logs/).
+/logs/
 *.log
 npm-debug.log*
 
