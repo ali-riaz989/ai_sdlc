@@ -43,6 +43,33 @@ export default function ProjectPreview() {
   const [result, setResult] = useState(null);
   const [files, setFiles] = useState([]); // { file, change_type, status }
   const [currentPageUrl, setCurrentPageUrl] = useState(null); // tracks which page is loaded in iframe
+  // Initial iframe src. Reads the last-visited path from localStorage so a
+  // page refresh keeps the user on the sub-page they were on (instead of
+  // dropping them back at the homepage). The key is scoped per project id.
+  const [initialIframeSrc] = useState(() => {
+    if (typeof window === 'undefined') return '/preview/';
+    try {
+      const saved = localStorage.getItem(`lastPagePath:${id}`);
+      if (saved && saved.startsWith('/')) return '/preview' + saved;
+    } catch {}
+    return '/preview/';
+  });
+  // Persist the current page path whenever the iframe navigates so the next
+  // refresh restores the same page. Strip protocol+host, keep only the path.
+  useEffect(() => {
+    if (!currentPageUrl || typeof window === 'undefined') return;
+    try {
+      const u = new URL(currentPageUrl, window.location.origin);
+      let p = u.pathname || '/';
+      // The iframe URL goes through /preview/<path> proxy. Strip the prefix
+      // so we save the project-relative path, not the Next route.
+      if (p.startsWith('/preview/')) p = p.replace(/^\/preview/, '') || '/';
+      else if (p === '/preview') p = '/';
+      // Skip internal preview helper routes — those would be useless on reload.
+      if (p.startsWith('/__preview_section')) return;
+      localStorage.setItem(`lastPagePath:${id}`, p);
+    } catch {}
+  }, [currentPageUrl, id]);
   // Per-URL cache of the resolved blade file. Populated once when the iframe navigates to a
   // new URL, then passed to every subsequent change-request so the backend skips resolution.
   const [bladeByUrl, setBladeByUrl] = useState({}); // { [url]: { blade_file, abs_path } }
@@ -677,14 +704,14 @@ export default function ProjectPreview() {
       // Detect clicks that land in a shared LAYOUT file (header / footer / sidebar / etc.)
       // Editing those affects every page that extends the layout — warn explicitly.
       const isInLayout = bladeSrc && /\/(layouts|partials)\//.test(bladeSrc);
-      const layoutFile = isInLayout ? bladeSrc.split(':')[0] : null;
-      addChat('ai', `Selected: ${elDesc}. What would you like to do?`, 'text');
       if (isInLayout) {
         addChat(
           'ai',
-          `Heads up — this element is in the shared layout "${layoutFile}". Any edit will affect EVERY page that uses this layout, not just the current one. If you only want to change this page, click on a page-specific element (the page's main content area) instead.`,
-          'question'
+          `Selected: ${elDesc}. Heads up — this is in the shared header/footer, so any change will apply to every page on the site. Tell me what you'd like to change.`,
+          'text'
         );
+      } else {
+        addChat('ai', `Selected: ${elDesc}. What would you like to do?`, 'text');
       }
 
       // Selected state: swap the existing hover overlay from green to red and pin its
@@ -2100,7 +2127,7 @@ export default function ProjectPreview() {
           <div className="flex-1 overflow-hidden relative">
             <iframe
               ref={iframeRef}
-              src="/preview/"
+              src={initialIframeSrc}
               className="w-full h-full border-0"
               title={project.display_name}
               onLoad={() => {

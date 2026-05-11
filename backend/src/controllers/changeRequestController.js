@@ -617,19 +617,17 @@ class ChangeRequestController {
         }
       }
 
-      // Attach linked CSS files. For large files we slice them around EVERY
-      // line that references the clicked element's classes — not just the
-      // top-scoring window — so that base rules, :hover/:focus variants, and
-      // @media overrides (often hundreds of lines apart) all reach the AI.
+      // Attach project CSS. Strategy:
+      //   1. Only LINKED CSS (files actually <link>'d on the page) — anything
+      //      else can't be affecting what the user sees.
+      //   2. Ship whole when small (<= 200 KB) so Claude reads the complete
+      //      rule list. Slicing creates "I cannot find the rule" loops.
+      //   3. For larger files, slice around the click region's classes — but
+      //      ship contiguous slices, no markers.
+      //   4. Hard total cap across all CSS so we don't blow Claude's 200K
+      //      token context.
       try {
         const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
-        // Hint set for the slicer: the clicked element's classes PLUS every
-        // class mentioned in the click region (parent wrappers, sibling tags).
-        // Important because the user often clicks a child element (e.g. an
-        // <img>) whose own classes don't appear in CSS — the styling rules
-        // live on the parent wrapper. Without the parents' classes here, the
-        // slicer falls back to a head-of-file slice and the actual rule
-        // (often deep in the file) is missed.
         const classSet = new Set();
         const addClasses = (s) => {
           if (!s) return;
@@ -644,106 +642,64 @@ class ChangeRequestController {
           }
         }
         const elClasses = [...classSet];
-        const PER_FILE_CAP = 120 * 1024;         // 120 KB total per file
+
+        const WHOLE_FILE_MAX = 200 * 1024;       // <= 200 KB → ship whole
+        const SLICE_PER_FILE_MAX = 160 * 1024;    // larger → slice up to 160 KB
+        const TOTAL_CSS_BUDGET = 360 * 1024;      // hard cap across all CSS files
         const WINDOW_BEFORE = 8;
-        const WINDOW_AFTER = 40;                  // typical rule fits in ~30 lines
+        const WINDOW_AFTER = 80;                  // generous — full SCSS-nested blocks fit
+        let cssBudgetUsed = 0;
 
         for (const f of cssFiles) {
+          if (cssBudgetUsed >= TOTAL_CSS_BUDGET) {
+            logger.warn('CSS budget exhausted — skipping remaining files', { skipped: f.rel });
+            continue;
+          }
           try {
             const content = await fs.readFile(f.abs, 'utf-8');
-            // Small enough — ship it whole.
-            if (content.length <= PER_FILE_CAP) {
-              candidates.push({ path: f.rel, content, type: 'css' });
-              continue;
-            }
-            // No class hints at all (e.g. user clicked plain text) — fall back to head slice.
-            if (elClasses.length === 0) {
-              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */', type: 'css' });
-              continue;
-            }
-            const lines = content.split('\n');
-            // Find every line that mentions any of the element's classes — base
-            // selectors, pseudo-classes (:hover/:focus/:active), and parent/
-            // descendant combinations all show up here.
-            const hits = [];
-            for (let i = 0; i < lines.length; i++) {
-              for (const cls of elClasses) {
-                if (lines[i].includes('.' + cls)) { hits.push(i); break; }
+            const remaining = TOTAL_CSS_BUDGET - cssBudgetUsed;
+            let toShip;
+            if (content.length <= Math.min(WHOLE_FILE_MAX, remaining)) {
+              toShip = content;
+            } else if (elClasses.length === 0) {
+              // No class hints → head of file, capped by remaining budget.
+              toShip = content.substring(0, Math.min(SLICE_PER_FILE_MAX, remaining));
+            } else {
+              // Slice around class hits. Single merged stitch — no markers.
+              const lines = content.split('\n');
+              const hits = [];
+              for (let i = 0; i < lines.length; i++) {
+                for (const cls of elClasses) {
+                  if (lines[i].includes('.' + cls)) { hits.push(i); break; }
+                }
+              }
+              if (hits.length === 0) {
+                toShip = content.substring(0, Math.min(SLICE_PER_FILE_MAX, remaining));
+              } else {
+                const windows = hits.map(i => [Math.max(0, i - WINDOW_BEFORE), Math.min(lines.length, i + WINDOW_AFTER + 1)]);
+                windows.sort((a, b) => a[0] - b[0]);
+                const merged = [windows[0]];
+                for (let i = 1; i < windows.length; i++) {
+                  const last = merged[merged.length - 1];
+                  if (windows[i][0] <= last[1]) last[1] = Math.max(last[1], windows[i][1]);
+                  else merged.push(windows[i]);
+                }
+                let stitched = '';
+                for (const [s, e] of merged) {
+                  // Plain newline join — no marker, no claim of omission.
+                  stitched += (stitched ? '\n' : '') + lines.slice(s, e).join('\n');
+                  if (stitched.length >= Math.min(SLICE_PER_FILE_MAX, remaining)) {
+                    stitched = stitched.substring(0, Math.min(SLICE_PER_FILE_MAX, remaining));
+                    break;
+                  }
+                }
+                toShip = stitched;
               }
             }
-            if (hits.length === 0) {
-              candidates.push({ path: f.rel, content: content.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */', type: 'css' });
-              continue;
-            }
-            // Expand each hit into a window, then merge overlapping windows so
-            // adjacent rules don't get split apart.
-            const windows = hits.map(i => [Math.max(0, i - WINDOW_BEFORE), Math.min(lines.length, i + WINDOW_AFTER + 1)]);
-            windows.sort((a, b) => a[0] - b[0]);
-            const merged = [windows[0]];
-            for (let i = 1; i < windows.length; i++) {
-              const last = merged[merged.length - 1];
-              if (windows[i][0] <= last[1]) last[1] = Math.max(last[1], windows[i][1]);
-              else merged.push(windows[i]);
-            }
-            // Stitch the windows with a marker so the AI knows they're non-contiguous.
-            let stitched = '';
-            for (const [s, e] of merged) {
-              stitched += (stitched ? '\n/* unrelated rules between these two windows */\n' : '') + lines.slice(s, e).join('\n');
-              if (stitched.length >= PER_FILE_CAP) {
-                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
-                break;
-              }
-            }
-            candidates.push({ path: f.rel, content: stitched, type: 'css' });
-            logger.info('CSS scoped slice', { file: f.rel, windows: merged.length, hits: hits.length, chars: stitched.length });
+            candidates.push({ path: f.rel, content: toShip, type: 'css' });
+            cssBudgetUsed += toShip.length;
+            logger.info('CSS attached', { file: f.rel, chars: toShip.length, totalFile: content.length, budgetUsed: cssBudgetUsed });
           } catch {}
-        }
-
-        // Also scan UNLINKED CSS files in public/css/ — some projects keep
-        // legacy stylesheets (style.css, homepage.css, etc.) on disk that
-        // aren't loaded via <link> on the current page but might still drive
-        // visible behavior (or that the AI needs to override). Ship a slice
-        // ONLY when the file actually contains a hint class — otherwise we'd
-        // dump thousands of unrelated bytes.
-        if (elClasses.length > 0) {
-          const linkedSet = new Set(cssFiles.map(f => f.rel));
-          const cssDir = path.join(project.local_path, 'public', 'css');
-          let entries = [];
-          try { entries = await fs.readdir(cssDir); } catch {}
-          for (const name of entries) {
-            if (!/\.css$/i.test(name) || /\.min\.css$/i.test(name)) continue;
-            const rel = path.join('public', 'css', name);
-            if (linkedSet.has(rel)) continue;
-            const abs = path.join(cssDir, name);
-            let content = '';
-            try { content = await fs.readFile(abs, 'utf-8'); } catch { continue; }
-            const lines = content.split('\n');
-            const hits = [];
-            for (let i = 0; i < lines.length; i++) {
-              for (const cls of elClasses) {
-                if (lines[i].includes('.' + cls)) { hits.push(i); break; }
-              }
-            }
-            if (hits.length === 0) continue;
-            const windows = hits.map(i => [Math.max(0, i - WINDOW_BEFORE), Math.min(lines.length, i + WINDOW_AFTER + 1)]);
-            windows.sort((a, b) => a[0] - b[0]);
-            const merged = [windows[0]];
-            for (let i = 1; i < windows.length; i++) {
-              const last = merged[merged.length - 1];
-              if (windows[i][0] <= last[1]) last[1] = Math.max(last[1], windows[i][1]);
-              else merged.push(windows[i]);
-            }
-            let stitched = '';
-            for (const [s, e] of merged) {
-              stitched += (stitched ? '\n/* unrelated rules between these two windows */\n' : '') + lines.slice(s, e).join('\n');
-              if (stitched.length >= PER_FILE_CAP) {
-                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
-                break;
-              }
-            }
-            candidates.push({ path: rel, content: stitched, type: 'css' });
-            logger.info('CSS unlinked match', { file: rel, windows: merged.length, hits: hits.length, chars: stitched.length });
-          }
         }
       } catch (cssErr) {
         logger.warn('CSS discovery failed', { error: cssErr.message });
@@ -759,7 +715,7 @@ class ChangeRequestController {
         for (const f of jsFiles) {
           try {
             let content = await fs.readFile(f.abs, 'utf-8');
-            if (content.length > 14000) content = content.substring(0, 14000) + '\n/* additional unrelated CSS omitted to save space — the rules visible above are the ones that touch the clicked element\'s classes */';
+            if (content.length > 60000) content = content.substring(0, 60000);
             candidates.push({ path: f.rel, content, type: 'js' });
           } catch {}
         }
@@ -867,6 +823,19 @@ class ChangeRequestController {
             const diffInfo = { old_block: edit.old_block, new_block: edit.new_block, reasoning: edit.reasoning || generated.reasoning };
             applied.push({ abs: targetAbs, originalContent: original, newContent: finalContent, file_path: edit.file_path, diffInfo });
             emitFile(edit.file_path, 'modify', 'done');
+          }
+
+          // No-op guard: if NO file actually changed (all edits' new content
+          // is identical to their original), the AI emitted a meaningless
+          // edit. Surface as a clarification instead of pretending success.
+          const anyChanged = applied.some(a => a.newContent !== a.originalContent);
+          if (!anyChanged) {
+            const reason = (generated.reasoning || '').trim();
+            const msg = reason
+              ? `I didn't make any change — ${reason}. Could you tell me what you want to change in different words?`
+              : `I couldn't figure out what to change. Could you describe the change in more detail?`;
+            await this._fail(requestId, emit, msg);
+            return;
           }
 
           // All edits succeeded → persist diff rows
@@ -1147,6 +1116,19 @@ class ChangeRequestController {
         }
         generatedOldBlock = generated.old_block;
         generatedNewBlock = generated.new_block;
+      }
+
+      // No-op guard: if the AI's old_block and new_block are identical OR
+      // the computed final content matches what's already on disk, NOTHING
+      // changed. Don't pretend an edit was made — surface the AI's reasoning
+      // as a clarification so the user knows why and can re-prompt.
+      if (finalContent === targetOriginal) {
+        const reason = (generated.reasoning || '').trim();
+        const msg = reason
+          ? `I didn't make any change — ${reason}. Could you tell me what you want to change in different words?`
+          : `I couldn't figure out what to change. Could you describe the change in more detail — for example, what size, colour, or position you want?`;
+        await this._fail(requestId, emit, msg);
+        return;
       }
 
       const diffInfo = { old_block: generatedOldBlock, new_block: generatedNewBlock, reasoning: generated.reasoning };
