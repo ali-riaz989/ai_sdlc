@@ -387,7 +387,7 @@
       // just "Book Lesson", deleting the arrow.
       el.dataset.liveEditOriginal = el.innerHTML;
       el.contentEditable = 'true';
-      el.style.outline = '1px dashed rgba(34,197,94,0.45)';
+      el.style.outline = '2px dashed #dc2626';
       el.style.outlineOffset = '2px';
       el.addEventListener('blur', onTextBlur);
       editableEls.add(el);
@@ -399,7 +399,7 @@
       if (img.dataset.liveEditWired) return;
       img.dataset.liveEditWired = '1';
       img.style.cursor = 'pointer';
-      img.style.outline = '2px dashed rgba(59,130,246,0.55)';
+      img.style.outline = '2px dashed #dc2626';
       img.style.outlineOffset = '2px';
       img.addEventListener('click', onImageClick);
 

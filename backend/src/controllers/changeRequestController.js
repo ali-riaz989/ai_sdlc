@@ -623,10 +623,28 @@ class ChangeRequestController {
       // @media overrides (often hundreds of lines apart) all reach the AI.
       try {
         const cssFiles = await this._findLinkedCssFiles(project.local_path, pageBladeFile);
-        const elClasses = (selectedElement?.classes || '')
-          .split(/\s+/)
-          .filter(c => c.length > 1 && !/^[0-9]/.test(c));
-        const PER_FILE_CAP = 40 * 1024;          // 40 KB total per file
+        // Hint set for the slicer: the clicked element's classes PLUS every
+        // class mentioned in the click region (parent wrappers, sibling tags).
+        // Important because the user often clicks a child element (e.g. an
+        // <img>) whose own classes don't appear in CSS — the styling rules
+        // live on the parent wrapper. Without the parents' classes here, the
+        // slicer falls back to a head-of-file slice and the actual rule
+        // (often deep in the file) is missed.
+        const classSet = new Set();
+        const addClasses = (s) => {
+          if (!s) return;
+          for (const c of String(s).split(/\s+/)) {
+            if (c.length > 1 && !/^[0-9]/.test(c)) classSet.add(c);
+          }
+        };
+        addClasses(selectedElement?.classes);
+        if (clickRegion) {
+          for (const m of clickRegion.matchAll(/class\s*=\s*["']([^"']+)["']/g)) {
+            addClasses(m[1]);
+          }
+        }
+        const elClasses = [...classSet];
+        const PER_FILE_CAP = 60 * 1024;          // 60 KB total per file
         const WINDOW_BEFORE = 8;
         const WINDOW_AFTER = 40;                  // typical rule fits in ~30 lines
 
@@ -679,6 +697,53 @@ class ChangeRequestController {
             candidates.push({ path: f.rel, content: stitched, type: 'css' });
             logger.info('CSS scoped slice', { file: f.rel, windows: merged.length, hits: hits.length, chars: stitched.length });
           } catch {}
+        }
+
+        // Also scan UNLINKED CSS files in public/css/ — some projects keep
+        // legacy stylesheets (style.css, homepage.css, etc.) on disk that
+        // aren't loaded via <link> on the current page but might still drive
+        // visible behavior (or that the AI needs to override). Ship a slice
+        // ONLY when the file actually contains a hint class — otherwise we'd
+        // dump thousands of unrelated bytes.
+        if (elClasses.length > 0) {
+          const linkedSet = new Set(cssFiles.map(f => f.rel));
+          const cssDir = path.join(project.local_path, 'public', 'css');
+          let entries = [];
+          try { entries = await fs.readdir(cssDir); } catch {}
+          for (const name of entries) {
+            if (!/\.css$/i.test(name) || /\.min\.css$/i.test(name)) continue;
+            const rel = path.join('public', 'css', name);
+            if (linkedSet.has(rel)) continue;
+            const abs = path.join(cssDir, name);
+            let content = '';
+            try { content = await fs.readFile(abs, 'utf-8'); } catch { continue; }
+            const lines = content.split('\n');
+            const hits = [];
+            for (let i = 0; i < lines.length; i++) {
+              for (const cls of elClasses) {
+                if (lines[i].includes('.' + cls)) { hits.push(i); break; }
+              }
+            }
+            if (hits.length === 0) continue;
+            const windows = hits.map(i => [Math.max(0, i - WINDOW_BEFORE), Math.min(lines.length, i + WINDOW_AFTER + 1)]);
+            windows.sort((a, b) => a[0] - b[0]);
+            const merged = [windows[0]];
+            for (let i = 1; i < windows.length; i++) {
+              const last = merged[merged.length - 1];
+              if (windows[i][0] <= last[1]) last[1] = Math.max(last[1], windows[i][1]);
+              else merged.push(windows[i]);
+            }
+            let stitched = '';
+            for (const [s, e] of merged) {
+              stitched += (stitched ? '\n/* …gap… */\n' : '') + lines.slice(s, e).join('\n');
+              if (stitched.length >= PER_FILE_CAP) {
+                stitched = stitched.substring(0, PER_FILE_CAP) + '\n/* …truncated… */';
+                break;
+              }
+            }
+            candidates.push({ path: rel, content: stitched, type: 'css' });
+            logger.info('CSS unlinked match', { file: rel, windows: merged.length, hits: hits.length, chars: stitched.length });
+          }
         }
       } catch (cssErr) {
         logger.warn('CSS discovery failed', { error: cssErr.message });
