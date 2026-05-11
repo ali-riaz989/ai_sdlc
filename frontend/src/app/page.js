@@ -64,10 +64,7 @@ export default function Home() {
           />
           <div className="flex items-center gap-8">
             {user.role === 'admin' && (
-              <>
-                <a href="/users" className={navLink}>USERS</a>
-                <a href="/admin/logs" className={navLink}>ADMIN</a>
-              </>
+              <a href="/users" className={navLink}>USERS</a>
             )}
             <button onClick={logout} className={navLink}>
               LOGOUT
