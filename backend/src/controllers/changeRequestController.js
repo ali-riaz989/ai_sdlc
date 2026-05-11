@@ -758,7 +758,7 @@ class ChangeRequestController {
             const replaceClickLine = (edit.file_path === pageBladeFile.blade_file) ? clickLine : -1;
             const finalContent = this._applyBlockReplace(original, edit.old_block, edit.new_block, replaceClickLine);
             if (!finalContent) {
-              throw new Error(`Could not locate text to replace in ${edit.file_path} — old_block did not match the file. The AI's multi-edit was rejected to prevent a half-finished change.`);
+              throw new Error(`I couldn't apply this change cleanly — part of it didn't line up with the page as I expected. Nothing was changed. Could you click directly on what you want changed and try again?`);
             }
             await fs.writeFile(targetAbs, finalContent, 'utf-8');
             const diffInfo = { old_block: edit.old_block, new_block: edit.new_block, reasoning: edit.reasoning || generated.reasoning };
@@ -1037,7 +1037,7 @@ class ChangeRequestController {
             old_preview: generated.old_block.substring(0, 200),
             new_preview: (generated.new_block || '').substring(0, 200)
           });
-          await this._fail(requestId, emit, `Could not locate the text to replace in ${generated.file_path}. The AI's old_block didn't match the file verbatim — try again or rephrase.`);
+          await this._fail(requestId, emit, `I couldn't apply that change cleanly — the part of the page I was trying to edit doesn't look quite the way I expected. Could you click directly on the exact element you want changed and try again?`);
           return;
         }
         generatedOldBlock = generated.old_block;
